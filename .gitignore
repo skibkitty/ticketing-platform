@@ -1,0 +1,36 @@
+# Maven
+target/
+*.jar
+*.war
+*.ear
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Eclipse
+.classpath
+.project
+.settings/
+bin/
+
+# VS Code
+.vscode/
+
+# Compiled classes
+*.class
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
