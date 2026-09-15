@@ -10,7 +10,11 @@ downstream; services trust that header rather than re-validating a
 signature.
 
 **Consequences:** One place to audit and rotate keys; downstream services
-carry no security dependency. This is only safe because internal services
-are not reachable except through the gateway — in an environment with
-untrusted internal network access (e.g. a shared cluster), each service
-would need to validate the JWT itself instead of trusting the header.
+carry no security dependency. The safety of trusting `X-User-Roles` rests
+on network hygiene, not protocol: nothing except our own services may reach
+an internal service. The default `docker-compose.yml` publishes host ports
+(8082-8084) for direct debugging, so a host-local process *can* forge the
+header today — accepted at demo scale. Tighten by removing the host port
+bindings for internal services once host-side debugging is done. If this
+ever runs on a shared or untrusted network, each service must validate the
+JWT itself instead of trusting the header.
