@@ -7,16 +7,18 @@ and gateway-level rate limiting for flash-sale traffic.
 **Start here:**
 1. [`docs/architecture.md`](docs/architecture.md) — what this is and why
    every non-obvious decision was made the way it was.
-2. [`docs/tasks.md`](docs/tasks.md) — the ordered, atomic implementation
-   checklist.
-3. [`docs/adr/`](docs/adr) — short decision records for the six main
-   choices; fill these in as you build (task T44).
+2. [`docs/adr/`](docs/adr) — short decision records for the main
+   choices; fill these in as you build.
+3. The [GitHub issue plan](https://github.com/skibkitty/ticketing-platform/issues/1)
+   — the spec and its child tickets are the single source of truth for what
+   gets built and in what order.
 
 ## For opencode / whoever implements this
 
 Scaffolding already exists: parent + module `pom.xml`s, `docker-compose.yml`,
 per-module `Dockerfile`s, package directories, CI workflow. Verify `mvn -q
-compile` before writing feature code, then work `docs/tasks.md` in order —
+compile` before writing feature code, then work the plan from the GitHub
+issues (spec #1 + its child tickets) one ticket at a time, blockers-first —
 payment-service's consumer can't be meaningfully tested until
 reservation-service actually publishes `ReservationCreated`.
 
@@ -38,7 +40,7 @@ docker compose up --build
 
 ## Example requests
 
-*(To be filled in with real, tested commands as part of task T45.)*
+*(To be filled in with real, tested commands as part of T14 (#15).)*
 
 ```bash
 # 1. Log in
