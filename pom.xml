@@ -30,10 +30,10 @@
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <spring-boot.version>3.4.5</spring-boot.version>
-        <!-- Spring Cloud 2024.0.x is the release train aligned with Boot 3.4.x.
-             Verify against https://spring.io/projects/spring-cloud#overview
-             before building. -->
-        <spring-cloud.version>2024.0.0</spring-cloud.version>
+        <!-- Spring Cloud 2024.0.x ("Moorgate") is the release train aligned with
+             Boot 3.4.x; 2024.0.3 is the newest release published to Maven
+             Central. -->
+        <spring-cloud.version>2024.0.3</spring-cloud.version>
     </properties>
 
     <dependencyManagement>
