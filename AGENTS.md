@@ -13,3 +13,10 @@ Five default labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for
 ### Domain docs
 
 Single-context: one `CONTEXT.md` at the repo root, ADRs under `docs/adr/`. See `docs/agents/domain.md`.
+
+### Git workflow
+
+Never commit or push to `main`. Work on a feature branch per ticket
+(`feat/<issue-number>-<kebab-slug>`), open a PR with `Closes #<issue>`, and
+merge only when CI is green. See `docs/agents/git-workflow.md`. Enable the
+guardrail hooks once per clone with `git config core.hooksPath .githooks`.
