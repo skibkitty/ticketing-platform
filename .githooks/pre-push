@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+#
+# Guardrail hook (.githooks/pre-push).
+#
+# Rejects any direct push to refs/heads/main — changes to main must land via
+# a pull request merged from a feature branch. Covers creation (first push of
+# main), force-push, and deletion, mirroring the server-side branch protection
+# locally.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Deliberate bypass:      git push --no-verify
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+	[ -z "$remote_ref" ] && continue
+	case "$remote_ref" in
+		refs/heads/main)
+			echo "pre-push: direct push to '$remote_ref' is blocked." >&2
+			echo "pre-push: open a PR from a feature branch and squash-merge it instead." >&2
+			echo "pre-push: (deliberate override: git push --no-verify / --force-with-lease --no-verify)" >&2
+			exit 1
+			;;
+	esac
+done
+
+exit 0
