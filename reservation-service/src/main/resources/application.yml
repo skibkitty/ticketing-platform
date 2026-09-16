@@ -1,0 +1,18 @@
+spring:
+  application:
+    name: reservation-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/platform?currentSchema=reservation}
+    username: ${DB_USER:platform}
+    password: ${DB_PASSWORD:platform}
+  flyway:
+    schemas: reservation
+    create-schemas: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
