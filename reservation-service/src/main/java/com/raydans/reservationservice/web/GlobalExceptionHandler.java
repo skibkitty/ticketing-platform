@@ -21,6 +21,12 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(status).body(error(status, ex, request));
     }
 
+    @ExceptionHandler(DuplicateSeatException.class)
+    ResponseEntity<ApiErrorResponse> duplicateSeat(DuplicateSeatException ex, HttpServletRequest request) {
+        HttpStatus status = HttpStatus.CONFLICT;
+        return ResponseEntity.status(status).body(error(status, ex, request));
+    }
+
     @ExceptionHandler(ResourceNotFoundException.class)
     ResponseEntity<ApiErrorResponse> notFound(ResourceNotFoundException ex, HttpServletRequest request) {
         HttpStatus status = HttpStatus.NOT_FOUND;
