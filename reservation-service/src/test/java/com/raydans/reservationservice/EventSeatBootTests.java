@@ -1,6 +1,7 @@
 package com.raydans.reservationservice;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.List;
 import java.util.Map;
@@ -8,8 +9,10 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -29,6 +32,9 @@ class EventSeatBootTests {
     @Autowired
     TestRestTemplate rest;
 
+    @Autowired
+    JdbcTemplate jdbc;
+
     @DynamicPropertySource
     static void datasourceProperties(DynamicPropertyRegistry registry) {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
@@ -38,42 +44,61 @@ class EventSeatBootTests {
 
     @Test
     void persistsEventWithSeatsAndListsThemBack() {
-        Map<String, Object> body = Map.of(
-                "name", "Opening Night",
-                "venue", "Metropolitan Opera",
-                "eventDate", "2026-11-01T19:30:00Z",
-                "seats", List.of(
-                        Map.of("section", "Orchestra", "row", "A", "seatNumber", 1),
-                        Map.of("section", "Orchestra", "row", "A", "seatNumber", 2)));
+        ResponseEntity<Map> created = postEvent("Opening Night", List.of(
+                Map.of("section", "Orchestra", "row", "A", "seatNumber", 1),
+                Map.of("section", "Orchestra", "row", "A", "seatNumber", 2)));
 
-        ResponseEntity<Map> created = rest.postForEntity("/api/v1/events", body, Map.class);
         assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         assertThat(created.getHeaders().getFirst("Location")).isNotBlank();
+        assertThat(created.getBody().get("eventId")).isNotNull();
 
         @SuppressWarnings("unchecked")
         List<Number> seatIds = (List<Number>) created.getBody().get("seatIds");
         assertThat(seatIds).hasSize(2);
+
+        Number eventId = (Number) created.getBody().get("eventId");
+        ResponseEntity<List> all = rest.getForEntity("/api/v1/events/" + eventId + "/seats", List.class);
+        assertThat(all.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(all.getBody()).hasSize(2);
+    }
+
+    @Test
+    void seatsDefaultToAvailableAndFilterWorks() {
+        ResponseEntity<Map> created = postEvent("Opening Night", List.of(
+                Map.of("section", "Orchestra", "row", "A", "seatNumber", 1)));
         Number eventId = (Number) created.getBody().get("eventId");
 
         ResponseEntity<List> available =
                 rest.getForEntity("/api/v1/events/" + eventId + "/seats?status=AVAILABLE", List.class);
         assertThat(available.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(available.getBody()).hasSize(2);
+        assertThat(available.getBody()).hasSize(1);
+
+        ResponseEntity<List> sold = rest.getForEntity("/api/v1/events/" + eventId + "/seats?status=HELD", List.class);
+        assertThat(sold.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(sold.getBody()).isEmpty();
     }
 
     @Test
     void rejectsDuplicateSeatWithinOneEventAsConflict() {
-        Map<String, Object> body = Map.of(
-                "name", "Opening Night",
-                "venue", "Metropolitan Opera",
-                "eventDate", "2026-11-01T19:30:00Z",
-                "seats", List.of(
-                        Map.of("section", "Orchestra", "row", "A", "seatNumber", 1),
-                        Map.of("section", "Orchestra", "row", "A", "seatNumber", 1)));
+        ResponseEntity<Map> created = postEvent("Opening Night", List.of(
+                Map.of("section", "Orchestra", "row", "A", "seatNumber", 1),
+                Map.of("section", "Orchestra", "row", "A", "seatNumber", 1)));
 
-        ResponseEntity<Map> response = rest.postForEntity("/api/v1/events", body, Map.class);
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
-        assertThat(response.getBody()).containsEntry("status", 409);
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(created.getBody()).containsEntry("status", 409);
+    }
+
+    @Test
+    void databaseUniquenessConstraintRejectsSameEventDuplicateRows() {
+        ResponseEntity<Map> created = postEvent("Opening Night", List.of(
+                Map.of("section", "Orchestra", "row", "A", "seatNumber", 1)));
+        Number eventId = (Number) created.getBody().get("eventId");
+
+        assertThatThrownBy(() -> jdbc.update(
+                "INSERT INTO reservation.seats (event_id, section, \"row\", seat_number) VALUES (?, 'Orchestra', 'A', 1)",
+                eventId.longValue()))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .hasMessageContaining("uq_seats_event_section_row_number");
     }
 
     @Test
@@ -81,5 +106,29 @@ class EventSeatBootTests {
         ResponseEntity<Map> response = rest.getForEntity("/api/v1/events/422/seats", Map.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(response.getBody()).containsEntry("status", 404);
+    }
+
+    @Test
+    void rejectsUnknownSeatStatusAsBadRequest() {
+        ResponseEntity<Map> response = rest.getForEntity("/api/v1/events/1/seats?status=BOGUS", Map.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).containsEntry("status", 400);
+    }
+
+    @Test
+    void rejectsBlankFieldsAsBadRequest() {
+        ResponseEntity<Map> response = postEvent("", List.of(
+                Map.of("section", "Orchestra", "row", "A", "seatNumber", 1)));
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).containsEntry("status", 400);
+    }
+
+    private ResponseEntity<Map> postEvent(String name, List<Map<String, Object>> seats) {
+        Map<String, Object> body = Map.of(
+                "name", name,
+                "venue", "Metropolitan Opera",
+                "eventDate", "2026-11-01T19:30:00Z",
+                "seats", seats);
+        return rest.postForEntity("/api/v1/events", body, Map.class);
     }
 }

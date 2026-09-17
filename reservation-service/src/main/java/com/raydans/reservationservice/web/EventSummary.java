@@ -1,3 +1,5 @@
 package com.raydans.reservationservice.web;
 
-public record EventSummary(long id, String name, String venue, String eventDate) {}
+import java.time.Instant;
+
+public record EventSummary(long id, String name, String venue, Instant eventDate) {}

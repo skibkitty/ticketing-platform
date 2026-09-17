@@ -1,5 +1,6 @@
 package com.raydans.reservationservice.web;
 
+import com.raydans.reservationservice.event.EventService;
 import jakarta.validation.Valid;
 import java.net.URI;
 import java.util.List;
@@ -27,7 +28,7 @@ public class EventController {
     ResponseEntity<CreateEventResponse> create(
             @Valid @RequestBody CreateEventRequest request, UriComponentsBuilder builder) {
         CreateEventResponse created = events.create(request);
-        URI location = builder.path("/api/v1/events/{id}").buildAndExpand(created.eventId()).toUri();
+        URI location = builder.path("/api/v1/events/{id}/seats").buildAndExpand(created.eventId()).toUri();
         return ResponseEntity.created(location).body(created);
     }
 
@@ -38,7 +39,8 @@ public class EventController {
 
     @GetMapping("/{eventId}/seats")
     List<SeatResponse> listSeats(
-            @PathVariable("eventId") Long eventId, @RequestParam(value = "status", required = false) String status) {
+            @PathVariable("eventId") Long eventId,
+            @RequestParam(value = "status", required = false) SeatStatus status) {
         return events.listSeats(eventId, status);
     }
 }

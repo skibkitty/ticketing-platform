@@ -10,6 +10,7 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.WebRequest;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 /** Maps every reservation-service failure to the shared {@code ApiErrorResponse} error contract. */
 @RestControllerAdvice
@@ -40,6 +41,13 @@ public class GlobalExceptionHandler {
                 .map(fe -> fe.getField() + ": " + fe.getDefaultMessage())
                 .toList();
         return ResponseEntity.status(status).body(error(status, status.getReasonPhrase(), ex.getMessage(), request, details));
+    }
+
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    ResponseEntity<ApiErrorResponse> typeMismatch(MethodArgumentTypeMismatchException ex, HttpServletRequest request) {
+        HttpStatus status = HttpStatus.BAD_REQUEST;
+        String message = "Invalid value for '" + ex.getName() + "': '" + ex.getValue() + "'";
+        return ResponseEntity.status(status).body(error(status, status.getReasonPhrase(), message, request, List.of()));
     }
 
     @ExceptionHandler(Exception.class)

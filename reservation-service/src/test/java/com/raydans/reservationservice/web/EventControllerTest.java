@@ -2,16 +2,18 @@ package com.raydans.reservationservice.web;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
-import org.mockito.Mockito;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.raydans.reservationservice.event.EventService;
+import java.time.Instant;
 import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
@@ -83,7 +85,7 @@ class EventControllerTest {
     void listEventsReturnsEventSummaries() throws Exception {
         when(events.list())
                 .thenReturn(List.of(new EventSummary(7L, "Opening Night", "Metropolitan Opera",
-                        "2026-11-01T19:30:00Z")));
+                        Instant.parse("2026-11-01T19:30:00Z"))));
 
         mvc.perform(get("/api/v1/events"))
                 .andExpect(status().isOk())
@@ -93,13 +95,21 @@ class EventControllerTest {
 
     @Test
     void listSeatsFilteredByStatusReturnsSeats() throws Exception {
-        when(events.listSeats(7L, "AVAILABLE"))
+        when(events.listSeats(7L, SeatStatus.AVAILABLE))
                 .thenReturn(List.of(new SeatResponse(10L, "Orchestra", "A", 1, SeatStatus.AVAILABLE)));
 
         mvc.perform(get("/api/v1/events/7/seats").param("status", "AVAILABLE"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$[0].id").value(10))
                 .andExpect(jsonPath("$[0].status").value("AVAILABLE"));
+    }
+
+    @Test
+    void listSeatsWithUnknownStatusReturns400() throws Exception {
+        mvc.perform(get("/api/v1/events/7/seats").param("status", "BOGUS"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.error").value("Bad Request"));
     }
 
     @Test
