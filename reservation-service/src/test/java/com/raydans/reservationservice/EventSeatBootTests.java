@@ -15,6 +15,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -34,6 +35,9 @@ class EventSeatBootTests {
 
     @Autowired
     JdbcTemplate jdbc;
+
+    @Autowired
+    TransactionTemplate transactionTemplate;
 
     @DynamicPropertySource
     static void datasourceProperties(DynamicPropertyRegistry registry) {
@@ -99,6 +103,26 @@ class EventSeatBootTests {
                 eventId.longValue()))
                 .isInstanceOf(DataIntegrityViolationException.class)
                 .hasMessageContaining("uq_seats_event_section_row_number");
+    }
+
+    @Test
+    void seatUniquenessViolationRollsBackEventAndSeatsTogether() {
+        assertThatThrownBy(() -> transactionTemplate.executeWithoutResult(status -> {
+            jdbc.update(
+                    "INSERT INTO reservation.events (name, venue, event_date) VALUES ('Rollback Test', 'Metropolitan Opera', now())");
+            Long eventId = jdbc.queryForObject(
+                    "SELECT id FROM reservation.events WHERE name = 'Rollback Test'", Long.class);
+            jdbc.update(
+                    "INSERT INTO reservation.seats (event_id, section, \"row\", seat_number) VALUES (?, 'Orchestra', 'A', 1)",
+                    eventId);
+            jdbc.update(
+                    "INSERT INTO reservation.seats (event_id, section, \"row\", seat_number) VALUES (?, 'Orchestra', 'A', 1)",
+                    eventId);
+        })).isInstanceOf(DataIntegrityViolationException.class);
+
+        Integer events = jdbc.queryForObject(
+                "SELECT count(*) FROM reservation.events WHERE name = 'Rollback Test'", Integer.class);
+        assertThat(events).isZero();
     }
 
     @Test

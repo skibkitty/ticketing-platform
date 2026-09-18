@@ -20,6 +20,9 @@ import org.springframework.dao.DataIntegrityViolationException;
 @ExtendWith(MockitoExtension.class)
 class JpaEventServiceTest {
 
+    static final String UNIQUE_VIOLATION_SQLSTATE = "23505";
+    static final String FOREIGN_KEY_SQLSTATE = "23503";
+
     @Mock
     EventRepository events;
 
@@ -63,9 +66,25 @@ class JpaEventServiceTest {
     }
 
     @Test
+    void uniqueViolationBySqlStateIsReportedAsDuplicateSeatEvenWithoutConstraintName() {
+        when(events.save(any())).thenReturn(new EventEntity("Opening Night", "Metropolitan Opera", Instant.now()));
+        when(seats.save(any())).thenThrow(uniqueViolationBySqlState(UNIQUE_VIOLATION_SQLSTATE));
+
+        assertThatThrownBy(() -> service.create(validRequest)).isInstanceOf(DuplicateSeatException.class);
+    }
+
+    @Test
     void unrelatedIntegrityViolationIsNotReportedAsDuplicateSeat() {
         when(events.save(any())).thenReturn(new EventEntity("Opening Night", "Metropolitan Opera", Instant.now()));
         when(seats.save(any())).thenThrow(uniqueViolation("uq_other_things_constraint"));
+
+        assertThatThrownBy(() -> service.create(validRequest)).isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    void nonUniqueIntegrityViolationIsNotReportedAsDuplicateSeat() {
+        when(events.save(any())).thenReturn(new EventEntity("Opening Night", "Metropolitan Opera", Instant.now()));
+        when(seats.save(any())).thenThrow(uniqueViolationBySqlState(FOREIGN_KEY_SQLSTATE));
 
         assertThatThrownBy(() -> service.create(validRequest)).isInstanceOf(DataIntegrityViolationException.class);
     }
@@ -77,5 +96,10 @@ class JpaEventServiceTest {
                         new SQLException("duplicate key"),
                         constraintName);
         return new DataIntegrityViolationException("StatementCallback; SQL", cause);
+    }
+
+    private DataIntegrityViolationException uniqueViolationBySqlState(String sqlState) {
+        return new DataIntegrityViolationException(
+                "StatementCallback; SQL", new SQLException("violates constraint", sqlState));
     }
 }

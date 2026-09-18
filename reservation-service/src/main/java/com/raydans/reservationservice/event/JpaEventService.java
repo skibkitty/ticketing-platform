@@ -8,6 +8,7 @@ import com.raydans.reservationservice.web.EventSummary;
 import com.raydans.reservationservice.web.ResourceNotFoundException;
 import com.raydans.reservationservice.web.SeatResponse;
 import com.raydans.reservationservice.web.SeatStatus;
+import java.sql.SQLException;
 import java.util.List;
 import org.hibernate.exception.ConstraintViolationException;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -18,6 +19,7 @@ import org.springframework.transaction.annotation.Transactional;
 public class JpaEventService implements EventService {
 
     private static final String SEAT_UNIQUENESS_CONSTRAINT = "uq_seats_event_section_row_number";
+    private static final String UNIQUE_VIOLATION_SQLSTATE = "23505";
     private static final String DUPLICATE_MESSAGE =
             "Seats must be unique per event: duplicate section/row/seatNumber detected";
 
@@ -89,6 +91,9 @@ public class JpaEventService implements EventService {
         for (Throwable cause = ex; cause != null; cause = cause.getCause()) {
             if (cause instanceof ConstraintViolationException cve
                     && SEAT_UNIQUENESS_CONSTRAINT.equals(cve.getConstraintName())) {
+                return true;
+            }
+            if (cause instanceof SQLException sql && UNIQUE_VIOLATION_SQLSTATE.equals(sql.getSQLState())) {
                 return true;
             }
         }
