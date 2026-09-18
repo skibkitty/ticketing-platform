@@ -6,10 +6,10 @@ import java.time.Instant;
 import java.util.List;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 /** Maps every reservation-service failure to the shared {@code ApiErrorResponse} error contract. */
@@ -47,6 +47,14 @@ public class GlobalExceptionHandler {
     ResponseEntity<ApiErrorResponse> typeMismatch(MethodArgumentTypeMismatchException ex, HttpServletRequest request) {
         HttpStatus status = HttpStatus.BAD_REQUEST;
         String message = "Invalid value for '" + ex.getName() + "': '" + ex.getValue() + "'";
+        return ResponseEntity.status(status).body(error(status, status.getReasonPhrase(), message, request, List.of()));
+    }
+
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    ResponseEntity<ApiErrorResponse> unreadableBody(
+            HttpMessageNotReadableException ex, HttpServletRequest request) {
+        HttpStatus status = HttpStatus.BAD_REQUEST;
+        String message = "Malformed request body: " + (ex.getMessage() == null ? "unreadable payload" : ex.getMessage());
         return ResponseEntity.status(status).body(error(status, status.getReasonPhrase(), message, request, List.of()));
     }
 

@@ -28,13 +28,18 @@ public class EventController {
     ResponseEntity<CreateEventResponse> create(
             @Valid @RequestBody CreateEventRequest request, UriComponentsBuilder builder) {
         CreateEventResponse created = events.create(request);
-        URI location = builder.path("/api/v1/events/{id}/seats").buildAndExpand(created.eventId()).toUri();
+        URI location = builder.path("/api/v1/events/{id}").buildAndExpand(created.eventId()).toUri();
         return ResponseEntity.created(location).body(created);
     }
 
     @GetMapping
     List<EventSummary> listEvents() {
         return events.list();
+    }
+
+    @GetMapping("/{eventId}")
+    EventSummary getEvent(@PathVariable("eventId") Long eventId) {
+        return events.get(eventId);
     }
 
     @GetMapping("/{eventId}/seats")

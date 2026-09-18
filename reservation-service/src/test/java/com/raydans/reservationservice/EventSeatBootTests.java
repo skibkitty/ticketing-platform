@@ -53,17 +53,30 @@ class EventSeatBootTests {
                 Map.of("section", "Orchestra", "row", "A", "seatNumber", 2)));
 
         assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        assertThat(created.getHeaders().getFirst("Location")).isNotBlank();
         assertThat(created.getBody().get("eventId")).isNotNull();
+        Number eventId = (Number) created.getBody().get("eventId");
+        assertThat(created.getHeaders().getFirst("Location"))
+                .endsWith("/api/v1/events/" + eventId);
 
         @SuppressWarnings("unchecked")
         List<Number> seatIds = (List<Number>) created.getBody().get("seatIds");
         assertThat(seatIds).hasSize(2);
 
-        Number eventId = (Number) created.getBody().get("eventId");
+        ResponseEntity<Map> event = rest.getForEntity("/api/v1/events/" + eventId, Map.class);
+        assertThat(event.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(event.getBody()).containsEntry("id", eventId);
+        assertThat(event.getBody()).containsEntry("name", "Opening Night");
+
         ResponseEntity<List> all = rest.getForEntity("/api/v1/events/" + eventId + "/seats", List.class);
         assertThat(all.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(all.getBody()).hasSize(2);
+    }
+
+    @Test
+    void getEventForUnknownIdReturnsNotFound() {
+        ResponseEntity<Map> response = rest.getForEntity("/api/v1/events/422", Map.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getBody()).containsEntry("status", 404);
     }
 
     @Test

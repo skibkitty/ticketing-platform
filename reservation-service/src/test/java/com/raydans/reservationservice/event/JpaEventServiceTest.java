@@ -82,6 +82,15 @@ class JpaEventServiceTest {
     }
 
     @Test
+    void differentlyNamedConstraintTakesPrecedenceOverUniqueSqlState() {
+        when(events.save(any())).thenReturn(new EventEntity("Opening Night", "Metropolitan Opera", Instant.now()));
+        when(seats.save(any()))
+                .thenThrow(uniqueViolationWithSqlState(UNIQUE_VIOLATION_SQLSTATE, "uq_some_other_constraint"));
+
+        assertThatThrownBy(() -> service.create(validRequest)).isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
     void nonUniqueIntegrityViolationIsNotReportedAsDuplicateSeat() {
         when(events.save(any())).thenReturn(new EventEntity("Opening Night", "Metropolitan Opera", Instant.now()));
         when(seats.save(any())).thenThrow(uniqueViolationBySqlState(FOREIGN_KEY_SQLSTATE));
@@ -90,10 +99,14 @@ class JpaEventServiceTest {
     }
 
     private DataIntegrityViolationException uniqueViolation(String constraintName) {
+        return uniqueViolationWithSqlState(null, constraintName);
+    }
+
+    private DataIntegrityViolationException uniqueViolationWithSqlState(String sqlState, String constraintName) {
         org.hibernate.exception.ConstraintViolationException cause =
                 new org.hibernate.exception.ConstraintViolationException(
                         "duplicate key value violates unique constraint \"" + constraintName + "\"",
-                        new SQLException("duplicate key"),
+                        new SQLException("duplicate key", sqlState),
                         constraintName);
         return new DataIntegrityViolationException("StatementCallback; SQL", cause);
     }

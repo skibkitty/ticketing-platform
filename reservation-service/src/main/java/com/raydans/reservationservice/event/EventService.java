@@ -12,6 +12,8 @@ public interface EventService {
 
     CreateEventResponse create(CreateEventRequest request);
 
+    EventSummary get(Long eventId);
+
     List<EventSummary> list();
 
     List<SeatResponse> listSeats(Long eventId, SeatStatus status);

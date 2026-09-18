@@ -48,7 +48,73 @@ class EventControllerTest {
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.eventId").value(7))
                 .andExpect(jsonPath("$.seatIds[0]").value(10))
-                .andExpect(jsonPath("$.seatIds[1]").value(11));
+                .andExpect(jsonPath("$.seatIds[1]").value(11))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.header()
+                        .string("Location", org.hamcrest.Matchers.endsWith("/api/v1/events/7")));
+    }
+
+    @Test
+    void createEventRejectsUnparsableEventDateAs400() throws Exception {
+        mvc.perform(post("/api/v1/events")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"name":"Opening Night","venue":"Metropolitan Opera",
+                                 "eventDate":"not-a-date",
+                                 "seats":[{"section":"Orchestra","row":"A","seatNumber":1}]}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.error").value("Bad Request"));
+    }
+
+    @Test
+    void createEventRejectsUnknownSeatStatusAs400() throws Exception {
+        mvc.perform(post("/api/v1/events")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"name":"Opening Night","venue":"Metropolitan Opera",
+                                 "eventDate":"2026-11-01T19:30:00Z",
+                                 "seats":[{"section":"Orchestra","row":"A","seatNumber":1,"status":"BANANA"}]}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400));
+    }
+
+    @Test
+    void createEventRejectsMalformedJsonAs400() throws Exception {
+        mvc.perform(post("/api/v1/events")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Opening Night\""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400));
+    }
+
+    @Test
+    void createEventRejectsTooLongNameAs400() throws Exception {
+        String longName = "n".repeat(256);
+        mvc.perform(post("/api/v1/events")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"name":"%s","venue":"Metropolitan Opera",
+                                 "eventDate":"2026-11-01T19:30:00Z",
+                                 "seats":[{"section":"Orchestra","row":"A","seatNumber":1}]}"""
+                                .formatted(longName)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.details[0]").value(org.hamcrest.Matchers.containsString("name")));
+    }
+
+    @Test
+    void createEventRejectsTooLongSectionAs400() throws Exception {
+        String longSection = "s".repeat(51);
+        mvc.perform(post("/api/v1/events")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"name":"Opening Night","venue":"Metropolitan Opera",
+                                 "eventDate":"2026-11-01T19:30:00Z",
+                                 "seats":[{"section":"%s","row":"A","seatNumber":1}]}"""
+                                .formatted(longSection)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.details[0]").value(org.hamcrest.Matchers.containsString("section")));
     }
 
     @Test
@@ -91,6 +157,28 @@ class EventControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$[0].id").value(7))
                 .andExpect(jsonPath("$[0].name").value("Opening Night"));
+    }
+
+    @Test
+    void getEventReturnsSummary() throws Exception {
+        when(events.get(7L))
+                .thenReturn(new EventSummary(7L, "Opening Night", "Metropolitan Opera",
+                        Instant.parse("2026-11-01T19:30:00Z")));
+
+        mvc.perform(get("/api/v1/events/7"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(7))
+                .andExpect(jsonPath("$.name").value("Opening Night"));
+    }
+
+    @Test
+    void getEventForUnknownIdReturns404() throws Exception {
+        when(events.get(99L))
+                .thenThrow(new ResourceNotFoundException("Event 99 was not found"));
+
+        mvc.perform(get("/api/v1/events/99"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.status").value(404));
     }
 
     @Test

@@ -50,10 +50,16 @@ public class JpaEventService implements EventService {
 
     @Override
     @Transactional(readOnly = true)
+    public EventSummary get(Long eventId) {
+        EventEntity event = events.findById(eventId)
+                .orElseThrow(() -> new ResourceNotFoundException("Event " + eventId + " was not found"));
+        return toSummary(event);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
     public List<EventSummary> list() {
-        return events.findAll().stream()
-                .map(e -> new EventSummary(e.getId(), e.getName(), e.getVenue(), e.getEventDate()))
-                .toList();
+        return events.findAll().stream().map(this::toSummary).toList();
     }
 
     @Override
@@ -68,6 +74,10 @@ public class JpaEventService implements EventService {
         return seats.stream()
                 .map(s -> new SeatResponse(s.getId(), s.getSection(), s.getRow(), s.getSeatNumber(), s.getStatus()))
                 .toList();
+    }
+
+    private EventSummary toSummary(EventEntity e) {
+        return new EventSummary(e.getId(), e.getName(), e.getVenue(), e.getEventDate());
     }
 
     private void requireUniqueSeats(CreateEventRequest request) {
@@ -88,16 +98,20 @@ public class JpaEventService implements EventService {
     }
 
     private boolean isSeatUniquenessViolation(DataIntegrityViolationException ex) {
+        String constraintName = null;
+        boolean sqlStateUnique = false;
         for (Throwable cause = ex; cause != null; cause = cause.getCause()) {
-            if (cause instanceof ConstraintViolationException cve
-                    && SEAT_UNIQUENESS_CONSTRAINT.equals(cve.getConstraintName())) {
-                return true;
+            if (cause instanceof ConstraintViolationException cve && cve.getConstraintName() != null) {
+                constraintName = cve.getConstraintName();
+                if (SEAT_UNIQUENESS_CONSTRAINT.equals(constraintName)) {
+                    return true;
+                }
             }
             if (cause instanceof SQLException sql && UNIQUE_VIOLATION_SQLSTATE.equals(sql.getSQLState())) {
-                return true;
+                sqlStateUnique = true;
             }
         }
-        return false;
+        return constraintName == null && sqlStateUnique;
     }
 
     private SeatStatus statusOf(CreateSeatRequest seat) {
