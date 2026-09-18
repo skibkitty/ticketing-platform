@@ -8,7 +8,9 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.raydans.reservationservice.event.DuplicateSeatException;
 import com.raydans.reservationservice.event.EventService;
+import com.raydans.reservationservice.event.ResourceNotFoundException;
 import java.time.Instant;
 import java.util.List;
 import org.junit.jupiter.api.BeforeEach;

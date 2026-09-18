@@ -1,9 +1,13 @@
 package com.raydans.reservationservice.web;
 
 import com.raydans.common.web.ApiErrorResponse;
+import com.raydans.reservationservice.event.DuplicateSeatException;
+import com.raydans.reservationservice.event.ResourceNotFoundException;
 import jakarta.servlet.http.HttpServletRequest;
 import java.time.Instant;
 import java.util.List;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -15,6 +19,8 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 /** Maps every reservation-service failure to the shared {@code ApiErrorResponse} error contract. */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
     @ExceptionHandler(SeatUnavailableException.class)
     ResponseEntity<ApiErrorResponse> seatUnavailable(SeatUnavailableException ex, HttpServletRequest request) {
@@ -60,8 +66,10 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(Exception.class)
     ResponseEntity<ApiErrorResponse> fallback(Exception ex, HttpServletRequest request) {
+        log.error("Unhandled exception on {} {}", request.getMethod(), request.getRequestURI(), ex);
         HttpStatus status = HttpStatus.INTERNAL_SERVER_ERROR;
-        return ResponseEntity.status(status).body(error(status, ex, request));
+        String message = "An unexpected error occurred";
+        return ResponseEntity.status(status).body(error(status, status.getReasonPhrase(), message, request, List.of()));
     }
 
     private ApiErrorResponse error(HttpStatus status, Exception ex, HttpServletRequest request) {

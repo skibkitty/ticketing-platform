@@ -1,12 +1,17 @@
 package com.raydans.reservationservice.event;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.raydans.reservationservice.web.CreateEventRequest;
+import com.raydans.reservationservice.web.CreateEventResponse;
 import com.raydans.reservationservice.web.CreateSeatRequest;
-import com.raydans.reservationservice.web.DuplicateSeatException;
+import com.raydans.reservationservice.web.SeatStatus;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.List;
@@ -41,6 +46,34 @@ class JpaEventServiceTest {
     @BeforeEach
     void setUp() {
         service = new JpaEventService(events, seats);
+    }
+
+    @Test
+    void createPersistsEventAndAllSeatsAndReturnsIds() {
+        EventEntity event = mock(EventEntity.class);
+        when(event.getId()).thenReturn(7L);
+        SeatEntity seat1 = mock(SeatEntity.class);
+        SeatEntity seat2 = mock(SeatEntity.class);
+        when(seat1.getId()).thenReturn(10L);
+        when(seat2.getId()).thenReturn(11L);
+        when(events.save(any(EventEntity.class))).thenReturn(event);
+        when(seats.save(any(SeatEntity.class))).thenReturn(seat1, seat2);
+
+        CreateEventRequest request =
+                new CreateEventRequest(
+                        "Opening Night",
+                        "Metropolitan Opera",
+                        Instant.parse("2026-11-01T19:30:00Z"),
+                        List.of(
+                                new CreateSeatRequest("Orchestra", "A", 1, null),
+                                new CreateSeatRequest("Orchestra", "B", 2, null)));
+
+        CreateEventResponse response = service.create(request);
+
+        assertThat(response.eventId()).isEqualTo(7L);
+        assertThat(response.seatIds()).containsExactly(10L, 11L);
+        verify(events).save(any(EventEntity.class));
+        verify(seats, times(2)).save(any(SeatEntity.class));
     }
 
     @Test
