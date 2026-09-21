@@ -131,8 +131,10 @@ class ReservationFlowBootTests {
         Integer reservationsForLoser = jdbc.queryForObject(
                 "SELECT count(*) FROM reservation.reservations WHERE customer_id = 8", Integer.class);
         assertThat(reservationsForLoser).isZero();
+        long firstReservationId = ((Number) first.getBody().get("id")).longValue();
         Integer seatLinks = jdbc.queryForObject(
-                "SELECT count(*) FROM reservation.reservation_seats", Integer.class);
+                "SELECT count(*) FROM reservation.reservation_seats WHERE reservation_id = ?",
+                Integer.class, firstReservationId);
         assertThat(seatLinks).isEqualTo(1);
     }
 
