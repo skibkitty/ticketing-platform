@@ -19,6 +19,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
+import org.mockito.ArgumentCaptor;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DataIntegrityViolationException;
 
@@ -41,7 +42,7 @@ class JpaEventServiceTest {
                     "Opening Night",
                     "Metropolitan Opera",
                     Instant.parse("2026-11-01T19:30:00Z"),
-                    List.of(new CreateSeatRequest("Orchestra", "A", 1, null)));
+                    List.of(new CreateSeatRequest("Orchestra", "A", 1, 15000, null)));
 
     @BeforeEach
     void setUp() {
@@ -65,8 +66,8 @@ class JpaEventServiceTest {
                         "Metropolitan Opera",
                         Instant.parse("2026-11-01T19:30:00Z"),
                         List.of(
-                                new CreateSeatRequest("Orchestra", "A", 1, null),
-                                new CreateSeatRequest("Orchestra", "B", 2, null)));
+                                new CreateSeatRequest("Orchestra", "A", 1, 15000, null),
+                                new CreateSeatRequest("Orchestra", "B", 2, 12000, null)));
 
         CreateEventResponse response = service.create(request);
 
@@ -84,10 +85,34 @@ class JpaEventServiceTest {
                         "Metropolitan Opera",
                         Instant.parse("2026-11-01T19:30:00Z"),
                         List.of(
-                                new CreateSeatRequest("Orchestra", "A", 1, null),
-                                new CreateSeatRequest("Orchestra", "A", 1, null)));
+                                new CreateSeatRequest("Orchestra", "A", 1, 15000, null),
+                                new CreateSeatRequest("Orchestra", "A", 1, 15000, null)));
 
         assertThatThrownBy(() -> service.create(request)).isInstanceOf(DuplicateSeatException.class);
+    }
+
+    @Test
+    void seatPriceIsPersistedAndDefaultsToZero() {
+        EventEntity event = mock(EventEntity.class);
+        when(event.getId()).thenReturn(7L);
+        when(events.save(any(EventEntity.class))).thenReturn(event);
+        when(seats.save(any(SeatEntity.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        CreateEventRequest request =
+                new CreateEventRequest(
+                        "Opening Night",
+                        "Metropolitan Opera",
+                        Instant.parse("2026-11-01T19:30:00Z"),
+                        List.of(
+                                new CreateSeatRequest("Orchestra", "A", 1, 15000, null),
+                                new CreateSeatRequest("Orchestra", "B", 2, null, null)));
+
+        service.create(request);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<SeatEntity> captor = ArgumentCaptor.forClass(SeatEntity.class);
+        verify(seats, times(2)).save(captor.capture());
+        assertThat(captor.getAllValues()).extracting(SeatEntity::getPriceCents).containsExactly(15000, 0);
     }
 
     @Test

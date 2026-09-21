@@ -13,6 +13,7 @@ import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
 import jakarta.persistence.Version;
+import java.time.Instant;
 
 @Entity
 @Table(schema = "reservation", name = "seats")
@@ -35,6 +36,12 @@ public class SeatEntity {
     @Column(name = "seat_number", nullable = false)
     private int seatNumber;
 
+    @Column(name = "price_cents", nullable = false)
+    private int priceCents;
+
+    @Column(name = "hold_expires_at")
+    private Instant holdExpiresAt;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 20)
     private SeatStatus status;
@@ -45,12 +52,14 @@ public class SeatEntity {
 
     protected SeatEntity() {}
 
-    public SeatEntity(EventEntity event, String section, String row, int seatNumber, SeatStatus status) {
+    public SeatEntity(EventEntity event, String section, String row, int seatNumber, int priceCents, SeatStatus status) {
         this.event = event;
         this.section = section;
         this.row = row;
         this.seatNumber = seatNumber;
+        this.priceCents = priceCents;
         this.status = status;
+        this.version = 0;
     }
 
     public Long getId() {
@@ -73,7 +82,20 @@ public class SeatEntity {
         return seatNumber;
     }
 
+    public int getPriceCents() {
+        return priceCents;
+    }
+
+    public Instant getHoldExpiresAt() {
+        return holdExpiresAt;
+    }
+
     public SeatStatus getStatus() {
         return status;
+    }
+
+    public void flipToHeld(Instant expiresAt) {
+        status = SeatStatus.HELD;
+        holdExpiresAt = expiresAt;
     }
 }

@@ -37,7 +37,8 @@ public class JpaEventService implements EventService {
         List<Long> seatIds;
         try {
             seatIds = request.seats().stream()
-                    .map(s -> seats.save(new SeatEntity(event, s.section(), s.row(), s.seatNumber(), statusOf(s))))
+                    .map(s -> seats.save(new SeatEntity(event, s.section(), s.row(), s.seatNumber(),
+                            priceOf(s), statusOf(s))))
                     .map(SeatEntity::getId)
                     .toList();
         } catch (DataIntegrityViolationException ex) {
@@ -70,7 +71,8 @@ public class JpaEventService implements EventService {
                 ? this.seats.findByEvent_IdOrderById(eventId)
                 : this.seats.findByEvent_IdAndStatusOrderById(eventId, status);
         return seats.stream()
-                .map(s -> new SeatResponse(s.getId(), s.getSection(), s.getRow(), s.getSeatNumber(), s.getStatus()))
+                .map(s -> new SeatResponse(s.getId(), s.getSection(), s.getRow(), s.getSeatNumber(),
+                        s.getPriceCents(), s.getStatus()))
                 .toList();
     }
 
@@ -114,6 +116,10 @@ public class JpaEventService implements EventService {
 
     private SeatStatus statusOf(CreateSeatRequest seat) {
         return seat.status() == null ? SeatStatus.AVAILABLE : seat.status();
+    }
+
+    private int priceOf(CreateSeatRequest seat) {
+        return seat.priceCents() == null ? 0 : seat.priceCents();
     }
 
     private record SeatKey(String section, String row, int seatNumber) {}

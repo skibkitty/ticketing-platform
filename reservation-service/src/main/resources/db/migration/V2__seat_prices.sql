@@ -1,0 +1,1 @@
+ALTER TABLE seats ADD COLUMN price_cents INT NOT NULL DEFAULT 0;
