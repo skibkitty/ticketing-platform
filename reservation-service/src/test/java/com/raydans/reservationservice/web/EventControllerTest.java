@@ -65,7 +65,8 @@ class EventControllerTest {
                                  "seats":[{"section":"Orchestra","row":"A","seatNumber":1}]}"""))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.status").value(400))
-                .andExpect(jsonPath("$.error").value("Bad Request"));
+                .andExpect(jsonPath("$.error").value("Bad Request"))
+                .andExpect(jsonPath("$.message").value("Malformed request body"));
     }
 
     @Test
@@ -77,7 +78,8 @@ class EventControllerTest {
                                  "eventDate":"2026-11-01T19:30:00Z",
                                  "seats":[{"section":"Orchestra","row":"A","seatNumber":1,"status":"BANANA"}]}"""))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.status").value(400));
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.message").value("Malformed request body"));
     }
 
     @Test
@@ -86,7 +88,8 @@ class EventControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"Opening Night\""))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.status").value(400));
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.message").value("Malformed request body"));
     }
 
     @Test
