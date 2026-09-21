@@ -1,4 +1,4 @@
-package com.raydans.reservationservice.web;
+package com.raydans.reservationservice.event;
 
 public class ResourceNotFoundException extends RuntimeException {
 
