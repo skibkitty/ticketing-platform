@@ -71,8 +71,7 @@ public class JpaEventService implements EventService {
                 ? this.seats.findByEvent_IdOrderById(eventId)
                 : this.seats.findByEvent_IdAndStatusOrderById(eventId, status);
         return seats.stream()
-                .map(s -> new SeatResponse(s.getId(), s.getSection(), s.getRow(), s.getSeatNumber(),
-                        s.getPriceCents(), s.getStatus()))
+                .map(SeatResponse::from)
                 .toList();
     }
 

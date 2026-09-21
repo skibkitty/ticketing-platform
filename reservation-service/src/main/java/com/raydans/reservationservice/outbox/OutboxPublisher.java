@@ -45,7 +45,7 @@ public class OutboxPublisher {
         try {
             String key = aggregateId(row.getAggregateId()).toString();
             EventEnvelope<JsonNode> envelope = new EventEnvelope<>(
-                    UUID.randomUUID(),
+                    row.getEventId(),
                     row.getEventType(),
                     Instant.now(),
                     row.getCorrelationId(),

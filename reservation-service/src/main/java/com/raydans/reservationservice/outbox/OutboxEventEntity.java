@@ -7,6 +7,7 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import java.time.Instant;
+import java.util.UUID;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
@@ -17,6 +18,9 @@ public class OutboxEventEntity {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
+
+    @Column(name = "event_id")
+    private UUID eventId;
 
     @Column(name = "aggregate_type", nullable = false, length = 100)
     private String aggregateType;
@@ -42,7 +46,9 @@ public class OutboxEventEntity {
 
     protected OutboxEventEntity() {}
 
-    public OutboxEventEntity(String aggregateType, long aggregateId, String eventType, String payload, String correlationId) {
+    public OutboxEventEntity(
+            UUID eventId, String aggregateType, long aggregateId, String eventType, String payload, String correlationId) {
+        this.eventId = eventId;
         this.aggregateType = aggregateType;
         this.aggregateId = aggregateId;
         this.eventType = eventType;
@@ -53,6 +59,10 @@ public class OutboxEventEntity {
 
     public Long getId() {
         return id;
+    }
+
+    public UUID getEventId() {
+        return eventId;
     }
 
     public String getAggregateType() {

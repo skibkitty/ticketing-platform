@@ -77,6 +77,9 @@ class JpaReservationService implements ReservationService {
     }
 
     private List<SeatEntity> loadAndFlipSeats(ReservationRequest request, Instant holdExpiresAt) {
+        if (request.seatIds().isEmpty()) {
+            throw new SeatUnavailableException("At least one seat must be requested");
+        }
         List<SeatEntity> seatList = seats.findAllById(request.seatIds());
         if (seatList.size() != new LinkedHashSet<>(request.seatIds()).size()) {
             throw new SeatUnavailableException("One or more requested seats are not available");
@@ -91,7 +94,6 @@ class JpaReservationService implements ReservationService {
         for (SeatEntity seat : seatList) {
             seat.flipToHeld(holdExpiresAt);
         }
-        seats.saveAll(seatList);
 
         return seatList;
     }
@@ -113,6 +115,7 @@ class JpaReservationService implements ReservationService {
                             heldSeats.stream().map(SeatEntity::getId).toList(),
                             heldSeats.stream().mapToInt(SeatEntity::getPriceCents).sum()));
             OutboxEventEntity event = new OutboxEventEntity(
+                    UUID.randomUUID(),
                     "Reservation",
                     reservation.getId(),
                     RESERVATION_CREATED,
@@ -131,8 +134,7 @@ class JpaReservationService implements ReservationService {
 
     private ReservationResponse toResponse(ReservationEntity reservation) {
         List<SeatResponse> seatDtos = reservation.getSeats().stream()
-                .map(s -> new SeatResponse(s.getId(), s.getSection(), s.getRow(),
-                        s.getSeatNumber(), s.getPriceCents(), s.getStatus()))
+                .map(SeatResponse::from)
                 .toList();
         int total = seatDtos.stream().mapToInt(SeatResponse::priceCents).sum();
         return new ReservationResponse(

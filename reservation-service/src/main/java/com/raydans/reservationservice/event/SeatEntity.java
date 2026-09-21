@@ -59,7 +59,6 @@ public class SeatEntity {
         this.seatNumber = seatNumber;
         this.priceCents = priceCents;
         this.status = status;
-        this.version = 0;
     }
 
     public Long getId() {

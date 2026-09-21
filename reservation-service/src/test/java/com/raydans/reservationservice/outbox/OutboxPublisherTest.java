@@ -33,7 +33,9 @@ class OutboxPublisherTest {
 
     @Test
     void publishBuildsKeyedEnvelopeCarryingCorrelationHeaderAndMarksPublishedOnAck() {
+        UUID eventId = UUID.randomUUID();
         OutboxEventEntity row = new OutboxEventEntity(
+                eventId,
                 "Reservation",
                 42L,
                 "reservation.ReservationCreated",
@@ -56,6 +58,7 @@ class OutboxPublisherTest {
                 .isEqualTo(new UUID(0L, 42L).toString());
         assertThat(message.getHeaders().get("X-Correlation-Id")).isEqualTo("cid-123");
         assertThat(message.getPayload())
+                .contains("\"eventId\":\"" + eventId + "\"")
                 .contains("\"eventType\":\"reservation.ReservationCreated\"")
                 .contains("\"correlationId\":\"cid-123\"")
                 .contains("\"aggregateId\":\"" + new UUID(0L, 42L) + "\"")
@@ -69,7 +72,7 @@ class OutboxPublisherTest {
     @Test
     void failedSendLeavesRowUnpublishedForRetry() {
         OutboxEventEntity row = new OutboxEventEntity(
-                "Reservation", 42L, "reservation.ReservationCreated",
+                UUID.randomUUID(), "Reservation", 42L, "reservation.ReservationCreated",
                 "{\"reservationId\":42}", "cid-123");
         when(kafka.send(any(Message.class))).thenAnswer(invocation -> {
             CompletableFuture<Object> f = new CompletableFuture<>();
@@ -88,7 +91,7 @@ class OutboxPublisherTest {
     void pollPublishesEachUnpublishedRow() {
         OutboxPublisher publisher = new OutboxPublisher(outbox, kafka, objectMapper);
         OutboxEventEntity row = new OutboxEventEntity(
-                "Reservation", 7L, "reservation.ReservationCreated",
+                UUID.randomUUID(), "Reservation", 7L, "reservation.ReservationCreated",
                 "{\"reservationId\":7}", "cid-7");
         when(outbox.findFirst20ByPublishedAtIsNullOrderByIdAsc()).thenReturn(List.of(row));
         when(kafka.send(any(Message.class))).thenAnswer(invocation -> completed());

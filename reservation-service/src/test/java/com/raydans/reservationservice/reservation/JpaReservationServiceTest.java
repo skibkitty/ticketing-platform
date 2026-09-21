@@ -85,7 +85,7 @@ class JpaReservationServiceTest {
         assertThat(seat2.getStatus()).isEqualTo(SeatStatus.HELD);
         assertThat(seat1.getHoldExpiresAt()).isAfter(Instant.now());
         assertThat(seat2.getHoldExpiresAt()).isEqualTo(seat1.getHoldExpiresAt());
-        verify(seats).saveAll(List.of(seat1, seat2));
+        verify(seats, never()).save(any(SeatEntity.class));
 
         ArgumentCaptor<OutboxEventEntity> outboxCaptor = ArgumentCaptor.forClass(OutboxEventEntity.class);
         verify(outbox).save(outboxCaptor.capture());
@@ -138,7 +138,7 @@ class JpaReservationServiceTest {
     }
 
     @Test
-    void createLoserOfVersionConflictGetsSeatUnavailableAndWritesNothing() {
+    void createLoserOfVersionConflictGetsSeatUnavailableAndPersistsNothing() {
         SeatEntity seat1 = seat(10L, "Orchestra", "A", 1, 15000);
         SeatEntity seat2 = seat(11L, "Orchestra", "B", 2, 12000);
         when(seats.findAllById(List.of(10L, 11L))).thenReturn(List.of(seat1, seat2));
@@ -147,6 +147,18 @@ class JpaReservationServiceTest {
 
         assertThatThrownBy(() -> service.create(new ReservationRequest(7L, List.of(10L, 11L)), 99L))
                 .isInstanceOf(SeatUnavailableException.class);
+
+        verify(seats, never()).save(any());
+        verify(seats, never()).saveAndFlush(any());
+        verify(outbox, never()).save(any());
+    }
+
+    @Test
+    void createWithNoSeatsRejectsBeforeAnyPersist() {
+        assertThatThrownBy(() -> service.create(new ReservationRequest(7L, List.of()), 99L))
+                .isInstanceOf(SeatUnavailableException.class);
+        verify(seats, never()).findAllById(any());
+        verify(reservations, never()).saveAndFlush(any());
         verify(outbox, never()).save(any());
     }
 
