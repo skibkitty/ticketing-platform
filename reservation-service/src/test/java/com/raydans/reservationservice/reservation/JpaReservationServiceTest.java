@@ -178,18 +178,39 @@ class JpaReservationServiceTest {
     }
 
     @Test
-    void getOfOverduePendingReservationExpiresItBeforeReturning() {
+    void getOfOverduePendingReservationExpiresItAndReleasesLapsedSeats() {
+        SeatEntity seat = heldSeat(10L, Instant.now().minusSeconds(1));
         ReservationEntity overdue = reservationEntity(42L);
         overdue.getSeats().clear();
+        overdue.getSeats().add(seat);
         ReflectionTestUtils.setField(overdue, "expiresAt", Instant.now().minusSeconds(1));
         when(reservations.findById(42L)).thenReturn(Optional.of(overdue));
 
         ReservationResponse response = service.get(42L);
 
         assertThat(response.status()).isEqualTo(ReservationStatus.EXPIRED);
+        assertThat(seat.getStatus()).isEqualTo(SeatStatus.AVAILABLE);
         ArgumentCaptor<ReservationEntity> captor = ArgumentCaptor.forClass(ReservationEntity.class);
         verify(reservations).save(captor.capture());
         assertThat(captor.getValue().getStatus()).isEqualTo(ReservationStatus.EXPIRED);
+        verify(seats).saveAll(List.of(seat));
+    }
+
+    @Test
+    void getOfOverdueReservationKeepsSeatWithStillLiveHold() {
+        SeatEntity seat = heldSeat(10L, Instant.now().plusSeconds(600));
+        ReservationEntity overdue = reservationEntity(42L);
+        overdue.getSeats().clear();
+        overdue.getSeats().add(seat);
+        ReflectionTestUtils.setField(overdue, "expiresAt", Instant.now().minusSeconds(1));
+        when(reservations.findById(42L)).thenReturn(Optional.of(overdue));
+
+        ReservationResponse response = service.get(42L);
+
+        assertThat(response.status()).isEqualTo(ReservationStatus.EXPIRED);
+        assertThat(seat.getStatus()).isEqualTo(SeatStatus.HELD);
+        verify(reservations).save(any());
+        verify(seats, never()).saveAll(any());
     }
 
     @Test
@@ -230,6 +251,13 @@ class JpaReservationServiceTest {
     private SeatEntity seat(long id, String section, String row, int number, int priceCents) {
         SeatEntity entity = new SeatEntity(event, section, row, number, priceCents, SeatStatus.AVAILABLE);
         ReflectionTestUtils.setField(entity, "id", id);
+        return entity;
+    }
+
+    private SeatEntity heldSeat(long id, Instant holdExpiresAt) {
+        SeatEntity entity = new SeatEntity(event, "Orchestra", "C", 3, 15000, SeatStatus.HELD);
+        ReflectionTestUtils.setField(entity, "id", id);
+        entity.flipToHeld(holdExpiresAt);
         return entity;
     }
 

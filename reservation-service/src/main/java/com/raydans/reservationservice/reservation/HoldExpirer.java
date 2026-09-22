@@ -2,8 +2,8 @@ package com.raydans.reservationservice.reservation;
 
 import com.raydans.reservationservice.event.SeatEntity;
 import com.raydans.reservationservice.event.SeatRepository;
-import com.raydans.reservationservice.web.SeatStatus;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -24,22 +24,25 @@ public class HoldExpirer {
     @Transactional
     public void expire() {
         Instant now = Instant.now();
-
-        List<SeatEntity> overdueSeats = seats.findByStatusAndHoldExpiresAtBefore(SeatStatus.HELD, now);
-        for (SeatEntity seat : overdueSeats) {
-            seat.releaseHold();
-        }
-        if (!overdueSeats.isEmpty()) {
-            seats.saveAll(overdueSeats);
-        }
-
-        List<ReservationEntity> overdueReservations =
+        List<ReservationEntity> overdue =
                 reservations.findByStatusAndExpiresAtBefore(ReservationStatus.PENDING_PAYMENT, now);
-        for (ReservationEntity reservation : overdueReservations) {
-            reservation.markExpired();
+        if (overdue.isEmpty()) {
+            return;
         }
-        if (!overdueReservations.isEmpty()) {
-            reservations.saveAll(overdueReservations);
+
+        List<SeatEntity> releasedSeats = new ArrayList<>();
+        for (ReservationEntity reservation : overdue) {
+            reservation.markExpired();
+            for (SeatEntity seat : reservation.getSeats()) {
+                if (seat.releaseHoldIfLapsed(now)) {
+                    releasedSeats.add(seat);
+                }
+            }
+        }
+
+        reservations.saveAll(overdue);
+        if (!releasedSeats.isEmpty()) {
+            seats.saveAll(releasedSeats);
         }
     }
 }

@@ -65,6 +65,8 @@ public class OutboxPublisher {
             row.markPublished();
             outbox.save(row);
         } catch (Exception ex) {
+            // A failure only leaves this row unpublished; the rest of the claimed batch still
+            // publishes and SKIP LOCKED re-claims this row on the next poll.
             log.warn("Failed to publish outbox event {} for aggregate {}; it stays unpublished and will be retried",
                     row.getId(), row.getAggregateId(), ex);
         }

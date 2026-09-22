@@ -181,6 +181,44 @@ class ReservationFlowBootTests {
         assertThat(again.getStatusCode()).isEqualTo(HttpStatus.CREATED);
     }
 
+    @Test
+    void expiringReservationDoesNotReleaseSeatWhoseHoldIsStillLive() {
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Terrace", "row", "A", "seatNumber", 1, "priceCents", 3000)));
+
+        ResponseEntity<Map> reservation =
+                postReservation(created.eventId(), List.of(created.seatIds().get(0)), 31L);
+        assertThat(reservation.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long reservationId = ((Number) reservation.getBody().get("id")).longValue();
+        long seatId = created.seatIds().get(0);
+
+        jdbc.update(
+                "UPDATE reservation.reservations SET expires_at = now() - interval '1 minute' WHERE id = ?",
+                reservationId);
+        String heldUntil = jdbc.queryForObject(
+                "SELECT hold_expires_at FROM reservation.seats WHERE id = ?", String.class, seatId);
+
+        holdExpirer.expire();
+
+        String reservationStatus = jdbc.queryForObject(
+                "SELECT status FROM reservation.reservations WHERE id = ?", String.class, reservationId);
+        assertThat(reservationStatus).isEqualTo("EXPIRED");
+
+        String seatStatus = jdbc.queryForObject(
+                "SELECT status FROM reservation.seats WHERE id = ?", String.class, seatId);
+        assertThat(seatStatus).isEqualTo("HELD");
+        String stillHeldUntil = jdbc.queryForObject(
+                "SELECT hold_expires_at FROM reservation.seats WHERE id = ?", String.class, seatId);
+        assertThat(stillHeldUntil).isEqualTo(heldUntil);
+
+        jdbc.update(
+                "UPDATE reservation.seats SET hold_expires_at = now() - interval '1 minute' WHERE id = ?", seatId);
+        holdExpirer.expire();
+        seatStatus = jdbc.queryForObject(
+                "SELECT status FROM reservation.seats WHERE id = ?", String.class, seatId);
+        assertThat(seatStatus).isEqualTo("AVAILABLE");
+    }
+
     private CreatedEvent postEvent(List<Map<String, Object>> seats) {
         ResponseEntity<Map> response = rest.postForEntity("/api/v1/events", Map.of(
                 "name", "Opening Night",

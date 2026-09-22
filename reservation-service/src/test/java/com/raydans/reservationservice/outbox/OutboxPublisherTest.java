@@ -103,6 +103,32 @@ class OutboxPublisherTest {
     }
 
     @Test
+    void pollContinuesAfterOneSendFailureLeavingOnlyThatRowUnpublished() {
+        OutboxPublisher publisher = new OutboxPublisher(outbox, kafka, objectMapper);
+        OutboxEventEntity failed = new OutboxEventEntity(
+                UUID.randomUUID(), "Reservation", 41L, "reservation.ReservationCreated",
+                "{\"reservationId\":41}", "cid-41");
+        OutboxEventEntity ok = new OutboxEventEntity(
+                UUID.randomUUID(), "Reservation", 42L, "reservation.ReservationCreated",
+                "{\"reservationId\":42}", "cid-42");
+        when(outbox.findUnpublishedBatch()).thenReturn(List.of(failed, ok));
+        when(kafka.send(any(Message.class)))
+                .thenAnswer(invocation -> {
+                    CompletableFuture<Object> f = new CompletableFuture<>();
+                    f.completeExceptionally(new RuntimeException("broker down"));
+                    return f;
+                })
+                .thenAnswer(invocation -> completed());
+
+        publisher.poll();
+
+        assertThat(failed.getPublishedAt()).isNull();
+        assertThat(ok.getPublishedAt()).isNotNull();
+        verify(outbox, never()).save(failed);
+        verify(outbox).save(ok);
+    }
+
+    @Test
     void pollWhenNothingPendingSendsNothing() {
         OutboxPublisher publisher = new OutboxPublisher(outbox, kafka, objectMapper);
         when(outbox.findUnpublishedBatch()).thenReturn(List.of());

@@ -1,6 +1,9 @@
 package com.raydans.reservationservice.reservation;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -34,52 +37,64 @@ class HoldExpirerTest {
     }
 
     @Test
-    void releasesOverdueHeldSeatsBackToAvailable() {
-        SeatEntity overdue = seat(10L, SeatStatus.HELD);
-        overdue.flipToHeld(Instant.now().minusSeconds(1));
-        when(seats.findByStatusAndHoldExpiresAtBefore(org.mockito.ArgumentMatchers.eq(SeatStatus.HELD), org.mockito.ArgumentMatchers.any(Instant.class)))
+    void expiresOverdueReservationAndReleasesExactlyItsLapsedSeats() {
+        SeatEntity seat = heldSeat(10L, Instant.now().minusSeconds(1));
+        ReservationEntity overdue =
+                pendingReservation(42L, List.of(seat), Instant.now().minusSeconds(1));
+        when(reservations.findByStatusAndExpiresAtBefore(
+                        eq(ReservationStatus.PENDING_PAYMENT), any(Instant.class)))
                 .thenReturn(List.of(overdue));
-        when(reservations.findByStatusAndExpiresAtBefore(org.mockito.ArgumentMatchers.eq(ReservationStatus.PENDING_PAYMENT),
-                org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(List.of());
-
-        expirer.expire();
-
-        assertThat(overdue.getStatus()).isEqualTo(SeatStatus.AVAILABLE);
-        assertThat(overdue.getHoldExpiresAt()).isNull();
-        verify(seats).saveAll(List.of(overdue));
-    }
-
-    @Test
-    void marksOverduePendingReservationsExpired() {
-        ReservationEntity overdue = new ReservationEntity(
-                99L, event(7L), ReservationStatus.PENDING_PAYMENT, Instant.now().minusSeconds(1));
-        when(seats.findByStatusAndHoldExpiresAtBefore(org.mockito.ArgumentMatchers.eq(SeatStatus.HELD), org.mockito.ArgumentMatchers.any(Instant.class)))
-                .thenReturn(List.of());
-        when(reservations.findByStatusAndExpiresAtBefore(org.mockito.ArgumentMatchers.eq(ReservationStatus.PENDING_PAYMENT),
-                org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(List.of(overdue));
 
         expirer.expire();
 
         assertThat(overdue.getStatus()).isEqualTo(ReservationStatus.EXPIRED);
+        assertThat(seat.getStatus()).isEqualTo(SeatStatus.AVAILABLE);
+        assertThat(seat.getHoldExpiresAt()).isNull();
         verify(reservations).saveAll(List.of(overdue));
+        verify(seats).saveAll(List.of(seat));
     }
 
     @Test
-    void doesNothingWhenNothingIsOverdue() {
-        when(seats.findByStatusAndHoldExpiresAtBefore(org.mockito.ArgumentMatchers.eq(SeatStatus.HELD), org.mockito.ArgumentMatchers.any(Instant.class)))
-                .thenReturn(List.of());
-        when(reservations.findByStatusAndExpiresAtBefore(org.mockito.ArgumentMatchers.eq(ReservationStatus.PENDING_PAYMENT),
-                org.mockito.ArgumentMatchers.any(Instant.class))).thenReturn(List.of());
+    void doesNotReleaseSeatWhoseHoldIsStillLive() {
+        SeatEntity seat = heldSeat(10L, Instant.now().plusSeconds(600));
+        ReservationEntity overdue =
+                pendingReservation(42L, List.of(seat), Instant.now().minusSeconds(1));
+        when(reservations.findByStatusAndExpiresAtBefore(
+                        eq(ReservationStatus.PENDING_PAYMENT), any(Instant.class)))
+                .thenReturn(List.of(overdue));
 
         expirer.expire();
 
-        verify(seats, org.mockito.Mockito.never()).saveAll(org.mockito.ArgumentMatchers.any());
-        verify(reservations, org.mockito.Mockito.never()).saveAll(org.mockito.ArgumentMatchers.any());
+        assertThat(overdue.getStatus()).isEqualTo(ReservationStatus.EXPIRED);
+        assertThat(seat.getStatus()).isEqualTo(SeatStatus.HELD);
+        verify(reservations).saveAll(List.of(overdue));
+        verify(seats, never()).saveAll(any());
     }
 
-    private SeatEntity seat(long id, SeatStatus status) {
-        SeatEntity entity = new SeatEntity(event(7L), "Orchestra", "A", 1, 15000, status);
+    @Test
+    void doesNothingWhenNoReservationIsOverdue() {
+        when(reservations.findByStatusAndExpiresAtBefore(
+                        eq(ReservationStatus.PENDING_PAYMENT), any(Instant.class)))
+                .thenReturn(List.of());
+
+        expirer.expire();
+
+        verify(reservations, never()).saveAll(any());
+        verify(seats, never()).saveAll(any());
+    }
+
+    private static SeatEntity heldSeat(long id, Instant holdExpiresAt) {
+        SeatEntity entity = new SeatEntity(event(7L), "Orchestra", "A", 1, 15000, SeatStatus.HELD);
         ReflectionTestUtils.setField(entity, "id", id);
+        entity.flipToHeld(holdExpiresAt);
+        return entity;
+    }
+
+    private static ReservationEntity pendingReservation(long id, List<SeatEntity> heldSeats, Instant expiresAt) {
+        ReservationEntity entity = new ReservationEntity(
+                99L, event(7L), ReservationStatus.PENDING_PAYMENT, expiresAt);
+        ReflectionTestUtils.setField(entity, "id", id);
+        entity.getSeats().addAll(heldSeats);
         return entity;
     }
 

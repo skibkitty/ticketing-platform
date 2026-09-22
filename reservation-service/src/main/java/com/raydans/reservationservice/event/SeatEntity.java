@@ -102,4 +102,12 @@ public class SeatEntity {
         status = SeatStatus.AVAILABLE;
         holdExpiresAt = null;
     }
+
+    public boolean releaseHoldIfLapsed(Instant now) {
+        if (status == SeatStatus.HELD && holdExpiresAt != null && holdExpiresAt.isBefore(now)) {
+            releaseHold();
+            return true;
+        }
+        return false;
+    }
 }

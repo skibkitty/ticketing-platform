@@ -16,6 +16,7 @@ import com.raydans.reservationservice.web.SeatStatus;
 import com.raydans.reservationservice.web.SeatUnavailableException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.UUID;
@@ -81,7 +82,17 @@ class JpaReservationService implements ReservationService {
     private void expireIfOverdue(ReservationEntity reservation) {
         if (reservation.getStatus() == ReservationStatus.PENDING_PAYMENT
                 && reservation.getExpiresAt().isBefore(Instant.now())) {
+            Instant now = Instant.now();
             reservation.markExpired();
+            List<SeatEntity> releasedSeats = new ArrayList<>();
+            for (SeatEntity seat : reservation.getSeats()) {
+                if (seat.releaseHoldIfLapsed(now)) {
+                    releasedSeats.add(seat);
+                }
+            }
+            if (!releasedSeats.isEmpty()) {
+                seats.saveAll(releasedSeats);
+            }
             reservations.save(reservation);
         }
     }
