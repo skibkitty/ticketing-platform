@@ -10,6 +10,8 @@ import com.raydans.reservationservice.reservation.HoldExpirer;
 import com.raydans.reservationservice.web.ReservationController;
 import com.raydans.reservationservice.web.SeatStatus;
 import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -285,6 +287,7 @@ class ReservationFlowBootTests {
             ExecutorService executor = Executors.newSingleThreadExecutor();
             try {
                 Future<?> expiry = executor.submit(() -> holdExpirer.expire());
+                awaitExpirerBlockedOnSeatLock(connection);
                 connection.commit();
                 assertThatThrownBy(() -> expiry.get(30, TimeUnit.SECONDS))
                         .isInstanceOf(ExecutionException.class)
@@ -313,6 +316,27 @@ class ReservationFlowBootTests {
         String holdUntil = jdbc.queryForObject(
                 "SELECT hold_expires_at FROM reservation.seats WHERE id = ?", String.class, seatId);
         assertThat(holdUntil).isNotNull();
+    }
+
+    private void awaitExpirerBlockedOnSeatLock(Connection connection)
+            throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < deadline) {
+            try (Statement statement = connection.createStatement()) {
+                try (ResultSet rs = statement.executeQuery(
+                        "SELECT count(*) FROM pg_locks WHERE granted = false "
+                                + "AND transactionid = pg_current_xact_id() "
+                                + "AND pid <> pg_backend_pid()")) {
+                    rs.next();
+                    if (rs.getInt(1) > 0) {
+                        return;
+                    }
+                }
+            }
+            Thread.sleep(50);
+        }
+        throw new AssertionError(
+                "expire() never blocked on the held seat lock — the race window was not entered");
     }
 
     private CreatedEvent postEvent(List<Map<String, Object>> seats) {
