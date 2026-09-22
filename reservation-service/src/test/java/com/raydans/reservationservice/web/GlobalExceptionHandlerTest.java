@@ -17,6 +17,7 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 
 class GlobalExceptionHandlerTest {
@@ -41,6 +42,9 @@ class GlobalExceptionHandlerTest {
         void boom() {
             throw new IllegalStateException("unmodeled");
         }
+
+        @GetMapping("/probe/missing-header")
+        void missingHeader(@RequestHeader(value = "X-Required") String value) {}
 
         @PostMapping("/probe/validate")
         void validate(@RequestBody @jakarta.validation.Valid ProbeCommand command) {}
@@ -86,6 +90,15 @@ class GlobalExceptionHandlerTest {
                 .andExpect(jsonPath("$.status").value(400))
                 .andExpect(jsonPath("$.details").isArray())
                 .andExpect(jsonPath("$.details[0]").value(containsString("eventId")));
+    }
+
+    @Test
+    void missingRequiredHeaderMapsTo400WithHeaderName() throws Exception {
+        mvc.perform(get("/probe/missing-header"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.error").value("Bad Request"))
+                .andExpect(jsonPath("$.message").value("Required request header 'X-Required' is not present"));
     }
 
     @Test

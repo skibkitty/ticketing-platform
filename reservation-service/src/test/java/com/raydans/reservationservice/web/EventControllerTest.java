@@ -189,7 +189,7 @@ class EventControllerTest {
     @Test
     void listSeatsFilteredByStatusReturnsSeats() throws Exception {
         when(events.listSeats(7L, SeatStatus.AVAILABLE))
-                .thenReturn(List.of(new SeatResponse(10L, "Orchestra", "A", 1, SeatStatus.AVAILABLE)));
+                .thenReturn(List.of(new SeatResponse(10L, "Orchestra", "A", 1, 15000, SeatStatus.AVAILABLE)));
 
         mvc.perform(get("/api/v1/events/7/seats").param("status", "AVAILABLE"))
                 .andExpect(status().isOk())

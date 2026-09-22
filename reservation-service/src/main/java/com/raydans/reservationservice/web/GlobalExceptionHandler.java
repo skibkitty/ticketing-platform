@@ -12,6 +12,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingRequestHeaderException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
@@ -62,6 +64,22 @@ public class GlobalExceptionHandler {
         log.warn("Malformed request body on {} {}", request.getMethod(), request.getRequestURI(), ex);
         HttpStatus status = HttpStatus.BAD_REQUEST;
         String message = "Malformed request body";
+        return ResponseEntity.status(status).body(error(status, status.getReasonPhrase(), message, request, List.of()));
+    }
+
+    @ExceptionHandler(MissingServletRequestParameterException.class)
+    ResponseEntity<ApiErrorResponse> missingParameter(
+            MissingServletRequestParameterException ex, HttpServletRequest request) {
+        HttpStatus status = HttpStatus.BAD_REQUEST;
+        String message = "Required request parameter '" + ex.getParameterName() + "' is not present";
+        return ResponseEntity.status(status).body(error(status, status.getReasonPhrase(), message, request, List.of()));
+    }
+
+    @ExceptionHandler(MissingRequestHeaderException.class)
+    ResponseEntity<ApiErrorResponse> missingHeader(
+            MissingRequestHeaderException ex, HttpServletRequest request) {
+        HttpStatus status = HttpStatus.BAD_REQUEST;
+        String message = "Required request header '" + ex.getHeaderName() + "' is not present";
         return ResponseEntity.status(status).body(error(status, status.getReasonPhrase(), message, request, List.of()));
     }
 
