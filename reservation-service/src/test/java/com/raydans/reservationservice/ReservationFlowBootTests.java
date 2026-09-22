@@ -325,7 +325,7 @@ class ReservationFlowBootTests {
             try (Statement statement = connection.createStatement()) {
                 try (ResultSet rs = statement.executeQuery(
                         "SELECT count(*) FROM pg_locks WHERE granted = false "
-                                + "AND transactionid = pg_current_xact_id() "
+                                + "AND transactionid = pg_current_xact_id()::xid "
                                 + "AND pid <> pg_backend_pid()")) {
                     rs.next();
                     if (rs.getInt(1) > 0) {
