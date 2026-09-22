@@ -9,11 +9,18 @@ import com.raydans.reservationservice.outbox.OutboxPublisher;
 import com.raydans.reservationservice.reservation.HoldExpirer;
 import com.raydans.reservationservice.web.ReservationController;
 import com.raydans.reservationservice.web.SeatStatus;
+import java.sql.Connection;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import javax.sql.DataSource;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -66,6 +73,9 @@ class ReservationFlowBootTests {
 
     @Autowired
     SeatRepository seatRepository;
+
+    @Autowired
+    DataSource dataSource;
 
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
@@ -250,6 +260,59 @@ class ReservationFlowBootTests {
         String status = jdbc.queryForObject(
                 "SELECT status FROM reservation.seats WHERE id = ?", String.class, seatId);
         assertThat(status).isEqualTo("HELD");
+    }
+
+    @Test
+    void concurrentReHoldIsNotUndoneByExpirerTransaction() throws Exception {
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Gallery", "row", "A", "seatNumber", 2, "priceCents", 2500)));
+        ResponseEntity<Map> reservation =
+                postReservation(created.eventId(), List.of(created.seatIds().get(0)), 42L);
+        assertThat(reservation.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long seatId = created.seatIds().get(0);
+
+        jdbc.update(
+                "UPDATE reservation.reservations SET expires_at = now() - interval '1 minute' WHERE customer_id = 42");
+        jdbc.update(
+                "UPDATE reservation.seats SET hold_expires_at = now() - interval '1 minute' WHERE id = ?", seatId);
+
+        try (Connection connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            connection.createStatement().executeUpdate(
+                    "UPDATE reservation.seats SET hold_expires_at = now() + interval '10 minutes', "
+                            + "version = version + 1 WHERE id = " + seatId);
+
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            try {
+                Future<?> expiry = executor.submit(() -> holdExpirer.expire());
+                connection.commit();
+                assertThatThrownBy(() -> expiry.get(30, TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class)
+                        .hasCauseInstanceOf(ObjectOptimisticLockingFailureException.class);
+            } finally {
+                executor.shutdownNow();
+            }
+        }
+
+        String reservationStatus = jdbc.queryForObject(
+                "SELECT status FROM reservation.reservations WHERE customer_id = 42", String.class);
+        assertThat(reservationStatus).isEqualTo("PENDING_PAYMENT");
+
+        String seatStatus = jdbc.queryForObject(
+                "SELECT status FROM reservation.seats WHERE id = ?", String.class, seatId);
+        assertThat(seatStatus).isEqualTo("HELD");
+
+        holdExpirer.expire();
+
+        reservationStatus = jdbc.queryForObject(
+                "SELECT status FROM reservation.reservations WHERE customer_id = 42", String.class);
+        assertThat(reservationStatus).isEqualTo("EXPIRED");
+        seatStatus = jdbc.queryForObject(
+                "SELECT status FROM reservation.seats WHERE id = ?", String.class, seatId);
+        assertThat(seatStatus).isEqualTo("HELD");
+        String holdUntil = jdbc.queryForObject(
+                "SELECT hold_expires_at FROM reservation.seats WHERE id = ?", String.class, seatId);
+        assertThat(holdUntil).isNotNull();
     }
 
     private CreatedEvent postEvent(List<Map<String, Object>> seats) {
