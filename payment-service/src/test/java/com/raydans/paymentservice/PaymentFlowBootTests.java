@@ -138,6 +138,47 @@ class PaymentFlowBootTests {
         assertOutcomePublishedExactlyOnce(reservationId);
     }
 
+    @Test
+    void malformedEventIsDeadLetteredAndConsumerKeepsProcessing() throws Exception {
+        long reservationId = 200L;
+        UUID eventId = UUID.randomUUID();
+
+        // 1. A record that cannot even be parsed is poison: neither processed nor silently dropped.
+        kafka.send(new ProducerRecord<>(RESERVATION_EVENTS_TOPIC, "poison-key", "{not-json"))
+                .get(10, TimeUnit.SECONDS);
+
+        // 2. After retries are exhausted it lands on the dead-letter topic.
+        assertThat(awaitOnTopic(RESERVATION_EVENTS_TOPIC + ".dlt", record ->
+                "poison-key".equals(record.key()) && "{not-json".equals(record.value())))
+                .as("poison record should be dead-lettered")
+                .isTrue();
+
+        // 3. The consumer is not wedged: a subsequent valid event is still processed.
+        produceReservationCreated(eventId, reservationId, 20000, "corr-after-dlt");
+        awaitPaymentStatus(reservationId, "SUCCEEDED");
+        awaitProcessed(eventId);
+    }
+
+    private boolean awaitOnTopic(String topic, java.util.function.Predicate<ConsumerRecord<String, String>> match) {
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(Map.of(
+                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
+                ConsumerConfig.GROUP_ID_CONFIG, "boot-test-" + UUID.randomUUID(),
+                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest",
+                ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class))) {
+            consumer.subscribe(List.of(topic));
+            Instant deadline = Instant.now().plusSeconds(30);
+            while (Instant.now().isBefore(deadline)) {
+                for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofSeconds(2)).records(topic)) {
+                    if (match.test(record)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+    }
+
     private void produceReservationCreated(UUID eventId, long reservationId, int amountCents, String correlationId)
             throws Exception {
         EventEnvelope<Map<String, Object>> envelope = new EventEnvelope<>(

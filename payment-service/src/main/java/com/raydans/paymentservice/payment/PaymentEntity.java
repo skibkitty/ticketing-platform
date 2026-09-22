@@ -40,7 +40,6 @@ public class PaymentEntity {
         this.reservationId = reservationId;
         this.amountCents = amountCents;
         this.status = status;
-        this.createdAt = Instant.now();
     }
 
     public void settle(PaymentStatus outcome) {

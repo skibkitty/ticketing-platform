@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.raydans.common.event.EventEnvelope;
 import com.raydans.common.web.CorrelationIdFilter;
 import com.raydans.paymentservice.payment.PaymentProcessingService;
+import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.header.Header;
@@ -53,6 +54,6 @@ public class ReservationCreatedConsumer {
             // then only invent one as a last resort so MDC always has a value to log.
             return fallback == null || fallback.isBlank() ? UUID.randomUUID().toString() : fallback;
         }
-        return new String(header.value());
+        return new String(header.value(), StandardCharsets.UTF_8);
     }
 }

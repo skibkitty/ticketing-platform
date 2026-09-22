@@ -1,6 +1,7 @@
 package com.raydans.paymentservice.payment;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -144,6 +145,39 @@ class JpaPaymentProcessingServiceTest {
         ArgumentCaptor<OutboxEventEntity> outboxCaptor = ArgumentCaptor.forClass(OutboxEventEntity.class);
         verify(outbox).save(outboxCaptor.capture());
         assertThat(outboxCaptor.getValue().getAggregateId()).isEqualTo(1L);
+        assertProcessed(eventId);
+    }
+
+    @Test
+    void negativeAmountIsRejectedInsteadOfSucceeding() {
+        UUID eventId = UUID.randomUUID();
+        when(processedEvents.existsById(eventId)).thenReturn(false);
+
+        assertThatThrownBy(() -> service.process(
+                envelope(eventId, "reservation.ReservationCreated", 105L, -100), CORRELATION_ID))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("amountCents");
+        verify(payments, never()).saveAndFlush(any());
+        verify(outbox, never()).save(any());
+        verify(processedEvents, never()).save(any());
+    }
+
+    @Test
+    void zeroAmountIsValidAndSucceeds() {
+        UUID eventId = UUID.randomUUID();
+        when(processedEvents.existsById(eventId)).thenReturn(false);
+        when(payments.saveAndFlush(any(PaymentEntity.class))).thenAnswer(invocation -> {
+            PaymentEntity created = invocation.getArgument(0);
+            ReflectionTestUtils.setField(created, "id", 45L);
+            return created;
+        });
+
+        service.process(envelope(eventId, "reservation.ReservationCreated", 106L, 0), CORRELATION_ID);
+
+        ArgumentCaptor<PaymentEntity> paymentCaptor = ArgumentCaptor.forClass(PaymentEntity.class);
+        verify(payments).saveAndFlush(paymentCaptor.capture());
+        assertThat(paymentCaptor.getValue().getAmountCents()).isZero();
+        assertThat(paymentCaptor.getValue().getStatus()).isEqualTo(PaymentStatus.SUCCEEDED);
         assertProcessed(eventId);
     }
 

@@ -61,7 +61,14 @@ class JpaPaymentProcessingService implements PaymentProcessingService {
         } catch (JsonProcessingException ex) {
             throw new IllegalStateException("Failed to deserialize ReservationCreated payload", ex);
         }
+        // A negative amount is a producer bug, never a payment: fail loudly (poll/retry/DLT path)
+        // instead of silently deciding SUCCEEDED for garbage input.
+        if (created.amountCents() < 0) {
+            throw new IllegalArgumentException(
+                    "ReservationCreated amountCents must be non-negative: " + created.amountCents());
+        }
 
+        // saveAndFlush, not save: serializeOutcome below needs the generated payment.id.
         PaymentEntity payment = payments.saveAndFlush(
                 new PaymentEntity(created.reservationId(), created.amountCents(), PaymentStatus.PENDING));
         payment.settle(decideOutcome(created.amountCents()));
@@ -75,7 +82,8 @@ class JpaPaymentProcessingService implements PaymentProcessingService {
                 correlationId));
 
         // Effect and processed-row insert share one transaction (ADR 004): a rollback drops both,
-        // so a redelivered event never double-applies an effect.
+        // so a redelivered event never double-applies an effect. The processed_events PK and the
+        // unique reservation_id are the concurrency arbiter; existsById above is only a fast path.
         processedEvents.save(new ProcessedEventEntity(envelope.eventId()));
     }
 
