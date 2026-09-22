@@ -3,6 +3,7 @@ package com.raydans.reservationservice;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.raydans.reservationservice.outbox.OutboxPublisher;
+import com.raydans.reservationservice.reservation.HoldExpirer;
 import com.raydans.reservationservice.web.ReservationController;
 import java.time.Duration;
 import java.time.Instant;
@@ -55,6 +56,9 @@ class ReservationFlowBootTests {
     @Autowired
     OutboxPublisher outboxPublisher;
 
+    @Autowired
+    HoldExpirer holdExpirer;
+
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
@@ -62,6 +66,7 @@ class ReservationFlowBootTests {
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("spring.kafka.bootstrap-servers", KAFKA::getBootstrapServers);
         registry.add("app.outbox.poll-interval-ms", () -> "60000");
+        registry.add("app.hold.expire-interval-ms", () -> "60000");
     }
 
     @Test
@@ -143,6 +148,37 @@ class ReservationFlowBootTests {
         ResponseEntity<Map> response = rest.getForEntity("/api/v1/reservations/422", Map.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(response.getBody()).containsEntry("status", 404);
+    }
+
+    @Test
+    void expiredHoldReleasesSeatAndExpiresReservationForReReservation() {
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Mezzanine", "row", "A", "seatNumber", 1, "priceCents", 4000)));
+
+        ResponseEntity<Map> first =
+                postReservation(created.eventId(), List.of(created.seatIds().get(0)), 21L);
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long reservationId = ((Number) first.getBody().get("id")).longValue();
+        long seatId = created.seatIds().get(0);
+
+        jdbc.update(
+                "UPDATE reservation.seats SET hold_expires_at = now() - interval '1 minute' WHERE id = ?", seatId);
+        jdbc.update(
+                "UPDATE reservation.reservations SET expires_at = now() - interval '1 minute' WHERE id = ?",
+                reservationId);
+
+        holdExpirer.expire();
+
+        String seatStatus = jdbc.queryForObject(
+                "SELECT status FROM reservation.seats WHERE id = ?", String.class, seatId);
+        assertThat(seatStatus).isEqualTo("AVAILABLE");
+        String reservationStatus = jdbc.queryForObject(
+                "SELECT status FROM reservation.reservations WHERE id = ?", String.class, reservationId);
+        assertThat(reservationStatus).isEqualTo("EXPIRED");
+
+        ResponseEntity<Map> again =
+                postReservation(created.eventId(), List.of(seatId), 22L);
+        assertThat(again.getStatusCode()).isEqualTo(HttpStatus.CREATED);
     }
 
     private CreatedEvent postEvent(List<Map<String, Object>> seats) {

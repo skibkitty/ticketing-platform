@@ -93,7 +93,7 @@ class OutboxPublisherTest {
         OutboxEventEntity row = new OutboxEventEntity(
                 UUID.randomUUID(), "Reservation", 7L, "reservation.ReservationCreated",
                 "{\"reservationId\":7}", "cid-7");
-        when(outbox.findFirst20ByPublishedAtIsNullOrderByIdAsc()).thenReturn(List.of(row));
+        when(outbox.findUnpublishedBatch()).thenReturn(List.of(row));
         when(kafka.send(any(Message.class))).thenAnswer(invocation -> completed());
 
         publisher.poll();
@@ -105,7 +105,7 @@ class OutboxPublisherTest {
     @Test
     void pollWhenNothingPendingSendsNothing() {
         OutboxPublisher publisher = new OutboxPublisher(outbox, kafka, objectMapper);
-        when(outbox.findFirst20ByPublishedAtIsNullOrderByIdAsc()).thenReturn(List.of());
+        when(outbox.findUnpublishedBatch()).thenReturn(List.of());
 
         publisher.poll();
 

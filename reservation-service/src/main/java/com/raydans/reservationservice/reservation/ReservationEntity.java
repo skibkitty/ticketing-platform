@@ -89,4 +89,8 @@ public class ReservationEntity {
     public Set<SeatEntity> getSeats() {
         return seats;
     }
+
+    public void markExpired() {
+        status = ReservationStatus.EXPIRED;
+    }
 }

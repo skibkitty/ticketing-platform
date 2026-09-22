@@ -61,19 +61,29 @@ class JpaReservationService implements ReservationService {
     }
 
     @Override
-    @Transactional(readOnly = true)
+    @Transactional
     public ReservationResponse get(long reservationId) {
         ReservationEntity reservation = reservations.findById(reservationId)
                 .orElseThrow(() -> new ResourceNotFoundException("Reservation " + reservationId + " was not found"));
+        expireIfOverdue(reservation);
         return toResponse(reservation);
     }
 
     @Override
-    @Transactional(readOnly = true)
+    @Transactional
     public List<ReservationResponse> listByCustomerId(long customerId) {
         return reservations.findByCustomerIdOrderByIdDesc(customerId).stream()
+                .peek(this::expireIfOverdue)
                 .map(this::toResponse)
                 .toList();
+    }
+
+    private void expireIfOverdue(ReservationEntity reservation) {
+        if (reservation.getStatus() == ReservationStatus.PENDING_PAYMENT
+                && reservation.getExpiresAt().isBefore(Instant.now())) {
+            reservation.markExpired();
+            reservations.save(reservation);
+        }
     }
 
     private List<SeatEntity> loadAndFlipSeats(ReservationRequest request, Instant holdExpiresAt) {

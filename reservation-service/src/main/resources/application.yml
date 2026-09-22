@@ -17,6 +17,8 @@ spring:
 app:
   outbox:
     poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:1000}
+  hold:
+    expire-interval-ms: ${HOLD_EXPIRE_INTERVAL_MS:1000}
 
 management:
   endpoints:

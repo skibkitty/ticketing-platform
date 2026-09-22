@@ -174,6 +174,38 @@ class JpaReservationServiceTest {
         assertThat(response.status()).isEqualTo(ReservationStatus.PENDING_PAYMENT);
         assertThat(response.amountCents()).isEqualTo(27000);
         assertThat(response.seats()).extracting("id").containsExactly(10L, 11L);
+        verify(reservations, never()).save(any());
+    }
+
+    @Test
+    void getOfOverduePendingReservationExpiresItBeforeReturning() {
+        ReservationEntity overdue = reservationEntity(42L);
+        overdue.getSeats().clear();
+        ReflectionTestUtils.setField(overdue, "expiresAt", Instant.now().minusSeconds(1));
+        when(reservations.findById(42L)).thenReturn(Optional.of(overdue));
+
+        ReservationResponse response = service.get(42L);
+
+        assertThat(response.status()).isEqualTo(ReservationStatus.EXPIRED);
+        ArgumentCaptor<ReservationEntity> captor = ArgumentCaptor.forClass(ReservationEntity.class);
+        verify(reservations).save(captor.capture());
+        assertThat(captor.getValue().getStatus()).isEqualTo(ReservationStatus.EXPIRED);
+    }
+
+    @Test
+    void listByCustomerIdExpiresOverduePendingReservations() {
+        ReservationEntity overdue = reservationEntity(42L);
+        ReflectionTestUtils.setField(overdue, "expiresAt", Instant.now().minusSeconds(1));
+        ReservationEntity fresh = reservationEntity(43L);
+        when(reservations.findByCustomerIdOrderByIdDesc(99L)).thenReturn(List.of(overdue, fresh));
+
+        List<ReservationResponse> responses = service.listByCustomerId(99L);
+
+        assertThat(responses).extracting(ReservationResponse::status)
+                .containsExactly(ReservationStatus.EXPIRED, ReservationStatus.PENDING_PAYMENT);
+        ArgumentCaptor<ReservationEntity> captor = ArgumentCaptor.forClass(ReservationEntity.class);
+        verify(reservations).save(captor.capture());
+        assertThat(captor.getValue().getStatus()).isEqualTo(ReservationStatus.EXPIRED);
     }
 
     @Test

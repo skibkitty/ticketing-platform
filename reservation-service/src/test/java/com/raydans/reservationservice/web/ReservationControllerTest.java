@@ -69,6 +69,16 @@ class ReservationControllerTest {
     }
 
     @Test
+    void createReservationWithoutCustomerHeaderReturns400() throws Exception {
+        mvc.perform(post("/api/v1/reservations")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"eventId\":7,\"seatIds\":[10]}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.error").value("Bad Request"));
+    }
+
+    @Test
     void createReservationWithoutSeatIdsReturns400() throws Exception {
         mvc.perform(post("/api/v1/reservations")
                         .header(ReservationController.CUSTOMER_HEADER, "99")

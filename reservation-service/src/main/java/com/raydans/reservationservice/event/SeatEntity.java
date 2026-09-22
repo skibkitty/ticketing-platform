@@ -97,4 +97,9 @@ public class SeatEntity {
         status = SeatStatus.HELD;
         holdExpiresAt = expiresAt;
     }
+
+    public void releaseHold() {
+        status = SeatStatus.AVAILABLE;
+        holdExpiresAt = null;
+    }
 }

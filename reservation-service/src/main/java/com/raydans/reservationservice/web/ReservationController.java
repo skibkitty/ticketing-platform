@@ -30,7 +30,7 @@ public class ReservationController {
     @PostMapping
     ResponseEntity<ReservationResponse> create(
             @Valid @RequestBody ReservationRequest request,
-            @RequestHeader(value = CUSTOMER_HEADER, required = false, defaultValue = "0") long customerId,
+            @RequestHeader(value = CUSTOMER_HEADER, required = true) long customerId,
             UriComponentsBuilder builder) {
         ReservationResponse created = reservations.create(request, customerId);
         URI location = builder.path("/api/v1/reservations/{id}").buildAndExpand(created.id()).toUri();

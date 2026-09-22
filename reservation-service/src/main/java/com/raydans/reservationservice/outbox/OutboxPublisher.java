@@ -7,6 +7,7 @@ import com.raydans.common.web.CorrelationIdFilter;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -15,6 +16,7 @@ import org.springframework.messaging.Message;
 import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 @Component
 public class OutboxPublisher {
@@ -34,8 +36,9 @@ public class OutboxPublisher {
     }
 
     @Scheduled(fixedDelayString = "${app.outbox.poll-interval-ms:1000}")
+    @Transactional
     public void poll() {
-        List<OutboxEventEntity> unpublished = outbox.findFirst20ByPublishedAtIsNullOrderByIdAsc();
+        List<OutboxEventEntity> unpublished = outbox.findUnpublishedBatch();
         for (OutboxEventEntity row : unpublished) {
             publish(row);
         }
@@ -58,17 +61,11 @@ public class OutboxPublisher {
                     .setHeader(KafkaHeaders.KEY, key)
                     .setHeader(CorrelationIdFilter.HEADER_NAME, row.getCorrelationId())
                     .build();
-            kafka.send(message).whenComplete((result, ex) -> {
-                if (ex != null) {
-                    log.warn("Kafka rejected outbox event {} for aggregate {}; it stays unpublished and will be retried",
-                            row.getId(), row.getAggregateId(), ex);
-                    return;
-                }
-                row.markPublished();
-                outbox.save(row);
-            });
+            kafka.send(message).get(10, TimeUnit.SECONDS);
+            row.markPublished();
+            outbox.save(row);
         } catch (Exception ex) {
-            log.error("Failed to serialise outbox event {} for aggregate {}",
+            log.warn("Failed to publish outbox event {} for aggregate {}; it stays unpublished and will be retried",
                     row.getId(), row.getAggregateId(), ex);
         }
     }
