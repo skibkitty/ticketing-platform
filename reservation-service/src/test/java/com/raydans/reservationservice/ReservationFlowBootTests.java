@@ -1,10 +1,14 @@
 package com.raydans.reservationservice;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.raydans.reservationservice.event.SeatEntity;
+import com.raydans.reservationservice.event.SeatRepository;
 import com.raydans.reservationservice.outbox.OutboxPublisher;
 import com.raydans.reservationservice.reservation.HoldExpirer;
 import com.raydans.reservationservice.web.ReservationController;
+import com.raydans.reservationservice.web.SeatStatus;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -23,6 +27,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.KafkaContainer;
@@ -58,6 +63,9 @@ class ReservationFlowBootTests {
 
     @Autowired
     HoldExpirer holdExpirer;
+
+    @Autowired
+    SeatRepository seatRepository;
 
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
@@ -210,13 +218,38 @@ class ReservationFlowBootTests {
         String stillHeldUntil = jdbc.queryForObject(
                 "SELECT hold_expires_at FROM reservation.seats WHERE id = ?", String.class, seatId);
         assertThat(stillHeldUntil).isEqualTo(heldUntil);
+    }
+
+    @Test
+    void staleExpirySaveIsRejectedByOptimisticLockKeepingTheReHold() {
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Gallery", "row", "A", "seatNumber", 1, "priceCents", 2500)));
+
+        ResponseEntity<Map> reservation =
+                postReservation(created.eventId(), List.of(created.seatIds().get(0)), 41L);
+        assertThat(reservation.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long seatId = created.seatIds().get(0);
 
         jdbc.update(
+                "UPDATE reservation.reservations SET expires_at = now() - interval '1 minute' WHERE customer_id = 41");
+        jdbc.update(
                 "UPDATE reservation.seats SET hold_expires_at = now() - interval '1 minute' WHERE id = ?", seatId);
-        holdExpirer.expire();
-        seatStatus = jdbc.queryForObject(
+
+        SeatEntity stale = seatRepository.findById(seatId).orElseThrow();
+        assertThat(stale.getStatus()).isEqualTo(SeatStatus.HELD);
+
+        jdbc.update(
+                "UPDATE reservation.seats SET hold_expires_at = now() + interval '10 minutes', version = version + 1 WHERE id = ?",
+                seatId);
+
+        assertThat(stale.releaseHoldIfLapsed(Instant.now())).isTrue();
+
+        assertThatThrownBy(() -> seatRepository.saveAndFlush(stale))
+                .isInstanceOf(ObjectOptimisticLockingFailureException.class);
+
+        String status = jdbc.queryForObject(
                 "SELECT status FROM reservation.seats WHERE id = ?", String.class, seatId);
-        assertThat(seatStatus).isEqualTo("AVAILABLE");
+        assertThat(status).isEqualTo("HELD");
     }
 
     private CreatedEvent postEvent(List<Map<String, Object>> seats) {
