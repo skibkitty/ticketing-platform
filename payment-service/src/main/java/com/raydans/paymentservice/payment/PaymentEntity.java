@@ -28,6 +28,7 @@ public class PaymentEntity {
     @Column(nullable = false, length = 20)
     private PaymentStatus status;
 
+    // DB-owned (DEFAULT now()), never set or updated from JPA: insertable/updatable false.
     @Column(name = "created_at", nullable = false, updatable = false, insertable = false)
     private Instant createdAt;
 
@@ -40,11 +41,6 @@ public class PaymentEntity {
         this.reservationId = reservationId;
         this.amountCents = amountCents;
         this.status = status;
-    }
-
-    public void settle(PaymentStatus outcome) {
-        this.status = outcome;
-        this.settledAt = Instant.now();
     }
 
     public Long getId() {

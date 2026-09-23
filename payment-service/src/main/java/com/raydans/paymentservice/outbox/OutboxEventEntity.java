@@ -38,6 +38,7 @@ public class OutboxEventEntity {
     @Column(name = "correlation_id", length = 100)
     private String correlationId;
 
+    // DB-owned (DEFAULT now()), never set or updated from JPA: insertable/updatable false.
     @Column(name = "created_at", nullable = false, updatable = false, insertable = false)
     private Instant createdAt;
 
@@ -54,7 +55,6 @@ public class OutboxEventEntity {
         this.eventType = eventType;
         this.payload = payload;
         this.correlationId = correlationId;
-        this.createdAt = Instant.now();
     }
 
     public Long getId() {

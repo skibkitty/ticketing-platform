@@ -32,28 +32,36 @@ public class ReservationCreatedConsumer {
 
     @KafkaListener(topics = "${app.kafka.topics.reservation-created}")
     public void onMessage(ConsumerRecord<String, String> record) {
+        EventEnvelope<JsonNode> envelope;
         try {
-            EventEnvelope<JsonNode> envelope = objectMapper.readValue(
-                    record.value(), new TypeReference<EventEnvelope<JsonNode>>() {});
-            String correlationId = headerOrElse(record, envelope.correlationId());
-            MDC.put(CorrelationIdFilter.MDC_KEY, correlationId);
-            try {
-                processing.process(envelope, correlationId);
-            } finally {
-                MDC.remove(CorrelationIdFilter.MDC_KEY);
-            }
+            envelope = objectMapper.readValue(record.value(), new TypeReference<EventEnvelope<JsonNode>>() {});
         } catch (JsonProcessingException ex) {
             throw new IllegalStateException("Failed to deserialize event envelope", ex);
         }
+        String correlationId = resolveCorrelationId(record, envelope.correlationId());
+        MDC.put(CorrelationIdFilter.MDC_KEY, correlationId);
+        try {
+            processing.process(envelope, correlationId);
+        } finally {
+            MDC.remove(CorrelationIdFilter.MDC_KEY);
+        }
     }
 
-    private String headerOrElse(ConsumerRecord<String, String> record, String fallback) {
+    /**
+     * Correlation ids are optional at the platform edge, not mandatory (the web
+     * {@code CorrelationIdFilter} and reservation-service's producer both mint a UUID when
+     * one is absent), so a missing/blank id here does not reject the message — it is minted
+     * so MDC always carries a non-blank trace id. Precedence: Kafka header, then the
+     * envelope's own id, then a freshly generated UUID.
+     */
+    private String resolveCorrelationId(ConsumerRecord<String, String> record, String envelopeCorrelationId) {
         Header header = record.headers().lastHeader(CorrelationIdFilter.HEADER_NAME);
-        if (header == null) {
-            // A producer normally stamps the header; fall back to the envelope's own trace id,
-            // then only invent one as a last resort so MDC always has a value to log.
-            return fallback == null || fallback.isBlank() ? UUID.randomUUID().toString() : fallback;
+        String fromHeader = header == null ? null : new String(header.value(), StandardCharsets.UTF_8);
+        if (fromHeader != null && !fromHeader.isBlank()) {
+            return fromHeader;
         }
-        return new String(header.value(), StandardCharsets.UTF_8);
+        return envelopeCorrelationId == null || envelopeCorrelationId.isBlank()
+                ? UUID.randomUUID().toString()
+                : envelopeCorrelationId;
     }
 }

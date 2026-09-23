@@ -1,5 +1,7 @@
 -- Payment schema (one instance, one schema per service — docs/adr/005).
 -- Idempotent: compose's postgres-init.sql also creates the schema.
+-- The *_at timestamps are DB-owned (DEFAULT now(), insertable=false in JPA):
+-- entities never write them, so there is exactly one source of truth for created_at.
 CREATE SCHEMA IF NOT EXISTS payment;
 
 SET search_path TO payment;
