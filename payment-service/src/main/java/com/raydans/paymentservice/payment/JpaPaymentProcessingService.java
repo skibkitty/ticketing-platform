@@ -170,7 +170,14 @@ class JpaPaymentProcessingService implements PaymentProcessingService {
         }
     }
 
-    /** Wire payload of a {@code reservation.ReservationCreated} event (reservation-service contract). */
+    /**
+     * Wire payload of a {@code reservation.ReservationCreated} event (reservation-service contract).
+     *
+     * <p>{@code eventId} is the show/performance this reservation is for (reservation-service builds
+     * it from {@code reservation.getEvent().getId()}) — NOT the Kafka message id. Idempotency keys on
+     * {@code envelope.eventId()}, the UUID minted by the producer; the two are unrelated and never
+     * need to match.
+     */
     public record ReservationCreatedPayload(
             Long reservationId, Long customerId, Long eventId, List<Long> seatIds, Integer amountCents) {}
 
