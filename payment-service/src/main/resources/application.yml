@@ -1,0 +1,39 @@
+spring:
+  application:
+    name: payment-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/platform?currentSchema=payment}
+    username: ${DB_USER:platform}
+    password: ${DB_PASSWORD:platform}
+  flyway:
+    schemas: payment
+    create-schemas: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    consumer:
+      group-id: payment-service
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      auto-offset-reset: earliest
+    listener:
+      # Per-record offsets so a poison record can be retried and dead-lettered
+      # without re-delivering its batch siblings (ADR 008).
+      ack-mode: record
+
+app:
+  outbox:
+    poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:1000}
+  payment:
+    decline-threshold-cents: ${PAYMENT_DECLINE_THRESHOLD_CENTS:50000}
+  kafka:
+    topics:
+      reservation-created: ${RESERVATION_EVENTS_TOPIC:reservation.events.v1}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
