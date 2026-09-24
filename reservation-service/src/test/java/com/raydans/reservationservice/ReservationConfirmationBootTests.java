@@ -123,7 +123,8 @@ class ReservationConfirmationBootTests {
         outboxPublisher.poll();
 
         ConsumerRecord<String, String> confirmed = awaitOnTopic(OutboxPublisher.RESERVATION_EVENTS_TOPIC,
-                record -> reservationId == parseReservationId(record.value()));
+                record -> reservationId == parseReservationId(record.value())
+                        && record.value().contains("reservation.ReservationConfirmed"));
         assertThat(confirmed).isNotNull();
         assertThat(confirmed.key()).isEqualTo(new UUID(0L, reservationId).toString());
         assertThat(confirmed.value())
