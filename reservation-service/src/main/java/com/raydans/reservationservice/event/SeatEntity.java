@@ -103,6 +103,11 @@ public class SeatEntity {
         holdExpiresAt = null;
     }
 
+    public void markSold() {
+        status = SeatStatus.SOLD;
+        holdExpiresAt = null;
+    }
+
     public boolean releaseHoldIfLapsed(Instant now) {
         if (status == SeatStatus.HELD && holdExpiresAt != null && holdExpiresAt.isBefore(now)) {
             releaseHold();

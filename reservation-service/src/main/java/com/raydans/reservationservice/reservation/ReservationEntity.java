@@ -15,6 +15,7 @@ import jakarta.persistence.JoinTable;
 import jakarta.persistence.ManyToMany;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
+import jakarta.persistence.Version;
 import java.time.Instant;
 import java.util.LinkedHashSet;
 import java.util.Set;
@@ -51,6 +52,15 @@ public class ReservationEntity {
             joinColumns = @JoinColumn(name = "reservation_id"),
             inverseJoinColumns = @JoinColumn(name = "seat_id"))
     private Set<SeatEntity> seats = new LinkedHashSet<>();
+
+    /**
+     * Optimistic lock (ADR 006 pattern, as on {@link SeatEntity}): at most one concurrent
+     * transaction may transition a Reservation (e.g. confirm vs. meanwhile-expire), so two
+     * distinct {@code PaymentSucceeded} events can never both win the confirmation.
+     */
+    @Version
+    @Column(nullable = false)
+    private long version;
 
     protected ReservationEntity() {}
 
@@ -92,5 +102,9 @@ public class ReservationEntity {
 
     public void markExpired() {
         status = ReservationStatus.EXPIRED;
+    }
+
+    public void confirm() {
+        status = ReservationStatus.CONFIRMED;
     }
 }

@@ -13,12 +13,30 @@ spring:
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    consumer:
+      group-id: reservation-service
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      auto-offset-reset: earliest
+    listener:
+      # Per-record offsets so a poison record can be retried and dead-lettered
+      # without re-delivering its batch siblings (ADR 008).
+      ack-mode: record
+    admin:
+      # The service provisions its own consumer topics + DLT via KafkaAdmin on
+      # startup (see KafkaTopicConfig); no reliance on broker auto-creation.
+      auto-create: true
 
 app:
   outbox:
     poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:1000}
   hold:
     expire-interval-ms: ${HOLD_EXPIRE_INTERVAL_MS:1000}
+  kafka:
+    topics:
+      payment-outcome: ${PAYMENT_EVENTS_TOPIC:payment.events.v1}
+    topic-partitions: ${PAYMENT_TOPIC_PARTITIONS:1}
+    topic-replicas: ${PAYMENT_TOPIC_REPLICAS:1}
 
 management:
   endpoints:

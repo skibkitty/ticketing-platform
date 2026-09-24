@@ -61,3 +61,28 @@ follow-up. The same policy is applied solely to payment-service; the T04
 reservation consumer predates this and keeps its implicit default behaviour.
 Inbound consumption is at-least-once: the same decision applies to outbound
 publication (ADR 003).
+
+## reservation-service's confirmation consumer
+
+reservation-service's `JpaReservationConfirmationService` applies the same
+error-handling shape to `payment.events.v1` (retry then `<topic>.dlt`), with one
+deliberate difference in classification. Its topics (`payment.events.v1` and
+`payment.events.v1.dlt`) are self-provisioned via `KafkaAdmin` (see
+`KafkaTopicConfig`) instead of relying on broker auto-creation. Event types are
+classified explicitly, never swallowed:
+
+- `payment.PaymentSucceeded` — the only type this consumer acts on (idempotent
+  confirm, ADR 004/007).
+- `payment.PaymentFailed` — a known type owned by the T07 compensating step;
+  deliberately ignored, never claimed, never dead-lettered.
+- anything else — an unrecognized event on the topic; rejected with an exception
+  so the record takes the retry/DLT path and stays auditable instead of being
+  silently acknowledged.
+
+Wire contract: on a `payment.PaymentSucceeded` the payload's `status` is always
+`SUCCEEDED`. payment-service derives both the event type and the payload status
+from the same persisted payment row (`payment.getStatus()`), so the two can
+never diverge for a legitimate message. reservation-service still validates
+`status == "SUCCEEDED"` as defense in depth: a record whose event type claims
+success while its payload disputes it is a producer bug that should reach the
+DLT, never be silently accepted.

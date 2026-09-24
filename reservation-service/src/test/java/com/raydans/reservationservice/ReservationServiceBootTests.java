@@ -42,6 +42,9 @@ class ReservationServiceBootTests {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+        // No Kafka broker is mounted here; the PaymentOutcomeConsumer listener container
+        // must not try to start.
+        registry.add("spring.kafka.listener.auto-startup", () -> "false");
     }
 
     @Test
