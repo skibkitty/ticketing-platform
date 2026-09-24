@@ -263,7 +263,8 @@ class ReservationCompensationBootTests {
         assertThat(awaitOnTopic(PAYMENT_EVENTS_DLT, record -> record.value().contains(outcomeEventId.toString())))
                 .as("an unknown-reservation PaymentFailed must be retried then dead-lettered")
                 .isNotNull();
-        awaitProcessed(outcomeEventId);
+        // The record is dead-lettered, never marked processed: every attempt's idempotency claim
+        // rolls back with the failing transaction, so the poison is never silently consumed.
         assertThat(processedCount(outcomeEventId))
                 .as("each failed attempt's idempotency claim must be rolled back")
                 .isZero();
@@ -323,16 +324,20 @@ class ReservationCompensationBootTests {
                 Map.of("section", "Grand Tier", "row", "B", "seatNumber", 2, "priceCents", 8000)));
         long reservationId = postReservation(created.eventId(), created.seatIds(), 33L);
 
-        UUID okEvent = UUID.randomUUID();
-        UUID failEvent = UUID.randomUUID();
-        EventEnvelope<JsonNode> okEnv = succeededEnvelopeJson(okEvent, reservationId, "corr-race-ok-33");
-        EventEnvelope<JsonNode> failEnv = failedEnvelopeJson(failEvent, reservationId, "corr-race-fail-33");
+        UUID okEvent1 = UUID.randomUUID();
+        UUID failEvent1 = UUID.randomUUID();
+        UUID okEvent2 = UUID.randomUUID();
+        UUID failEvent2 = UUID.randomUUID();
+        EventEnvelope<JsonNode> okEnv1 = succeededEnvelopeJson(okEvent1, reservationId, "corr-race-33");
+        EventEnvelope<JsonNode> failEnv1 = failedEnvelopeJson(failEvent1, reservationId, "corr-race-33");
+        EventEnvelope<JsonNode> okEnv2 = succeededEnvelopeJson(okEvent2, reservationId, "corr-race-33");
+        EventEnvelope<JsonNode> failEnv2 = failedEnvelopeJson(failEvent2, reservationId, "corr-race-33");
 
         List<Throwable> raceFailures = runConcurrentlyReturningFailures(List.of(
-                buildProcessor(okEnv),
-                buildProcessor(okEnv),
-                buildProcessor(failEnv),
-                buildProcessor(failEnv)));
+                buildProcessor(okEnv1),
+                buildProcessor(failEnv1),
+                buildProcessor(okEnv2),
+                buildProcessor(failEnv2)));
 
         // Exactly one terminal transition wins the single-version gate: either confirmed+sold or
         // cancelled+available — never a mix. Losers may throw an optimistic-lock exception as the
@@ -356,21 +361,26 @@ class ReservationCompensationBootTests {
         }
 
         // Both losing paths redeliver cleanly: the winner's duplicate is skipped by the idempotency
-        // claim, the loser's event is claimed once and no-ops on the ADR 007 guard.
+        // claim, the loser's event is claimed once and no-ops on the ADR 007 guard. All four events
+        // are distinct, so each is processed exactly once.
+        List<EventEnvelope<JsonNode>> allOutcomes = List.of(okEnv1, failEnv1, okEnv2, failEnv2);
         List<Throwable> redeliveryFailures = new ArrayList<>();
-        for (EventEnvelope<JsonNode> env : List.of(okEnv, failEnv)) {
+        for (EventEnvelope<JsonNode> env : allOutcomes) {
             try {
                 confirmation.process(env, "corr-redeliver-33-" + env.eventId());
             } catch (Throwable throwable) {
                 redeliveryFailures.add(throwable);
             }
         }
-        awaitProcessed(okEvent);
-        awaitProcessed(failEvent);
+        for (UUID eventId : List.of(okEvent1, failEvent1, okEvent2, failEvent2)) {
+            awaitProcessed(eventId);
+        }
 
         assertThat(redeliveryFailures).as("redelivered losers must be no-ops, not errors").isEmpty();
-        assertThat(processedCount(okEvent)).isEqualTo(1);
-        assertThat(processedCount(failEvent)).isEqualTo(1);
+        assertThat(processedCount(okEvent1)).isEqualTo(1);
+        assertThat(processedCount(failEvent1)).isEqualTo(1);
+        assertThat(processedCount(okEvent2)).isEqualTo(1);
+        assertThat(processedCount(failEvent2)).isEqualTo(1);
         assertThat(outboxCancelledCount(reservationId))
                 .as("a confirmed reservation must not emit a cancelled transition")
                 .isEqualTo(confirmed ? 0 : 1);
@@ -433,6 +443,10 @@ class ReservationCompensationBootTests {
         return () -> {
             try {
                 confirmation.process(envelope, envelope.correlationId());
+            } catch (Error error) {
+                throw error;
+            } catch (RuntimeException runtimeException) {
+                throw runtimeException;
             } catch (Throwable throwable) {
                 throw new RuntimeException(throwable);
             }
