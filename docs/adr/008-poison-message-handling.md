@@ -78,3 +78,11 @@ classified explicitly, never swallowed:
 - anything else — an unrecognized event on the topic; rejected with an exception
   so the record takes the retry/DLT path and stays auditable instead of being
   silently acknowledged.
+
+Wire contract: on a `payment.PaymentSucceeded` the payload's `status` is always
+`SUCCEEDED`. payment-service derives both the event type and the payload status
+from the same persisted payment row (`payment.getStatus()`), so the two can
+never diverge for a legitimate message. reservation-service still validates
+`status == "SUCCEEDED"` as defense in depth: a record whose event type claims
+success while its payload disputes it is a producer bug that should reach the
+DLT, never be silently accepted.
