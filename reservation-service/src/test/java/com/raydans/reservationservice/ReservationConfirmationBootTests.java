@@ -27,6 +27,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
@@ -47,6 +48,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -250,8 +252,10 @@ class ReservationConfirmationBootTests {
 
         // The Kafka listener is single-threaded, so the true race lives here — many
         // transactions racing the same PENDING reservation through the same service bean
-        // (same technique as payment-service's concurrency tests).
-        List<Throwable> failures = runConcurrentlyReturningFailures(List.of(
+        // (same technique as payment-service's concurrency tests). With the ADR 006
+        // optimistic lock at most one transaction commits; a loser rolls back its claim
+        // and surfaces an ObjectOptimisticLockingFailureException.
+        List<Throwable> raceFailures = runConcurrentlyReturningFailures(List.of(
                 () -> confirmation.process(envA, "corr-race-a"),
                 () -> confirmation.process(envA, "corr-race-a"),
                 () -> confirmation.process(envA, "corr-race-a"),
@@ -261,22 +265,26 @@ class ReservationConfirmationBootTests {
 
         awaitReservationStatus(reservationId, "CONFIRMED");
 
-        // A transaction that lost the optimistic-lock race threw inside its transaction and
-        // rolled back (claim included). Kafka at-least-once then redelivers: each eventId must
-        // be a clean guard no-op on redelivery — never a second confirmation, never an error.
+        // A loser rolled back its idempotency claim with the business transaction. Kafka
+        // at-least-once then redelivers: each eventId must now be a clean duplicate-guard
+        // no-op — never a second confirmation, never an error.
+        List<Throwable> redeliveryFailures = new ArrayList<>();
         for (UUID eventId : List.of(eventA, eventB)) {
             try {
                 confirmation.process(succeededEnvelopeJson(eventId, reservationId, "corr-redeliver-" + eventId), "corr-redeliver");
             } catch (Throwable t) {
-                failures.add(t);
+                redeliveryFailures.add(t);
             }
             awaitProcessed(eventId);
         }
 
         outboxPublisher.poll();
-        assertThat(failures)
-                .as("losing transactions may roll back once; their redelivery must be a clean no-op")
+        assertThat(redeliveryFailures)
+                .as("redelivery of both event ids after the race must be a clean no-op")
                 .isEmpty();
+        assertThat(raceFailures)
+                .as("a concurrent loser may throw exactly an optimistic-lock exception, never a double-confirm")
+                .allMatch(failure -> failure instanceof ObjectOptimisticLockingFailureException);
         assertThat(outboxConfirmedCount(reservationId)).isEqualTo(1);
         for (long seatId : created.seatIds()) {
             assertThat(seatStatus(seatId)).isEqualTo("SOLD");
@@ -325,15 +333,18 @@ class ReservationConfirmationBootTests {
 
         // Fail the first two attempts AFTER the claim, then let the third succeed: the retry
         // proves the claim was rolled back with the business transaction and can be re-taken.
+        // saveAll is abstract on the repository proxy (Mockito can't call it "for real"), so
+        // the third attempt just returns normally — the seat sale still lands because the
+        // seat entities are managed and persisting by Hibernate's commit-time flush.
+        AtomicInteger attempt = new AtomicInteger();
         CountDownLatch firstFailure = new CountDownLatch(1);
         doAnswer(invocation -> {
-                    firstFailure.countDown();
-                    throw new RuntimeException("boom after claim");
+                    if (attempt.incrementAndGet() <= 2) {
+                        firstFailure.countDown();
+                        throw new RuntimeException("boom after claim");
+                    }
+                    return invocation.getArguments()[0];
                 })
-                .doAnswer(invocation -> {
-                    throw new RuntimeException("boom after claim");
-                })
-                .doCallRealMethod()
                 .when(seats).saveAll(anyList());
 
         UUID eventId = UUID.randomUUID();
@@ -354,6 +365,9 @@ class ReservationConfirmationBootTests {
         awaitProcessed(eventId);
         assertThat(outboxConfirmedCount(reservationId)).isEqualTo(1);
         assertThat(seatStatus(seatId)).isEqualTo("SOLD");
+
+        // Leave the shared @MockitoSpyBean clean for the other tests in this cached context.
+        reset(seats);
     }
 
     @Test
