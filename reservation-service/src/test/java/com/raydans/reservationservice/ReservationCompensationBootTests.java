@@ -11,6 +11,7 @@ import com.raydans.common.event.EventEnvelope;
 import com.raydans.common.web.CorrelationIdFilter;
 import com.raydans.reservationservice.event.SeatRepository;
 import com.raydans.reservationservice.outbox.OutboxPublisher;
+import com.raydans.reservationservice.reservation.HoldExpirer;
 import com.raydans.reservationservice.reservation.ReservationConfirmationService;
 import com.raydans.reservationservice.web.ReservationController;
 import java.nio.charset.StandardCharsets;
@@ -111,6 +112,9 @@ class ReservationCompensationBootTests {
 
     @Autowired
     ReservationConfirmationService confirmation;
+
+    @Autowired
+    HoldExpirer holdExpirer;
 
     @MockitoSpyBean
     SeatRepository seats;
@@ -398,6 +402,65 @@ class ReservationCompensationBootTests {
     }
 
     @Test
+    void paymentFailedRacingHoldExpiryLeavesExactlyOneTerminalOutcome() throws Exception {
+        // Race the hold-expiry sweep against a live PaymentFailed — same technique as the sibling
+        // race tests: the Kafka listener is single-threaded, so the true race lives at the shared
+        // transaction layer. The single @Version gate on the reservation row lets exactly one
+        // transition win: EXPIRED (seat released, the late compensation becomes an ADR 007 guard
+        // no-op) or CANCELLED (seat released, ReservationCancelled emitted). Either way the seat
+        // ends AVAILABLE, at most one ReservationCancelled is written, and the PaymentFailed is
+        // claimed as processed exactly once — a raced-away compensation loses the claim and is
+        // redelivered, it is never silently dropped.
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Gallery", "row", "A", "seatNumber", 1, "priceCents", 2500)));
+        long reservationId = postReservation(created.eventId(), created.seatIds(), 61L);
+        long seatId = created.seatIds().get(0);
+
+        // Make the hold lapsed so the expirer's overdue sweep will pick the reservation up.
+        jdbc.update(
+                "UPDATE reservation.reservations SET expires_at = now() - interval '1 minute' WHERE id = ?",
+                reservationId);
+        jdbc.update(
+                "UPDATE reservation.seats SET hold_expires_at = now() - interval '1 minute' WHERE id = ?",
+                seatId);
+
+        UUID outcomeEventId = UUID.randomUUID();
+        String correlationId = "corr-expiry-race-61";
+        EventEnvelope<JsonNode> failed = failedEnvelopeJson(outcomeEventId, reservationId, correlationId);
+
+        List<Throwable> raceFailures = runConcurrentlyReturningFailures(List.of(
+                buildProcessor(failed),
+                () -> holdExpirer.expire()));
+
+        // Exactly one transaction wins the version gate; a colliding loser fails with the
+        // optimistic-lock guard and rolls back whole (no partial expiry/cancel, no leaked claim).
+        assertThat(raceFailures)
+                .allSatisfy(failure -> {
+                    assertThat(failure)
+                            .as("the only legitimate expiry-race failure is the optimistic-lock guard")
+                            .isInstanceOf(ObjectOptimisticLockingFailureException.class);
+                });
+
+        String terminalStatus = awaitTerminalStatus(reservationId);
+        boolean cancelled = "CANCELLED".equals(terminalStatus);
+        assertThat(cancelled || "EXPIRED".equals(terminalStatus))
+                .as("the expiry race must resolve to exactly one terminal outcome, was " + terminalStatus)
+                .isTrue();
+        assertThat(seatStatus(seatId))
+                .as("both the expirer and the compensation release the seat")
+                .isEqualTo("AVAILABLE");
+        assertThat(outboxCancelledCount(reservationId))
+                .as("ReservationCancelled is written iff the compensation, not the expirer, won")
+                .isEqualTo(cancelled ? 1 : 0);
+
+        // If the compensation lost the race, the redelivery re-claims and no-ops on the ADR 007
+        // guard; if it won, the redelivery is skipped as a duplicate claim. Either way exactly once.
+        confirmation.process(failed, correlationId);
+        awaitProcessed(outcomeEventId);
+        assertThat(processedCount(outcomeEventId)).isEqualTo(1);
+    }
+
+    @Test
     void paymentFailedAfterConfirmationIsANoOpMarkedProcessed() throws Exception {
         CreatedEvent created = postEvent(List.of(
                 Map.of("section", "Circle", "row", "A", "seatNumber", 1, "priceCents", 3000)));
@@ -529,7 +592,9 @@ class ReservationCompensationBootTests {
         Instant deadline = Instant.now().plusSeconds(30);
         while (Instant.now().isBefore(deadline)) {
             String status = reservationStatus(reservationId);
-            if ("CONFIRMED".equals(status) || "CANCELLED".equals(status)) {
+            if ("CONFIRMED".equals(status)
+                    || "CANCELLED".equals(status)
+                    || "EXPIRED".equals(status)) {
                 return status;
             }
             sleep(100);
