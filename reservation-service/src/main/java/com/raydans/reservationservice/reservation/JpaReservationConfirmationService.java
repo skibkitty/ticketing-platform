@@ -24,6 +24,8 @@ import org.springframework.transaction.annotation.Transactional;
 class JpaReservationConfirmationService implements ReservationConfirmationService {
 
     static final String PAYMENT_SUCCEEDED = "payment.PaymentSucceeded";
+    static final String PAYMENT_FAILED = "payment.PaymentFailed";
+    static final String PAYMENT_SUCCEEDED_STATUS = "SUCCEEDED";
     static final String RESERVATION_CONFIRMED = "reservation.ReservationConfirmed";
 
     private static final Logger log = LoggerFactory.getLogger(JpaReservationConfirmationService.class);
@@ -54,13 +56,23 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
         if (eventType == null || eventType.isBlank()) {
             throw new IllegalArgumentException("envelope.eventType must be set, got: " + envelope);
         }
-        // Everything else on payment.events.v1 (e.g. the PaymentFailed that T07 compensates,
-        // or any unknown type) is deliberately ignored, unprocessed (ADR 008).
-        if (!PAYMENT_SUCCEEDED.equals(eventType)) {
-            log.debug("Ignoring {} on payment.events.v1", eventType);
-            return;
+        switch (eventType) {
+            case PAYMENT_SUCCEEDED -> processPaymentSucceeded(envelope, correlationId);
+            // payment.PaymentFailed is owned by the T07 compensating step (reservation stays
+            // PENDING_PAYMENT and lapses to EXPIRED instead): this confirmation consumer
+            // deliberately ignores it — never claimed, never dead-lettered.
+            case PAYMENT_FAILED -> log.debug(
+                    "Ignoring {} on payment.events.v1 (owned by the T07 compensation step)",
+                    eventType);
+            // Anything else is an unrecognized event on our topic: reject it deliberately so
+            // the record goes through the retry/DLT path (ADR 008) instead of vanishing.
+            default -> throw new IllegalArgumentException(
+                    "Unsupported event type on payment.events.v1: " + eventType);
         }
+    }
 
+    private void processPaymentSucceeded(EventEnvelope<JsonNode> envelope, String correlationId) {
+        String eventType = envelope.eventType();
         if (envelope.eventId() == null) {
             throw new IllegalArgumentException("envelope.eventId must be set for " + eventType);
         }
@@ -113,13 +125,17 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
 
     private OutboxEventEntity confirmedEvent(
             ReservationEntity reservation, List<SeatEntity> soldSeats, String correlationId) {
+        // The confirmation amount is derived from the reservation's own seat prices — the
+        // source of truth is the reservation's pricing, never the payment event's amountCents
+        // (which only documents what the money step settled).
+        int amountCents = soldSeats.stream().mapToInt(SeatEntity::getPriceCents).sum();
         try {
             String payload = objectMapper.writeValueAsString(new ReservationConfirmedPayload(
                     reservation.getId(),
                     reservation.getCustomerId(),
                     reservation.getEvent().getId(),
                     soldSeats.stream().map(SeatEntity::getId).toList(),
-                    soldSeats.stream().mapToInt(SeatEntity::getPriceCents).sum()));
+                    amountCents));
             return new OutboxEventEntity(
                     UUID.randomUUID(),
                     "Reservation",
@@ -148,11 +164,22 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
             throw new IllegalArgumentException(
                     "PaymentSucceeded reservationId must be a positive id: " + outcome.reservationId());
         }
+        // The event TYPE is authoritative proof the payment succeeded; the payload's status
+        // field is only allowed to agree. A PaymentSucceeded whose payload claims anything
+        // else (e.g. "FAILED") is a contract violation and must not be silently accepted.
+        if (!PAYMENT_SUCCEEDED_STATUS.equals(outcome.status())) {
+            throw new IllegalArgumentException(
+                    "payment.PaymentSucceeded must carry status 'SUCCEEDED' but was: "
+                            + outcome.status() + " (reservation " + outcome.reservationId() + ")");
+        }
     }
 
     /**
-     * Wire payload of a {@code payment.PaymentSucceeded} event (payment-service contract). Only
-     * {@code reservationId} is needed to confirm; the rest documents the resolved payment.
+     * Wire payload of a {@code payment.PaymentSucceeded} event (payment-service contract).
+     * The event type itself is authoritative proof of a successful payment; {@code status}
+     * must agree ({@code SUCCEEDED}) or the event is rejected. {@code amountCents} is
+     * informational — the confirmation amount is derived from the reservation's seat
+     * prices. Only {@code reservationId} is actually needed to confirm.
      */
     public record PaymentSucceededPayload(
             Long paymentId, Long reservationId, Integer amountCents, String status) {}

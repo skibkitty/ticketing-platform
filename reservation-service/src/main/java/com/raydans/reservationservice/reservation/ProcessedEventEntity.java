@@ -7,6 +7,14 @@ import jakarta.persistence.Table;
 import java.time.Instant;
 import java.util.UUID;
 
+/**
+ * Append-only idempotency log (ADR 004): one row per claimed inbound event id.
+ *
+ * <p>Retention requirement: rows must survive at least as long as every source
+ * topic's Kafka retention <em>plus</em> any replay/DLT re-drive window, otherwise a
+ * re-delivered event would be wrongly seen as "already processed". This is a
+ * known gap (ADR 009) — a purge job must never delete before that horizon.
+ */
 @Entity
 @Table(schema = "reservation", name = "processed_events")
 public class ProcessedEventEntity {

@@ -131,6 +131,40 @@ class JpaReservationConfirmationServiceTest {
     }
 
     @Test
+    void paymentSucceededWithInconsistentStatusIsRejectedNotSilentlyAccepted() {
+        UUID eventId = UUID.randomUUID();
+
+        EventEnvelope<JsonNode> envelope = new EventEnvelope<>(
+                eventId, "payment.PaymentSucceeded", Instant.now(), CORRELATION_ID,
+                new UUID(0L, 45L), objectMapper.valueToTree(Map.of(
+                        "paymentId", 1L, "reservationId", 45L, "amountCents", 27000, "status", "FAILED")));
+
+        assertThatThrownBy(() -> service.process(envelope, CORRELATION_ID))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must carry status 'SUCCEEDED'");
+
+        verify(processedEvents, never()).tryClaim(any());
+        verify(reservations, never()).findById(any());
+    }
+
+    @Test
+    void unknownEventTypeIsRejectedSoItCanBeRetriedAndDeadLettered() {
+        UUID eventId = UUID.randomUUID();
+
+        EventEnvelope<JsonNode> envelope = new EventEnvelope<>(
+                eventId, "pipeline.UnknownThing", Instant.now(), CORRELATION_ID,
+                new UUID(0L, 45L), outcomePayload(45L));
+
+        assertThatThrownBy(() -> service.process(envelope, CORRELATION_ID))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unsupported event type");
+
+        verify(processedEvents, never()).tryClaim(any());
+        verify(reservations, never()).findById(any());
+        verify(outbox, never()).save(any(OutboxEventEntity.class));
+    }
+
+    @Test
     void blankEventTypeIsRejectedAsMalformed() {
         UUID eventId = UUID.randomUUID();
 

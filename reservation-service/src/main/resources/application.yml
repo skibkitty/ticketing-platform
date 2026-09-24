@@ -22,6 +22,10 @@ spring:
       # Per-record offsets so a poison record can be retried and dead-lettered
       # without re-delivering its batch siblings (ADR 008).
       ack-mode: record
+    admin:
+      # The service provisions its own consumer topics + DLT via KafkaAdmin on
+      # startup (see KafkaTopicConfig); no reliance on broker auto-creation.
+      auto-create: true
 
 app:
   outbox:
@@ -31,6 +35,8 @@ app:
   kafka:
     topics:
       payment-outcome: ${PAYMENT_EVENTS_TOPIC:payment.events.v1}
+    topic-partitions: ${PAYMENT_TOPIC_PARTITIONS:1}
+    topic-replicas: ${PAYMENT_TOPIC_REPLICAS:1}
 
 management:
   endpoints:
