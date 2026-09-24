@@ -381,9 +381,20 @@ class ReservationCompensationBootTests {
         assertThat(processedCount(failEvent1)).isEqualTo(1);
         assertThat(processedCount(okEvent2)).isEqualTo(1);
         assertThat(processedCount(failEvent2)).isEqualTo(1);
-        assertThat(outboxCancelledCount(reservationId))
-                .as("a confirmed reservation must not emit a cancelled transition")
+
+        // Exactly one terminal event is emitted — the confirm and cancel outbox rows are mutually
+        // exclusive and sum to one, so the race can never publish both (or neither) transitions.
+        int confirmedCount = outboxConfirmedCount(reservationId);
+        int cancelledCount = outboxCancelledCount(reservationId);
+        assertThat(confirmedCount)
+                .as("a confirmed reservation must emit exactly its one ReservationConfirmed row")
+                .isEqualTo(confirmed ? 1 : 0);
+        assertThat(cancelledCount)
+                .as("a cancelled reservation must emit exactly its one ReservationCancelled row")
                 .isEqualTo(confirmed ? 0 : 1);
+        assertThat(confirmedCount + cancelledCount)
+                .as("the race must emit exactly one terminal outbox event")
+                .isEqualTo(1);
     }
 
     @Test
@@ -409,14 +420,50 @@ class ReservationCompensationBootTests {
         assertThat(outboxCancelledCount(reservationId)).isZero();
     }
 
+    @Test
+    void cancellationAmountComesFromReservationSeatPricingNotTheEventsAmountCents() throws Exception {
+        // Invariant: ReservationCancelled.amountCents is derived from the reservation's own seat
+        // pricing (4000), never from the PaymentFailed event's amountCents (27000) — the event
+        // amount is informational to reservation-service and is not the source of truth.
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Gallery", "row", "A", "seatNumber", 1, "priceCents", 4000)));
+        long reservationId = postReservation(created.eventId(), created.seatIds(), 5L);
+        long seatId = created.seatIds().get(0);
+
+        UUID outcomeEventId = UUID.randomUUID();
+        String correlationId = "corr-amount-truth-" + reservationId;
+        producePaymentFailed(outcomeEventId, reservationId, 27_000, correlationId);
+
+        awaitReservationStatus(reservationId, "CANCELLED");
+        assertThat(seatStatus(seatId)).isEqualTo("AVAILABLE");
+        awaitProcessed(outcomeEventId);
+
+        outboxPublisher.poll();
+
+        ConsumerRecord<String, String> cancelled = awaitOnTopic(OutboxPublisher.RESERVATION_EVENTS_TOPIC,
+                record -> reservationId == parseReservationId(record.value())
+                        && record.value().contains("reservation.ReservationCancelled"));
+        assertThat(cancelled).isNotNull();
+        assertThat(cancelled.value())
+                .as("the cancellation amount is the reservation's seat-pricing truth (4000), "
+                        + "never the PaymentFailed event's amountCents (27000)")
+                .contains("\"amountCents\":4000")
+                .doesNotContain("\"amountCents\":27000");
+    }
+
     private void producePaymentFailed(UUID eventId, long reservationId, String correlationId) throws Exception {
+        producePaymentFailed(eventId, reservationId, 27_000, correlationId);
+    }
+
+    private void producePaymentFailed(UUID eventId, long reservationId, int amountCents, String correlationId)
+            throws Exception {
         EventEnvelope<Map<String, Object>> envelope = new EventEnvelope<>(
                 eventId,
                 "payment.PaymentFailed",
                 Instant.now(),
                 correlationId,
                 new UUID(0L, reservationId),
-                Map.of("paymentId", 2L, "reservationId", reservationId, "amountCents", 27000, "status", "FAILED"));
+                Map.of("paymentId", 2L, "reservationId", reservationId, "amountCents", amountCents, "status", "FAILED"));
         ProducerRecord<String, String> record = new ProducerRecord<>(
                 PAYMENT_EVENTS_TOPIC,
                 new UUID(0L, reservationId).toString(),
@@ -501,6 +548,12 @@ class ReservationCompensationBootTests {
         return count(
                 "SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = "
                         + reservationId + " AND event_type = 'reservation.ReservationCancelled'");
+    }
+
+    private int outboxConfirmedCount(long reservationId) {
+        return count(
+                "SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = "
+                        + reservationId + " AND event_type = 'reservation.ReservationConfirmed'");
     }
 
     private CreatedEvent postEvent(List<Map<String, Object>> seats) {
