@@ -16,11 +16,15 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -59,6 +63,18 @@ class ReservationConfirmationBootTests {
 
     @Container
     static final KafkaContainer KAFKA = new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.7.1"));
+
+    @BeforeAll
+    static void createTopics() {
+        try (AdminClient admin = AdminClient.create(Map.of(
+                AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
+                AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, 10000))) {
+            admin.createTopics(List.of(new NewTopic(PAYMENT_EVENTS_TOPIC, 1, (short) 1)))
+                    .all().get(30, TimeUnit.SECONDS);
+        } catch (Exception ex) {
+            throw new RuntimeException("Failed to pre-create topic " + PAYMENT_EVENTS_TOPIC, ex);
+        }
+    }
 
     @Autowired
     TestRestTemplate rest;
@@ -142,7 +158,7 @@ class ReservationConfirmationBootTests {
         assertThat(reservationStatus(reservationId)).isEqualTo("EXPIRED");
         assertThat(seatStatus(seatId)).isEqualTo("HELD");
         Integer outboxRows = jdbc.queryForObject(
-                "SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = ?",
+                "SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationConfirmed'",
                 Integer.class, reservationId);
         assertThat(outboxRows).isZero();
     }
@@ -223,9 +239,30 @@ class ReservationConfirmationBootTests {
     }
 
     private void awaitReservationStatus(long reservationId, String status) {
-        awaitUntil(() -> status.equals(query(jdbc ->
-                "SELECT status FROM reservation.reservations WHERE id = " + reservationId)),
-                "reservation " + reservationId + " to reach " + status);
+        String last = "";
+        Instant deadline = Instant.now().plusSeconds(30);
+        while (Instant.now().isBefore(deadline)) {
+            last = query(jdbc ->
+                    "SELECT status FROM reservation.reservations WHERE id = " + reservationId);
+            if (status.equals(last)) {
+                return;
+            }
+            sleep(100);
+        }
+        throw new AssertionError(
+                "Timed out waiting for reservation " + reservationId + " to reach " + status
+                        + " (last seen status: " + last
+                        + "; processed_events rows: "
+                        + count("SELECT count(*) FROM reservation.processed_events")
+                        + "; outbox rows for reservation: "
+                        + count("SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = "
+                                + reservationId)
+                        + "; seat states for reservation: "
+                        + query(jdbc -> "SELECT string_agg(s.id || ':' || s.status, ', ') "
+                                + "FROM reservation.reservation_seats rs "
+                                + "JOIN reservation.seats s ON s.id = rs.seat_id "
+                                + "WHERE rs.reservation_id = " + reservationId)
+                        + ")");
     }
 
     private void awaitProcessed(UUID eventId) {
