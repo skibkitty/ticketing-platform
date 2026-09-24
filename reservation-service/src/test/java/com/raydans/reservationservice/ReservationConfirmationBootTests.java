@@ -242,8 +242,7 @@ class ReservationConfirmationBootTests {
         String last = "";
         Instant deadline = Instant.now().plusSeconds(30);
         while (Instant.now().isBefore(deadline)) {
-            last = query(jdbc ->
-                    "SELECT status FROM reservation.reservations WHERE id = " + reservationId);
+            last = reservationStatus(reservationId);
             if (status.equals(last)) {
                 return;
             }
@@ -258,10 +257,12 @@ class ReservationConfirmationBootTests {
                         + count("SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = "
                                 + reservationId)
                         + "; seat states for reservation: "
-                        + query(jdbc -> "SELECT string_agg(s.id || ':' || s.status, ', ') "
-                                + "FROM reservation.reservation_seats rs "
-                                + "JOIN reservation.seats s ON s.id = rs.seat_id "
-                                + "WHERE rs.reservation_id = " + reservationId)
+                        + jdbc.queryForObject(
+                                "SELECT string_agg(s.id || ':' || s.status, ', ') "
+                                        + "FROM reservation.reservation_seats rs "
+                                        + "JOIN reservation.seats s ON s.id = rs.seat_id "
+                                        + "WHERE rs.reservation_id = ?",
+                                String.class, reservationId)
                         + ")");
     }
 
@@ -285,11 +286,6 @@ class ReservationConfirmationBootTests {
     private int count(String sql) {
         Integer value = jdbc.queryForObject(sql, Integer.class);
         return value == null ? 0 : value;
-    }
-
-    private String query(java.util.function.Function<JdbcTemplate, String> fn) {
-        String value = fn.apply(jdbc);
-        return value == null ? "" : value;
     }
 
     private ConsumerRecord<String, String> awaitOnTopic(String topic, Predicate<ConsumerRecord<String, String>> match) {
