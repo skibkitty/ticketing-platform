@@ -163,11 +163,16 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
         }
 
         reservation.cancel();
+        // releaseHold() only releases seats actually in HELD state (it returns whether it
+        // released), so a seat that somehow left the hold is never handed back to the pool and
+        // the outbox payload reflects exactly the seats that were released.
         List<SeatEntity> releasedSeats = reservation.getSeats().stream()
-                .peek(SeatEntity::releaseHold)
+                .filter(SeatEntity::releaseHold)
                 .toList();
         reservations.save(reservation);
-        seats.saveAll(releasedSeats);
+        if (!releasedSeats.isEmpty()) {
+            seats.saveAll(releasedSeats);
+        }
         outbox.save(cancelledEvent(reservation, releasedSeats, correlationId));
 
         log.info(

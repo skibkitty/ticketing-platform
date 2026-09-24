@@ -98,9 +98,19 @@ public class SeatEntity {
         holdExpiresAt = expiresAt;
     }
 
-    public void releaseHold() {
-        status = SeatStatus.AVAILABLE;
-        holdExpiresAt = null;
+    /**
+     * Releases the hold on a {@code HELD} seat back to {@code AVAILABLE} and clears its hold
+     * expiry. Returns whether the seat was actually released: a seat in any other state (e.g.
+     * {@code SOLD}) is left untouched — a compensating action must never hand a sold seat back
+     * to the general pool.
+     */
+    public boolean releaseHold() {
+        if (status == SeatStatus.HELD) {
+            status = SeatStatus.AVAILABLE;
+            holdExpiresAt = null;
+            return true;
+        }
+        return false;
     }
 
     public void markSold() {
@@ -109,10 +119,9 @@ public class SeatEntity {
     }
 
     public boolean releaseHoldIfLapsed(Instant now) {
-        if (status == SeatStatus.HELD && holdExpiresAt != null && holdExpiresAt.isBefore(now)) {
-            releaseHold();
-            return true;
-        }
-        return false;
+        return status == SeatStatus.HELD
+                && holdExpiresAt != null
+                && holdExpiresAt.isBefore(now)
+                && releaseHold();
     }
 }

@@ -1,19 +1,32 @@
 package com.raydans.reservationservice;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.reset;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.raydans.common.event.EventEnvelope;
 import com.raydans.common.web.CorrelationIdFilter;
+import com.raydans.reservationservice.event.SeatRepository;
 import com.raydans.reservationservice.outbox.OutboxPublisher;
+import com.raydans.reservationservice.reservation.ReservationConfirmationService;
 import com.raydans.reservationservice.web.ReservationController;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
@@ -34,8 +47,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.testcontainers.containers.KafkaContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -93,6 +108,12 @@ class ReservationCompensationBootTests {
 
     @Autowired
     OutboxPublisher outboxPublisher;
+
+    @Autowired
+    ReservationConfirmationService confirmation;
+
+    @MockitoSpyBean
+    SeatRepository seats;
 
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
@@ -229,6 +250,155 @@ class ReservationCompensationBootTests {
                 .isNull();
     }
 
+    @Test
+    void paymentFailedForUnknownReservationIsDeadLetteredAndNeverConsumed() throws Exception {
+        long ghostReservationId = 999_999L;
+        UUID outcomeEventId = UUID.randomUUID();
+        String correlationId = "corr-ghost-999999";
+        producePaymentFailed(outcomeEventId, ghostReservationId, correlationId);
+
+        // Every retry claims the idempotency row, then throws on the unknown reservation — and the
+        // failed tx rolls the claim back. After the retry budget the poison lands on the DLT, so an
+        // unresolvable PaymentFailed is quarantined instead of blocking the consumer.
+        assertThat(awaitOnTopic(PAYMENT_EVENTS_DLT, record -> record.value().contains(outcomeEventId.toString())))
+                .as("an unknown-reservation PaymentFailed must be retried then dead-lettered")
+                .isNotNull();
+        awaitProcessed(outcomeEventId);
+        assertThat(processedCount(outcomeEventId))
+                .as("each failed attempt's idempotency claim must be rolled back")
+                .isZero();
+        Integer cancelledRows = jdbc.queryForObject(
+                "SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationCancelled'",
+                Integer.class, ghostReservationId);
+        assertThat(cancelledRows).isZero();
+    }
+
+    @Test
+    void failedCompensationRollsBackTheClaimAndRedeliverySucceeds() throws Exception {
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Dress Circle", "row", "A", "seatNumber", 1, "priceCents", 7000)));
+        long reservationId = postReservation(created.eventId(), created.seatIds(), 66L);
+        long seatId = created.seatIds().get(0);
+
+        AtomicInteger attempts = new AtomicInteger();
+        CountDownLatch firstFailure = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            if (attempts.incrementAndGet() <= 2) {
+                firstFailure.countDown();
+                throw new RuntimeException("boom during compensation");
+            }
+            return invocation.getArguments()[0];
+        }).when(seats).saveAll(anyList());
+
+        UUID outcomeEventId = UUID.randomUUID();
+        producePaymentFailed(outcomeEventId, reservationId, "corr-compensation-rollback-66");
+
+        assertThat(firstFailure.await(30, TimeUnit.SECONDS))
+                .as("the first compensation attempt failed after the idempotency claim")
+                .isTrue();
+
+        // The failed transaction rolled back in full: a mid-compensation crash does not strand the
+        // reservation as partially cancelled nor leak a claim / cancelled outbox row.
+        assertThat(processedCount(outcomeEventId)).as("idempotency claim must roll back").isZero();
+        assertThat(reservationStatus(reservationId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(seatStatus(seatId)).isEqualTo("HELD");
+        Integer cancelledRows = jdbc.queryForObject(
+                "SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationCancelled'",
+                Integer.class, reservationId);
+        assertThat(cancelledRows).isZero();
+
+        // Kafka redelivers; once the seat write works the compensation lands exactly once.
+        awaitReservationStatus(reservationId, "CANCELLED");
+        awaitProcessed(outcomeEventId);
+        assertThat(seatStatus(seatId)).isEqualTo("AVAILABLE");
+        assertThat(outboxCancelledCount(reservationId)).isEqualTo(1);
+
+        reset(seats);
+    }
+
+    @Test
+    void concurrentSucceededAndFailedOutcomesLeaveNoInconsistentState() throws Exception {
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Grand Tier", "row", "A", "seatNumber", 1, "priceCents", 9000),
+                Map.of("section", "Grand Tier", "row", "B", "seatNumber", 2, "priceCents", 8000)));
+        long reservationId = postReservation(created.eventId(), created.seatIds(), 33L);
+
+        UUID okEvent = UUID.randomUUID();
+        UUID failEvent = UUID.randomUUID();
+        EventEnvelope<JsonNode> okEnv = succeededEnvelopeJson(okEvent, reservationId, "corr-race-ok-33");
+        EventEnvelope<JsonNode> failEnv = failedEnvelopeJson(failEvent, reservationId, "corr-race-fail-33");
+
+        List<Throwable> raceFailures = runConcurrentlyReturningFailures(List.of(
+                buildProcessor(okEnv),
+                buildProcessor(okEnv),
+                buildProcessor(failEnv),
+                buildProcessor(failEnv)));
+
+        // Exactly one terminal transition wins the single-version gate: either confirmed+sold or
+        // cancelled+available — never a mix. Losers may throw an optimistic-lock exception as the
+        // version conflict rolls back their whole tx (including their idempotency claim).
+        assertThat(raceFailures)
+                .allSatisfy(failure -> {
+                    assertThat(failure)
+                            .as("the only legitimate race failure is the optimistic-lock guard")
+                            .isInstanceOf(ObjectOptimisticLockingFailureException.class);
+                });
+
+        String terminalStatus = awaitTerminalStatus(reservationId);
+        boolean confirmed = "CONFIRMED".equals(terminalStatus);
+        assertThat(confirmed || "CANCELLED".equals(terminalStatus))
+                .as("reservation must reach exactly one terminal state, was " + terminalStatus)
+                .isTrue();
+        for (long seatId : created.seatIds()) {
+            assertThat(seatStatus(seatId))
+                    .as("seat state must agree with the winning terminal transition")
+                    .isEqualTo(confirmed ? "SOLD" : "AVAILABLE");
+        }
+
+        // Both losing paths redeliver cleanly: the winner's duplicate is skipped by the idempotency
+        // claim, the loser's event is claimed once and no-ops on the ADR 007 guard.
+        List<Throwable> redeliveryFailures = new ArrayList<>();
+        for (EventEnvelope<JsonNode> env : List.of(okEnv, failEnv)) {
+            try {
+                confirmation.process(env, "corr-redeliver-33-" + env.eventId());
+            } catch (Throwable throwable) {
+                redeliveryFailures.add(throwable);
+            }
+        }
+        awaitProcessed(okEvent);
+        awaitProcessed(failEvent);
+
+        assertThat(redeliveryFailures).as("redelivered losers must be no-ops, not errors").isEmpty();
+        assertThat(processedCount(okEvent)).isEqualTo(1);
+        assertThat(processedCount(failEvent)).isEqualTo(1);
+        assertThat(outboxCancelledCount(reservationId))
+                .as("a confirmed reservation must not emit a cancelled transition")
+                .isEqualTo(confirmed ? 0 : 1);
+    }
+
+    @Test
+    void paymentFailedAfterConfirmationIsANoOpMarkedProcessed() throws Exception {
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Circle", "row", "A", "seatNumber", 1, "priceCents", 3000)));
+        long reservationId = postReservation(created.eventId(), created.seatIds(), 11L);
+        long seatId = created.seatIds().get(0);
+
+        // Force the reservation straight to CONFIRMED with its seat sold, as if the money step
+        // confirmed it first — a late PaymentFailed must not claw already-sold seats back.
+        jdbc.update(
+                "UPDATE reservation.reservations SET status = 'CONFIRMED' WHERE id = ?", reservationId);
+        jdbc.update(
+                "UPDATE reservation.seats SET status = 'SOLD', hold_expires_at = NULL WHERE id = ?", seatId);
+
+        UUID outcomeEventId = UUID.randomUUID();
+        producePaymentFailed(outcomeEventId, reservationId, "corr-guard-confirmed-11");
+
+        awaitProcessed(outcomeEventId);
+        assertThat(reservationStatus(reservationId)).isEqualTo("CONFIRMED");
+        assertThat(seatStatus(seatId)).isEqualTo("SOLD");
+        assertThat(outboxCancelledCount(reservationId)).isZero();
+    }
+
     private void producePaymentFailed(UUID eventId, long reservationId, String correlationId) throws Exception {
         EventEnvelope<Map<String, Object>> envelope = new EventEnvelope<>(
                 eventId,
@@ -243,6 +413,80 @@ class ReservationCompensationBootTests {
                 objectMapper.writeValueAsString(envelope));
         record.headers().add(CorrelationIdFilter.HEADER_NAME, correlationId.getBytes(StandardCharsets.UTF_8));
         kafka.send(record).get(10, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    private EventEnvelope<JsonNode> succeededEnvelopeJson(UUID eventId, long reservationId, String correlationId) {
+        return new EventEnvelope<>(
+                eventId, "payment.PaymentSucceeded", Instant.now(), correlationId,
+                new UUID(0L, reservationId), objectMapper.valueToTree(Map.of(
+                        "paymentId", 1L, "reservationId", reservationId, "amountCents", 27000, "status", "SUCCEEDED")));
+    }
+
+    private EventEnvelope<JsonNode> failedEnvelopeJson(UUID eventId, long reservationId, String correlationId) {
+        return new EventEnvelope<>(
+                eventId, "payment.PaymentFailed", Instant.now(), correlationId,
+                new UUID(0L, reservationId), objectMapper.valueToTree(Map.of(
+                        "paymentId", 2L, "reservationId", reservationId, "amountCents", 27000, "status", "FAILED")));
+    }
+
+    private Runnable buildProcessor(EventEnvelope<JsonNode> envelope) {
+        return () -> {
+            try {
+                confirmation.process(envelope, envelope.correlationId());
+            } catch (Throwable throwable) {
+                throw new RuntimeException(throwable);
+            }
+        };
+    }
+
+    private List<Throwable> runConcurrentlyReturningFailures(List<Runnable> tasks) throws Exception {
+        List<Future<Void>> results = Collections.synchronizedList(new ArrayList<>());
+        List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
+        ExecutorService pool = Executors.newFixedThreadPool(tasks.size());
+        try {
+            for (Runnable task : tasks) {
+                results.add(pool.submit(() -> {
+                    try {
+                        task.run();
+                        return null;
+                    } catch (Throwable throwable) {
+                        failures.add(throwable);
+                        return null;
+                    }
+                }));
+            }
+            for (Future<Void> result : results) {
+                result.get(30, TimeUnit.SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        return failures;
+    }
+
+    private String awaitTerminalStatus(long reservationId) {
+        Instant deadline = Instant.now().plusSeconds(30);
+        while (Instant.now().isBefore(deadline)) {
+            String status = reservationStatus(reservationId);
+            if ("CONFIRMED".equals(status) || "CANCELLED".equals(status)) {
+                return status;
+            }
+            sleep(100);
+        }
+        throw new AssertionError(
+                "Timed out waiting for reservation " + reservationId + " to reach a terminal state (last seen: "
+                        + reservationStatus(reservationId) + ")");
+    }
+
+    private int processedCount(UUID eventId) {
+        return count(
+                "SELECT count(*) FROM reservation.processed_events WHERE event_id = '" + eventId + "'");
+    }
+
+    private int outboxCancelledCount(long reservationId) {
+        return count(
+                "SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = "
+                        + reservationId + " AND event_type = 'reservation.ReservationCancelled'");
     }
 
     private CreatedEvent postEvent(List<Map<String, Object>> seats) {
