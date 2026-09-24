@@ -6,9 +6,11 @@ import com.raydans.common.event.EventEnvelope;
 public interface ReservationConfirmationService {
 
     /**
-     * Applies a {@code payment.PaymentSucceeded} outcome to a Reservation idempotently.
+     * Applies a {@code payment.PaymentSucceeded} or {@code payment.PaymentFailed} outcome to a
+     * Reservation idempotently: success confirms the reservation and sells its seats; failure
+     * cancels it and releases its seats back to {@code AVAILABLE} (the T07 compensating action).
      *
-     * <p>The ADR 007 guard is enforced here: the outcome is applied <em>only while the
+     * <p>The ADR 007 guard is enforced here: an outcome is applied <em>only while the
      * Reservation is {@code PENDING_PAYMENT}</em>; otherwise the event is recorded as
      * processed and no state changes (a late outcome must never re-flip seats a reservation
      * no longer owns).

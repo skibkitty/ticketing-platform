@@ -71,10 +71,18 @@ deliberate difference in classification. Its topics (`payment.events.v1` and
 `KafkaTopicConfig`) instead of relying on broker auto-creation. Event types are
 classified explicitly, never swallowed:
 
-- `payment.PaymentSucceeded` — the only type this consumer acts on (idempotent
-  confirm, ADR 004/007).
-- `payment.PaymentFailed` — a known type owned by the T07 compensating step;
-  deliberately ignored, never claimed, never dead-lettered.
+- `payment.PaymentSucceeded` — confirms a pending reservation (idempotent
+  confirm, ADR 004/007), and the payload's `status` must be `SUCCEEDED` —
+  a record whose event type claims success while its payload disputes it is a
+  producer bug that takes the retry/DLT path.
+- `payment.PaymentFailed` — the compensating step (T07): cancels the pending
+  reservation and releases its seats back to `AVAILABLE`, claimed idempotently
+  under the same ADR 004/007 guards. A **well-formed** PaymentFailed is handled
+  and therefore never dead-lettered — it is a known type, not quarantine
+  fodder. Malformed variants are still classified poison like any other failing
+  record: a missing/non-positive `reservationId`, an unknown reservation, an
+  unparseable payload, or a `status` that disputes the event type (must be
+  `FAILED`) all raise and take the retry/DLT path.
 - anything else — an unrecognized event on the topic; rejected with an exception
   so the record takes the retry/DLT path and stays auditable instead of being
   silently acknowledged.
