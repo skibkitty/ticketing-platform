@@ -93,4 +93,8 @@ public class ReservationEntity {
     public void markExpired() {
         status = ReservationStatus.EXPIRED;
     }
+
+    public void confirm() {
+        status = ReservationStatus.CONFIRMED;
+    }
 }
