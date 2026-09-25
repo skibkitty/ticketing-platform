@@ -14,10 +14,15 @@ public class HoldExpirer {
 
     private final SeatRepository seats;
     private final ReservationRepository reservations;
+    private final ReservationExpiryService expiry;
 
-    public HoldExpirer(SeatRepository seats, ReservationRepository reservations) {
+    public HoldExpirer(
+            SeatRepository seats,
+            ReservationRepository reservations,
+            ReservationExpiryService expiry) {
         this.seats = seats;
         this.reservations = reservations;
+        this.expiry = expiry;
     }
 
     @Scheduled(fixedDelayString = "${app.hold.expire-interval-ms:1000}")
@@ -30,19 +35,12 @@ public class HoldExpirer {
             return;
         }
 
+        // Each transition stages its ReservationExpired outbox row in this same transaction, so a
+        // @Version-conflict rollback (a concurrent re-hold or confirmation winning the seat or the
+        // reservation) undoes the EXPIRED mutation, the seat releases, and the staged row together.
         List<SeatEntity> releasedSeats = new ArrayList<>();
         for (ReservationEntity reservation : overdue) {
-            reservation.markExpired();
-            // A seat is only released if its hold has lapsed in this snapshot. If the seat was
-            // re-held concurrently after this snapshot, the @Version check on saveAll rejects the
-            // expired release (ObjectOptimisticLockingFailureException), the whole transaction
-            // rolls back, and the next tick re-evaluates against the newer state — a re-hold is
-            // never overwritten.
-            for (SeatEntity seat : reservation.getSeats()) {
-                if (seat.releaseHoldIfLapsed(now)) {
-                    releasedSeats.add(seat);
-                }
-            }
+            releasedSeats.addAll(expiry.expireIfOverdue(reservation, now));
         }
 
         reservations.saveAll(overdue);

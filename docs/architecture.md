@@ -51,7 +51,13 @@ Customer -> POST /api/v1/reservations {eventId, seatIds}
 
 Separately, a scheduled sweep in reservation-service finds PENDING_PAYMENT
 reservations past holdExpiresAt with no payment outcome yet, releases their
-seats, marks the reservation EXPIRED, and publishes ReservationExpired.
+seats, marks the reservation EXPIRED, and publishes ReservationExpired. The
+same transition also runs on the read path: a GET or list that encounters a
+PENDING_PAYMENT reservation past its expiresAt expires it the same way, so an
+expiry is never lost just because no sweep ran first. Every expiry path runs
+in one transaction and publishes exactly one ReservationExpired —
+seatIds/amountCents describe the seats actually released by that transition
+(possibly none, when a hold was re-extended before the expiry saw it).
 ```
 
 This is a **choreographed saga**, not an orchestrated one: there's no
