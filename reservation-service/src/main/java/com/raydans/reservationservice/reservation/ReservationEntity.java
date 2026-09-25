@@ -104,6 +104,10 @@ public class ReservationEntity {
         status = ReservationStatus.EXPIRED;
     }
 
+    public void cancel() {
+        status = ReservationStatus.CANCELLED;
+    }
+
     public void confirm() {
         status = ReservationStatus.CONFIRMED;
     }

@@ -396,34 +396,6 @@ class ReservationConfirmationBootTests {
         awaitProcessed(validEventId);
     }
 
-    @Test
-    void paymentFailedIsIntentionallyIgnoredAndNeverDeadLettered() throws Exception {
-        CreatedEvent created = postEvent(List.of(
-                Map.of("section", "Front Orchestra", "row", "A", "seatNumber", 1, "priceCents", 3000)));
-        long reservationId = postReservation(created.eventId(), created.seatIds(), 11L);
-
-        UUID failEventId = UUID.randomUUID();
-        produceEnvelope(new EventEnvelope<>(failEventId, "payment.PaymentFailed", Instant.now(),
-                "corr-failed-11", new UUID(0L, reservationId),
-                Map.of("paymentId", 2L, "reservationId", reservationId, "amountCents", 3000, "status", "FAILED")),
-                reservationId);
-
-        // Wait out the full retry/DLT window: a PaymentFailed must be ignored, not quarantined.
-        assertThat(countMatchingWithin(PAYMENT_EVENTS_DLT,
-                record -> record.value().contains(failEventId.toString()), Duration.ofSeconds(12)))
-                .as("PaymentFailed is owned by T07; must not be dead-lettered")
-                .isZero();
-        assertThat(reservationStatus(reservationId)).isEqualTo("PENDING_PAYMENT");
-        assertThat(seatStatus(created.seatIds().get(0))).isEqualTo("HELD");
-        assertThat(processedCount(failEventId)).isZero();
-        assertThat(outboxConfirmedCount(reservationId)).isZero();
-
-        UUID okEventId = UUID.randomUUID();
-        producePaymentSucceeded(okEventId, reservationId, "corr-after-failed-11");
-        awaitReservationStatus(reservationId, "CONFIRMED");
-        awaitProcessed(okEventId);
-    }
-
     private void producePaymentSucceeded(UUID eventId, long reservationId, String correlationId) throws Exception {
         produceEnvelope(succeededEnvelope(eventId, reservationId, correlationId), reservationId);
     }
@@ -569,21 +541,6 @@ class ReservationConfirmationBootTests {
             }
         }
         return null;
-    }
-
-    private long countMatchingWithin(String topic, Predicate<ConsumerRecord<String, String>> match, Duration window) {
-        try (KafkaConsumer<String, String> consumer = kafkaConsumer(topic)) {
-            Instant deadline = Instant.now().plus(window);
-            long matching = 0;
-            while (Instant.now().isBefore(deadline)) {
-                for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofSeconds(1)).records(topic)) {
-                    if (match.test(record)) {
-                        matching++;
-                    }
-                }
-            }
-            return matching;
-        }
     }
 
     private KafkaConsumer<String, String> kafkaConsumer(String topic) {

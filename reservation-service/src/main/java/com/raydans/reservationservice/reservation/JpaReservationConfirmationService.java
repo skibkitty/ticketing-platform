@@ -17,8 +17,11 @@ import org.springframework.transaction.annotation.Transactional;
 
 /**
  * The money-step outcome consumer: {@code payment.PaymentSucceeded} confirms a pending
- * reservation and sells its seats, in the same transaction that claims the event in
- * {@code processed_events} (ADR 004) and writes the {@code ReservationConfirmed} outbox row.
+ * reservation and sells its seats; {@code payment.PaymentFailed} is the T07 compensating
+ * action — it cancels the reservation and releases its seats back to {@code AVAILABLE}. Both
+ * run in the same transaction that claims the event in {@code processed_events} (ADR 004),
+ * write the {@code ReservationConfirmed}/{@code ReservationCancelled} outbox row, and are
+ * gated on the reservation still being {@code PENDING_PAYMENT} (ADR 007).
  */
 @Service
 class JpaReservationConfirmationService implements ReservationConfirmationService {
@@ -26,7 +29,9 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
     static final String PAYMENT_SUCCEEDED = "payment.PaymentSucceeded";
     static final String PAYMENT_FAILED = "payment.PaymentFailed";
     static final String PAYMENT_SUCCEEDED_STATUS = "SUCCEEDED";
+    static final String PAYMENT_FAILED_STATUS = "FAILED";
     static final String RESERVATION_CONFIRMED = "reservation.ReservationConfirmed";
+    static final String RESERVATION_CANCELLED = "reservation.ReservationCancelled";
 
     private static final Logger log = LoggerFactory.getLogger(JpaReservationConfirmationService.class);
 
@@ -58,12 +63,7 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
         }
         switch (eventType) {
             case PAYMENT_SUCCEEDED -> processPaymentSucceeded(envelope, correlationId);
-            // payment.PaymentFailed is owned by the T07 compensating step (reservation stays
-            // PENDING_PAYMENT and lapses to EXPIRED instead): this confirmation consumer
-            // deliberately ignores it — never claimed, never dead-lettered.
-            case PAYMENT_FAILED -> log.debug(
-                    "Ignoring {} on payment.events.v1 (owned by the T07 compensation step)",
-                    eventType);
+            case PAYMENT_FAILED -> processPaymentFailed(envelope, correlationId);
             // Anything else is an unrecognized event on our topic: reject it deliberately so
             // the record goes through the retry/DLT path (ADR 008) instead of vanishing.
             default -> throw new IllegalArgumentException(
@@ -79,8 +79,8 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
         if (envelope.payload() == null) {
             throw new IllegalArgumentException("envelope.payload must be set for " + eventType);
         }
-        PaymentSucceededPayload outcome = parseOutcome(envelope.payload());
-        validateOutcome(outcome);
+        PaymentOutcomePayload outcome = parseOutcome(envelope.payload());
+        validateSucceededOutcome(outcome);
 
         // Idempotency claim (ADR 004): 1 = this transaction won the event, 0 = duplicate.
         if (processedEvents.tryClaim(envelope.eventId()) == 0) {
@@ -92,6 +92,29 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
                 .orElseThrow(() -> new IllegalStateException(
                         "PaymentSucceeded for unknown reservation " + outcome.reservationId()));
         confirmIfPending(reservation, envelope.eventId(), correlationId);
+    }
+
+    private void processPaymentFailed(EventEnvelope<JsonNode> envelope, String correlationId) {
+        String eventType = envelope.eventType();
+        if (envelope.eventId() == null) {
+            throw new IllegalArgumentException("envelope.eventId must be set for " + eventType);
+        }
+        if (envelope.payload() == null) {
+            throw new IllegalArgumentException("envelope.payload must be set for " + eventType);
+        }
+        PaymentOutcomePayload outcome = parseOutcome(envelope.payload());
+        validateFailedOutcome(outcome);
+
+        // Idempotency claim (ADR 004): 1 = this transaction won the event, 0 = duplicate.
+        if (processedEvents.tryClaim(envelope.eventId()) == 0) {
+            log.debug("Skipping duplicate delivery of event {}", envelope.eventId());
+            return;
+        }
+
+        ReservationEntity reservation = reservations.findById(outcome.reservationId())
+                .orElseThrow(() -> new IllegalStateException(
+                        "PaymentFailed for unknown reservation " + outcome.reservationId()));
+        cancelIfPending(reservation, envelope.eventId(), correlationId);
     }
 
     /**
@@ -123,6 +146,40 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
                 reservation.getId(), eventId);
     }
 
+    /**
+     * ADR 007 guard, on the compensating side: a {@code PaymentFailed} only applies while the
+     * reservation is still {@code PENDING_PAYMENT}. Otherwise the event has already been claimed
+     * as processed and we no-op — a late {@code PaymentFailed} must not re-brand a
+     * meanwhile-confirmed/expired reservation or touch seats it no longer owns.
+     */
+    private void cancelIfPending(
+            ReservationEntity reservation, UUID eventId, String correlationId) {
+        if (reservation.getStatus() != ReservationStatus.PENDING_PAYMENT) {
+            log.info(
+                    "Ignoring PaymentFailed {} for reservation {} with status {} (ADR 007 guard); "
+                            + "event recorded as processed",
+                    eventId, reservation.getId(), reservation.getStatus());
+            return;
+        }
+
+        reservation.cancel();
+        // releaseHold() only releases seats actually in HELD state (it returns whether it
+        // released), so a seat that somehow left the hold is never handed back to the pool and
+        // the outbox payload reflects exactly the seats that were released.
+        List<SeatEntity> releasedSeats = reservation.getSeats().stream()
+                .filter(SeatEntity::releaseHold)
+                .toList();
+        reservations.save(reservation);
+        if (!releasedSeats.isEmpty()) {
+            seats.saveAll(releasedSeats);
+        }
+        outbox.save(cancelledEvent(reservation, releasedSeats, correlationId));
+
+        log.info(
+                "Reservation {} cancelled by payment outcome {}",
+                reservation.getId(), eventId);
+    }
+
     private OutboxEventEntity confirmedEvent(
             ReservationEntity reservation, List<SeatEntity> soldSeats, String correlationId) {
         // The confirmation amount is derived from the reservation's own seat prices — the
@@ -148,22 +205,41 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
         }
     }
 
-    private PaymentSucceededPayload parseOutcome(JsonNode payload) {
+    private OutboxEventEntity cancelledEvent(
+            ReservationEntity reservation, List<SeatEntity> releasedSeats, String correlationId) {
+        // Like confirmation, the amount is derived from the reservation's own seat prices —
+        // the source of truth is the reservation's pricing, never the payment event's
+        // amountCents (which only documents what the money step attempted to settle).
+        int amountCents = releasedSeats.stream().mapToInt(SeatEntity::getPriceCents).sum();
         try {
-            return objectMapper.treeToValue(payload, PaymentSucceededPayload.class);
+            String payload = objectMapper.writeValueAsString(new ReservationCancelledPayload(
+                    reservation.getId(),
+                    reservation.getCustomerId(),
+                    reservation.getEvent().getId(),
+                    releasedSeats.stream().map(SeatEntity::getId).toList(),
+                    amountCents));
+            return new OutboxEventEntity(
+                    UUID.randomUUID(),
+                    "Reservation",
+                    reservation.getId(),
+                    RESERVATION_CANCELLED,
+                    payload,
+                    correlationId);
         } catch (JsonProcessingException ex) {
-            throw new IllegalStateException("Failed to deserialize PaymentSucceeded payload", ex);
+            throw new IllegalStateException("Failed to serialize ReservationCancelled payload", ex);
         }
     }
 
-    private void validateOutcome(PaymentSucceededPayload outcome) {
-        if (outcome.reservationId() == null) {
-            throw new IllegalArgumentException("PaymentSucceeded reservationId must be set");
+    private PaymentOutcomePayload parseOutcome(JsonNode payload) {
+        try {
+            return objectMapper.treeToValue(payload, PaymentOutcomePayload.class);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("Failed to deserialize payment outcome payload", ex);
         }
-        if (outcome.reservationId() <= 0) {
-            throw new IllegalArgumentException(
-                    "PaymentSucceeded reservationId must be a positive id: " + outcome.reservationId());
-        }
+    }
+
+    private void validateSucceededOutcome(PaymentOutcomePayload outcome) {
+        validateCommon(outcome);
         // The event TYPE is authoritative proof the payment succeeded; the payload's status
         // field is only allowed to agree. A PaymentSucceeded whose payload claims anything
         // else (e.g. "FAILED") is a contract violation and must not be silently accepted.
@@ -174,17 +250,43 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
         }
     }
 
+    private void validateFailedOutcome(PaymentOutcomePayload outcome) {
+        validateCommon(outcome);
+        // Mirror of the succeeded check: a PaymentFailed whose payload claims anything but
+        // "FAILED" disputes its own event type — a producer bug to be dead-lettered, never
+        // silently accepted as a compensation.
+        if (!PAYMENT_FAILED_STATUS.equals(outcome.status())) {
+            throw new IllegalArgumentException(
+                    "payment.PaymentFailed must carry status 'FAILED' but was: "
+                            + outcome.status() + " (reservation " + outcome.reservationId() + ")");
+        }
+    }
+
+    private void validateCommon(PaymentOutcomePayload outcome) {
+        if (outcome.reservationId() == null) {
+            throw new IllegalArgumentException("payment outcome reservationId must be set");
+        }
+        if (outcome.reservationId() <= 0) {
+            throw new IllegalArgumentException(
+                    "payment outcome reservationId must be a positive id: " + outcome.reservationId());
+        }
+    }
+
     /**
-     * Wire payload of a {@code payment.PaymentSucceeded} event (payment-service contract).
-     * The event type itself is authoritative proof of a successful payment; {@code status}
-     * must agree ({@code SUCCEEDED}) or the event is rejected. {@code amountCents} is
-     * informational — the confirmation amount is derived from the reservation's seat
-     * prices. Only {@code reservationId} is actually needed to confirm.
+     * Wire payload of a {@code payment.PaymentSucceeded}/{@code payment.PaymentFailed} event
+     * (payment-service contract). The event type itself is authoritative proof of the outcome;
+     * {@code status} must agree ({@code SUCCEEDED} or {@code FAILED}) or the event is rejected.
+     * {@code amountCents} is informational — the confirmation/cancellation amount is derived
+     * from the reservation's seat prices. Only {@code reservationId} is actually needed.
      */
-    public record PaymentSucceededPayload(
+    public record PaymentOutcomePayload(
             Long paymentId, Long reservationId, Integer amountCents, String status) {}
 
     /** Wire payload of a {@code reservation.ReservationConfirmed} event. */
     public record ReservationConfirmedPayload(
+            long reservationId, long customerId, long eventId, List<Long> seatIds, int amountCents) {}
+
+    /** Wire payload of a {@code reservation.ReservationCancelled} event. */
+    public record ReservationCancelledPayload(
             long reservationId, long customerId, long eventId, List<Long> seatIds, int amountCents) {}
 }

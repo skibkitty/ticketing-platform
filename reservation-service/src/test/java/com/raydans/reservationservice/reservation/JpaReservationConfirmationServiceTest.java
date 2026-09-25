@@ -120,14 +120,199 @@ class JpaReservationConfirmationServiceTest {
     }
 
     @Test
-    void failedOutcomeEventTypeIsIgnored() {
+    void failedOutcomeCancelsReservationReleasesSeatsAndWritesOutboxRow() {
+        UUID eventId = UUID.randomUUID();
+        ReservationEntity reservation = pendingReservation(42L, List.of(seat(10L, 15000), seat(11L, 12000)));
+        when(processedEvents.tryClaim(eventId)).thenReturn(1);
+        when(reservations.findById(42L)).thenReturn(Optional.of(reservation));
+
+        service.process(failedEnvelope(eventId, 42L), CORRELATION_ID);
+
+        verify(processedEvents).tryClaim(eventId);
+        assertThat(reservation.getStatus()).isEqualTo(ReservationStatus.CANCELLED);
+        assertThat(reservation.getSeats()).allMatch(s -> s.getStatus() == SeatStatus.AVAILABLE);
+        assertThat(reservation.getSeats()).allMatch(s -> s.getHoldExpiresAt() == null);
+        verify(reservations).save(reservation);
+        verify(seats).saveAll(any());
+
+        ArgumentCaptor<OutboxEventEntity> outboxCaptor = ArgumentCaptor.forClass(OutboxEventEntity.class);
+        verify(outbox).save(outboxCaptor.capture());
+        OutboxEventEntity cancelled = outboxCaptor.getValue();
+        assertThat(cancelled.getEventType()).isEqualTo("reservation.ReservationCancelled");
+        assertThat(cancelled.getAggregateType()).isEqualTo("Reservation");
+        assertThat(cancelled.getAggregateId()).isEqualTo(42L);
+        assertThat(cancelled.getCorrelationId()).isEqualTo(CORRELATION_ID);
+        assertThat(cancelled.getPayload())
+                .contains("\"reservationId\":42")
+                .contains("\"customerId\":99")
+                .contains("\"eventId\":7")
+                .contains("\"seatIds\":[10,11]")
+                .contains("\"amountCents\":27000");
+    }
+
+    @Test
+    void failedOutcomeForNonPendingReservationIsANoOpButStillRecordedProcessed() {
+        UUID eventId = UUID.randomUUID();
+        ReservationEntity reservation = pendingReservation(43L, List.of(seat(12L, 1000)));
+        reservation.markExpired();
+        when(processedEvents.tryClaim(eventId)).thenReturn(1);
+        when(reservations.findById(43L)).thenReturn(Optional.of(reservation));
+
+        service.process(failedEnvelope(eventId, 43L), CORRELATION_ID);
+
+        verify(processedEvents).tryClaim(eventId);
+        assertThat(reservation.getStatus()).isEqualTo(ReservationStatus.EXPIRED);
+        assertThat(reservation.getSeats()).allMatch(s -> s.getStatus() == SeatStatus.HELD);
+        verify(reservations, never()).save(any());
+        verify(seats, never()).saveAll(any());
+        verify(outbox, never()).save(any(OutboxEventEntity.class));
+    }
+
+    @Test
+    void duplicateFailedOutcomeDeliveryIsANoOp() {
+        UUID eventId = UUID.randomUUID();
+        when(processedEvents.tryClaim(eventId)).thenReturn(0);
+
+        service.process(failedEnvelope(eventId, 44L), CORRELATION_ID);
+
+        verify(reservations, never()).findById(any());
+        verify(reservations, never()).save(any());
+        verify(seats, never()).saveAll(any());
+        verify(outbox, never()).save(any(OutboxEventEntity.class));
+    }
+
+    @Test
+    void paymentFailedWithInconsistentStatusIsRejectedNotSilentlyAccepted() {
         UUID eventId = UUID.randomUUID();
 
-        service.process(failedEnvelope(eventId, 45L), CORRELATION_ID);
+        EventEnvelope<JsonNode> envelope = new EventEnvelope<>(
+                eventId, "payment.PaymentFailed", Instant.now(), CORRELATION_ID,
+                new UUID(0L, 45L), objectMapper.valueToTree(Map.of(
+                        "paymentId", 2L, "reservationId", 45L, "amountCents", 27000, "status", "SUCCEEDED")));
+
+        assertThatThrownBy(() -> service.process(envelope, CORRELATION_ID))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must carry status 'FAILED'");
 
         verify(processedEvents, never()).tryClaim(any());
         verify(reservations, never()).findById(any());
+    }
+
+    @Test
+    void failedOutcomeForUnknownReservationIsAnErrorButWasClaimed() {
+        UUID eventId = UUID.randomUUID();
+        when(processedEvents.tryClaim(eventId)).thenReturn(1);
+        when(reservations.findById(50L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.process(failedEnvelope(eventId, 50L), CORRELATION_ID))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("unknown reservation 50");
+
+        // The event IS claimed before the reservation is loaded, so on retry the (rolled-back)
+        // claim can be re-taken until the poison record is dead-lettered — a poison PaymentFailed
+        // is never permanently consumed. The rollback of that claim is proven in the boot tests.
+        verify(processedEvents).tryClaim(eventId);
         verify(outbox, never()).save(any(OutboxEventEntity.class));
+    }
+
+    @Test
+    void failedCompensationAfterConfirmationIsANoOpButStillRecordedProcessed() {
+        UUID eventId = UUID.randomUUID();
+        ReservationEntity reservation = pendingReservation(51L, List.of(seat(14L, 9000)));
+        List<SeatEntity> soldSeats = reservation.getSeats().stream().toList();
+        reservation.confirm();
+        soldSeats.forEach(SeatEntity::markSold);
+        when(processedEvents.tryClaim(eventId)).thenReturn(1);
+        when(reservations.findById(51L)).thenReturn(Optional.of(reservation));
+
+        service.process(failedEnvelope(eventId, 51L), CORRELATION_ID);
+
+        verify(processedEvents).tryClaim(eventId);
+        assertThat(reservation.getStatus()).isEqualTo(ReservationStatus.CONFIRMED);
+        assertThat(reservation.getSeats()).allMatch(s -> s.getStatus() == SeatStatus.SOLD);
+        verify(reservations, never()).save(any());
+        verify(seats, never()).saveAll(any());
+        verify(outbox, never()).save(any(OutboxEventEntity.class));
+    }
+
+    @Test
+    void failedCompensationReleasesOnlyHeldSeatsAndNeverASoldSeat() {
+        UUID eventId = UUID.randomUUID();
+        SeatEntity held = seat(10L, 15000);
+        held.flipToHeld(Instant.now().plusSeconds(600));
+        SeatEntity sold = seat(13L, 20000);
+        sold.markSold();
+        ReservationEntity reservation = pendingReservation(52L, List.of(held, sold));
+        when(processedEvents.tryClaim(eventId)).thenReturn(1);
+        when(reservations.findById(52L)).thenReturn(Optional.of(reservation));
+
+        service.process(failedEnvelope(eventId, 52L), CORRELATION_ID);
+
+        assertThat(reservation.getStatus()).isEqualTo(ReservationStatus.CANCELLED);
+        assertThat(held.getStatus()).isEqualTo(SeatStatus.AVAILABLE);
+        assertThat(held.getHoldExpiresAt()).isNull();
+        assertThat(sold.getStatus())
+                .as("a compensation must never hand a sold seat back to the pool")
+                .isEqualTo(SeatStatus.SOLD);
+        verify(seats).saveAll(List.of(held));
+
+        ArgumentCaptor<OutboxEventEntity> outboxCaptor = ArgumentCaptor.forClass(OutboxEventEntity.class);
+        verify(outbox).save(outboxCaptor.capture());
+        assertThat(outboxCaptor.getValue().getPayload())
+                .as("the outbox reflects exactly the released seats")
+                .contains("\"seatIds\":[10]")
+                .contains("\"amountCents\":15000");
+    }
+
+    @Test
+    void paymentFailedWithMissingEventIdIsRejectedAsMalformed() {
+        assertThatThrownBy(() -> service.process(
+                        new EventEnvelope<>(null, "payment.PaymentFailed", Instant.now(), CORRELATION_ID,
+                                new UUID(0L, 53L), failedPayload(53L)),
+                        CORRELATION_ID))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("eventId");
+
+        verify(processedEvents, never()).tryClaim(any());
+    }
+
+    @Test
+    void paymentFailedWithNullPayloadIsRejectedAsMalformed() {
+        UUID eventId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> service.process(
+                        new EventEnvelope<>(eventId, "payment.PaymentFailed", Instant.now(), CORRELATION_ID,
+                                new UUID(0L, 54L), null),
+                        CORRELATION_ID))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("payload");
+
+        verify(processedEvents, never()).tryClaim(any());
+    }
+
+    @Test
+    void paymentFailedWithMissingReservationIdIsRejected() {
+        UUID eventId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> service.process(
+                        new EventEnvelope<>(eventId, "payment.PaymentFailed", Instant.now(), CORRELATION_ID,
+                                new UUID(0L, 55L), objectMapper.valueToTree(Map.of(
+                                        "paymentId", 2L, "amountCents", 27000, "status", "FAILED"))),
+                        CORRELATION_ID))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("reservationId");
+
+        verify(processedEvents, never()).tryClaim(any());
+    }
+
+    @Test
+    void paymentFailedWithZeroReservationIdIsRejected() {
+        assertThatThrownBy(() -> service.process(
+                        failedEnvelope(UUID.randomUUID(), 0L), CORRELATION_ID))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("reservationId");
+
+        verify(processedEvents, never()).tryClaim(any());
     }
 
     @Test
@@ -276,7 +461,12 @@ class JpaReservationConfirmationServiceTest {
     private EventEnvelope<JsonNode> failedEnvelope(UUID eventId, long reservationId) {
         return new EventEnvelope<>(
                 eventId, "payment.PaymentFailed", Instant.now(), CORRELATION_ID,
-                new UUID(0L, reservationId), outcomePayload(reservationId));
+                new UUID(0L, reservationId), failedPayload(reservationId));
+    }
+
+    private JsonNode failedPayload(long reservationId) {
+        return objectMapper.valueToTree(Map.of(
+                "paymentId", 2L, "reservationId", reservationId, "amountCents", 27000, "status", "FAILED"));
     }
 
     private JsonNode outcomePayload(long reservationId) {
