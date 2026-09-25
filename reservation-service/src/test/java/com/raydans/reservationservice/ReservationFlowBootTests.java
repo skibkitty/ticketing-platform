@@ -7,6 +7,7 @@ import com.raydans.reservationservice.event.SeatEntity;
 import com.raydans.reservationservice.event.SeatRepository;
 import com.raydans.reservationservice.outbox.OutboxPublisher;
 import com.raydans.reservationservice.reservation.HoldExpirer;
+import com.raydans.reservationservice.reservation.ReservationService;
 import com.raydans.reservationservice.web.ReservationController;
 import com.raydans.reservationservice.web.SeatStatus;
 import java.sql.Connection;
@@ -34,6 +35,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -73,6 +75,9 @@ class ReservationFlowBootTests {
 
     @Autowired
     HoldExpirer holdExpirer;
+
+    @Autowired
+    ReservationService reservations;
 
     @Autowired
     SeatRepository seatRepository;
@@ -227,6 +232,15 @@ class ReservationFlowBootTests {
         assertThat(expired.headers().lastHeader(CORRELATION_HEADER)).isNotNull();
         assertThat(new String(expired.headers().lastHeader(CORRELATION_HEADER).value()))
                 .isEqualTo(stagedCorrelationId);
+
+        // A later read must not re-publish: the sweep already committed the EXPIRED transition, so
+        // the read path's expireIfOverdue no-ops and the count stays at exactly one.
+        ResponseEntity<Map> reread = rest.getForEntity("/api/v1/reservations/" + reservationId, Map.class);
+        assertThat(reread.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(reread.getBody().get("status")).isEqualTo("EXPIRED");
+        assertThat(outboxExpiredCount(reservationId))
+                .as("a read after the sweep must not re-publish ReservationExpired")
+                .isEqualTo(1);
 
         ResponseEntity<Map> again =
                 postReservation(created.eventId(), List.of(seatId), 22L);
@@ -431,6 +445,139 @@ class ReservationFlowBootTests {
         assertThat(terminalSeat).isEqualTo("AVAILABLE");
         assertThat(outboxExpiredCount(reservationId))
                 .as("two sweep instances must commit at most one ReservationExpired row")
+                .isEqualTo(1);
+    }
+
+    @Test
+    void getOfOverdueReservationExpiresItAndPublishesExactlyOneReservationExpired() {
+        // The regression this test exists for: a GET/list that expires an overdue reservation
+        // used to skip the outbox entirely — the reservation left the sweep's PENDING_PAYMENT
+        // query, so ReservationExpired was never published. The read path must behave exactly
+        // like the sweep: same transition, same event, same correlation propagation, same
+        // exactly-one guarantee when the sweep runs afterward.
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Gallery", "row", "A", "seatNumber", 2, "priceCents", 4000)));
+        ResponseEntity<Map> reservation =
+                postReservation(created.eventId(), List.of(created.seatIds().get(0)), 23L);
+        assertThat(reservation.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long reservationId = ((Number) reservation.getBody().get("id")).longValue();
+        long seatId = created.seatIds().get(0);
+
+        jdbc.update(
+                "UPDATE reservation.reservations SET expires_at = now() - interval '1 minute' WHERE id = ?",
+                reservationId);
+        jdbc.update(
+                "UPDATE reservation.seats SET hold_expires_at = now() - interval '1 minute' WHERE id = ?",
+                seatId);
+
+        String correlationId = "corr-read-path-" + reservationId;
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(CORRELATION_HEADER, correlationId);
+        ResponseEntity<Map> response = rest.exchange(
+                "/api/v1/reservations/" + reservationId,
+                HttpMethod.GET,
+                new HttpEntity<>(headers),
+                Map.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody().get("status")).isEqualTo("EXPIRED");
+
+        assertThat(jdbc.queryForObject(
+                "SELECT status FROM reservation.seats WHERE id = ?", String.class, seatId))
+                .isEqualTo("AVAILABLE");
+        assertThat(outboxExpiredCount(reservationId))
+                .as("the read path must stage exactly one ReservationExpired row")
+                .isEqualTo(1);
+        String expiredPayload = jdbc.queryForObject(
+                "SELECT payload FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationExpired'",
+                String.class, reservationId);
+        assertThat(compactJson(expiredPayload))
+                .contains("\"reservationId\":" + reservationId)
+                .contains("\"customerId\":23")
+                .contains("\"eventId\":" + created.eventId())
+                .contains("\"seatIds\":[" + seatId + "]")
+                .contains("\"amountCents\":4000");
+        String stagedCorrelationId = jdbc.queryForObject(
+                "SELECT correlation_id FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationExpired'",
+                String.class, reservationId);
+        assertThat(stagedCorrelationId)
+                .as("the read-path expiry stages the request's correlation id")
+                .isEqualTo(correlationId);
+
+        outboxPublisher.poll();
+        ConsumerRecord<String, String> expired = awaitOnTopic(
+                new UUID(0L, reservationId).toString(), "reservation.ReservationExpired");
+        assertThat(expired.value())
+                .contains("\"amountCents\":4000")
+                .contains("\"reservationId\":" + reservationId);
+        assertThat(new String(expired.headers().lastHeader(CORRELATION_HEADER).value()))
+                .as("the wire correlation must echo the request's correlation id")
+                .isEqualTo(correlationId);
+
+        // The catch-up sweep must not duplicate what the read path already published: it finds no
+        // PENDING_PAYMENT reservation and stages nothing.
+        holdExpirer.expire();
+        assertThat(outboxExpiredCount(reservationId))
+                .as("a later sweep must not re-publish ReservationExpired")
+                .isEqualTo(1);
+    }
+
+    @Test
+    void getExpiryRacingScheduledExpiryWritesExactlyOneReservationExpired() throws Exception {
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Gallery", "row", "A", "seatNumber", 4, "priceCents", 2500)));
+        ResponseEntity<Map> reservation =
+                postReservation(created.eventId(), List.of(created.seatIds().get(0)), 44L);
+        assertThat(reservation.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long reservationId = ((Number) reservation.getBody().get("id")).longValue();
+        long seatId = created.seatIds().get(0);
+
+        jdbc.update(
+                "UPDATE reservation.reservations SET expires_at = now() - interval '1 minute' WHERE id = ?",
+                reservationId);
+        jdbc.update(
+                "UPDATE reservation.seats SET hold_expires_at = now() - interval '1 minute' WHERE id = ?",
+                seatId);
+
+        // Race the read-path expiry (an in-service GET, running its own transaction) against the
+        // scheduled sweep's transaction. The single @Version gates let exactly one commit the
+        // EXPIRED transition; whichever loses rolls its whole unit back (EXPIRED mutation, seat
+        // release, staged ReservationExpired row), so the two paths jointly commit exactly one
+        // event — never two, never none.
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        List<Throwable> failures = new ArrayList<>();
+        try {
+            Future<Void> read = executor.submit(() -> {
+                reservations.get(reservationId);
+                return null;
+            });
+            Future<Void> sweep = executor.submit(() -> {
+                holdExpirer.expire();
+                return null;
+            });
+            for (Future<Void> future : List.of(read, sweep)) {
+                try {
+                    future.get(30, TimeUnit.SECONDS);
+                } catch (ExecutionException ex) {
+                    failures.add(ex.getCause());
+                }
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertThat(failures)
+                .as("a raced-away expiry may fail only with the optimistic-lock guard")
+                .allSatisfy(failure -> assertThat(failure)
+                        .isInstanceOf(ObjectOptimisticLockingFailureException.class));
+
+        assertThat(jdbc.queryForObject(
+                "SELECT status FROM reservation.reservations WHERE id = ?", String.class, reservationId))
+                .isEqualTo("EXPIRED");
+        assertThat(jdbc.queryForObject(
+                "SELECT status FROM reservation.seats WHERE id = ?", String.class, seatId))
+                .isEqualTo("AVAILABLE");
+        assertThat(outboxExpiredCount(reservationId))
+                .as("read-path and scheduled expiry must jointly commit exactly one ReservationExpired row")
                 .isEqualTo(1);
     }
 
