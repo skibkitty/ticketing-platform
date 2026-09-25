@@ -211,8 +211,11 @@ class ReservationFlowBootTests {
                 .contains("\"customerId\":21")
                 .contains("\"eventId\":" + created.eventId())
                 .contains("\"seatIds\":[" + seatId + "]")
-                .contains("\"amountCents\":4000")
-                .contains("\"correlationId\":\"");
+                .contains("\"amountCents\":4000");
+        String stagedCorrelationId = jdbc.queryForObject(
+                "SELECT correlation_id FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationExpired'",
+                String.class, reservationId);
+        assertThat(stagedCorrelationId).as("the sweep stages a correlation id").isNotBlank();
 
         outboxPublisher.poll();
         ConsumerRecord<String, String> expired = awaitOnTopic(
@@ -222,6 +225,8 @@ class ReservationFlowBootTests {
                 .contains("\"amountCents\":4000")
                 .contains("\"reservationId\":" + reservationId);
         assertThat(expired.headers().lastHeader(CORRELATION_HEADER)).isNotNull();
+        assertThat(new String(expired.headers().lastHeader(CORRELATION_HEADER).value()))
+                .isEqualTo(stagedCorrelationId);
 
         ResponseEntity<Map> again =
                 postReservation(created.eventId(), List.of(seatId), 22L);
