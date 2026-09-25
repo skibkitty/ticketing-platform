@@ -7,15 +7,19 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.raydans.reservationservice.event.EventEntity;
 import com.raydans.reservationservice.event.SeatEntity;
 import com.raydans.reservationservice.event.SeatRepository;
+import com.raydans.reservationservice.outbox.OutboxEventEntity;
+import com.raydans.reservationservice.outbox.OutboxEventRepository;
 import com.raydans.reservationservice.web.SeatStatus;
 import java.time.Instant;
 import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -29,11 +33,16 @@ class HoldExpirerTest {
     @Mock
     ReservationRepository reservations;
 
+    @Mock
+    OutboxEventRepository outbox;
+
+    final ObjectMapper objectMapper = new ObjectMapper();
+
     HoldExpirer expirer;
 
     @BeforeEach
     void setUp() {
-        expirer = new HoldExpirer(seats, reservations);
+        expirer = new HoldExpirer(seats, reservations, outbox, objectMapper);
     }
 
     @Test
@@ -52,6 +61,20 @@ class HoldExpirerTest {
         assertThat(seat.getHoldExpiresAt()).isNull();
         verify(reservations).saveAll(List.of(overdue));
         verify(seats).saveAll(List.of(seat));
+
+        ArgumentCaptor<OutboxEventEntity> outboxCaptor = ArgumentCaptor.forClass(OutboxEventEntity.class);
+        verify(outbox).save(outboxCaptor.capture());
+        OutboxEventEntity expired = outboxCaptor.getValue();
+        assertThat(expired.getEventType()).isEqualTo("reservation.ReservationExpired");
+        assertThat(expired.getAggregateType()).isEqualTo("Reservation");
+        assertThat(expired.getAggregateId()).isEqualTo(42L);
+        assertThat(expired.getCorrelationId()).isNotNull();
+        assertThat(expired.getPayload())
+                .contains("\"reservationId\":42")
+                .contains("\"customerId\":99")
+                .contains("\"eventId\":7")
+                .contains("\"seatIds\":[10]")
+                .contains("\"amountCents\":15000");
     }
 
     @Test
@@ -69,6 +92,15 @@ class HoldExpirerTest {
         assertThat(seat.getStatus()).isEqualTo(SeatStatus.HELD);
         verify(reservations).saveAll(List.of(overdue));
         verify(seats, never()).saveAll(any());
+
+        ArgumentCaptor<OutboxEventEntity> outboxCaptor = ArgumentCaptor.forClass(OutboxEventEntity.class);
+        verify(outbox).save(outboxCaptor.capture());
+        OutboxEventEntity expired = outboxCaptor.getValue();
+        assertThat(expired.getEventType()).isEqualTo("reservation.ReservationExpired");
+        assertThat(expired.getAggregateId()).isEqualTo(42L);
+        assertThat(expired.getPayload())
+                .contains("\"seatIds\":[]")
+                .contains("\"amountCents\":0");
     }
 
     @Test
@@ -81,6 +113,7 @@ class HoldExpirerTest {
 
         verify(reservations, never()).saveAll(any());
         verify(seats, never()).saveAll(any());
+        verify(outbox, never()).save(any(OutboxEventEntity.class));
     }
 
     private static SeatEntity heldSeat(long id, Instant holdExpiresAt) {
