@@ -16,7 +16,6 @@ import com.raydans.reservationservice.web.SeatStatus;
 import com.raydans.reservationservice.web.SeatUnavailableException;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.UUID;
@@ -35,16 +34,19 @@ class JpaReservationService implements ReservationService {
     private final SeatRepository seats;
     private final OutboxEventRepository outbox;
     private final ObjectMapper objectMapper;
+    private final ReservationExpiryService expiry;
 
     JpaReservationService(
             ReservationRepository reservations,
             SeatRepository seats,
             OutboxEventRepository outbox,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            ReservationExpiryService expiry) {
         this.reservations = reservations;
         this.seats = seats;
         this.outbox = outbox;
         this.objectMapper = objectMapper;
+        this.expiry = expiry;
     }
 
     @Override
@@ -80,21 +82,15 @@ class JpaReservationService implements ReservationService {
     }
 
     private void expireIfOverdue(ReservationEntity reservation) {
-        if (reservation.getStatus() == ReservationStatus.PENDING_PAYMENT
-                && reservation.getExpiresAt().isBefore(Instant.now())) {
-            Instant now = Instant.now();
-            reservation.markExpired();
-            List<SeatEntity> releasedSeats = new ArrayList<>();
-            for (SeatEntity seat : reservation.getSeats()) {
-                if (seat.releaseHoldIfLapsed(now)) {
-                    releasedSeats.add(seat);
-                }
-            }
-            if (!releasedSeats.isEmpty()) {
-                seats.saveAll(releasedSeats);
-            }
-            reservations.save(reservation);
+        Instant now = Instant.now();
+        if (!expiry.isOverdue(reservation, now)) {
+            return;
         }
+        List<SeatEntity> releasedSeats = expiry.expireIfOverdue(reservation, now);
+        if (!releasedSeats.isEmpty()) {
+            seats.saveAll(releasedSeats);
+        }
+        reservations.save(reservation);
     }
 
     private List<SeatEntity> loadAndFlipSeats(ReservationRequest request, Instant holdExpiresAt) {

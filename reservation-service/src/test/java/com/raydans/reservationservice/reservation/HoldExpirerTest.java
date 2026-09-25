@@ -40,11 +40,14 @@ class HoldExpirerTest {
 
     final ObjectMapper objectMapper = new ObjectMapper();
 
+    ReservationExpiryService expiry;
+
     HoldExpirer expirer;
 
     @BeforeEach
     void setUp() {
-        expirer = new HoldExpirer(seats, reservations, outbox, objectMapper);
+        expiry = new ReservationExpiryService(outbox, objectMapper);
+        expirer = new HoldExpirer(seats, reservations, expiry);
     }
 
     @Test

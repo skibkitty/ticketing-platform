@@ -46,13 +46,20 @@ class JpaReservationServiceTest {
     @Mock
     OutboxEventRepository outbox;
 
+    final ObjectMapper objectMapper = new ObjectMapper();
+
     JpaReservationService service;
 
     EventEntity event = newEvent(7L);
 
     @BeforeEach
     void setUp() {
-        service = new JpaReservationService(reservations, seats, outbox, new ObjectMapper());
+        service = new JpaReservationService(
+                reservations,
+                seats,
+                outbox,
+                objectMapper,
+                new ReservationExpiryService(outbox, objectMapper));
         MDC.put("correlationId", CORRELATION_ID);
     }
 
@@ -175,10 +182,11 @@ class JpaReservationServiceTest {
         assertThat(response.amountCents()).isEqualTo(27000);
         assertThat(response.seats()).extracting("id").containsExactly(10L, 11L);
         verify(reservations, never()).save(any());
+        verify(outbox, never()).save(any(OutboxEventEntity.class));
     }
 
     @Test
-    void getOfOverduePendingReservationExpiresItAndReleasesLapsedSeats() {
+    void getOfOverduePendingReservationExpiresItReleasesLapsedSeatsAndStagesTheEvent() {
         SeatEntity seat = heldSeat(10L, Instant.now().minusSeconds(1));
         ReservationEntity overdue = reservationEntity(42L);
         overdue.getSeats().clear();
@@ -194,6 +202,22 @@ class JpaReservationServiceTest {
         verify(reservations).save(captor.capture());
         assertThat(captor.getValue().getStatus()).isEqualTo(ReservationStatus.EXPIRED);
         verify(seats).saveAll(List.of(seat));
+
+        // The read path must stage the exact same ReservationExpired event the sweep would, with
+        // the request's correlation id — an expired-by-GET reservation must not go unpublished.
+        ArgumentCaptor<OutboxEventEntity> outboxCaptor = ArgumentCaptor.forClass(OutboxEventEntity.class);
+        verify(outbox).save(outboxCaptor.capture());
+        OutboxEventEntity expired = outboxCaptor.getValue();
+        assertThat(expired.getEventType()).isEqualTo("reservation.ReservationExpired");
+        assertThat(expired.getAggregateType()).isEqualTo("Reservation");
+        assertThat(expired.getAggregateId()).isEqualTo(42L);
+        assertThat(expired.getCorrelationId()).isEqualTo(CORRELATION_ID);
+        assertThat(expired.getPayload())
+                .contains("\"reservationId\":42")
+                .contains("\"customerId\":99")
+                .contains("\"eventId\":7")
+                .contains("\"seatIds\":[10]")
+                .contains("\"amountCents\":15000");
     }
 
     @Test
@@ -211,6 +235,16 @@ class JpaReservationServiceTest {
         assertThat(seat.getStatus()).isEqualTo(SeatStatus.HELD);
         verify(reservations).save(any());
         verify(seats, never()).saveAll(any());
+
+        // The reservation is still overdue, so the read path expires it and still publishes — but
+        // the re-held live seat was released by nobody, so the event reports the truth: no seats,
+        // zero amount. It never claims the reservation's original seats.
+        ArgumentCaptor<OutboxEventEntity> outboxCaptor = ArgumentCaptor.forClass(OutboxEventEntity.class);
+        verify(outbox).save(outboxCaptor.capture());
+        assertThat(outboxCaptor.getValue().getEventType()).isEqualTo("reservation.ReservationExpired");
+        assertThat(outboxCaptor.getValue().getPayload())
+                .contains("\"seatIds\":[]")
+                .contains("\"amountCents\":0");
     }
 
     @Test
@@ -227,6 +261,10 @@ class JpaReservationServiceTest {
         ArgumentCaptor<ReservationEntity> captor = ArgumentCaptor.forClass(ReservationEntity.class);
         verify(reservations).save(captor.capture());
         assertThat(captor.getValue().getStatus()).isEqualTo(ReservationStatus.EXPIRED);
+        ArgumentCaptor<OutboxEventEntity> outboxCaptor = ArgumentCaptor.forClass(OutboxEventEntity.class);
+        verify(outbox).save(outboxCaptor.capture());
+        assertThat(outboxCaptor.getValue().getEventType()).isEqualTo("reservation.ReservationExpired");
+        assertThat(outboxCaptor.getValue().getAggregateId()).isEqualTo(42L);
     }
 
     @Test
@@ -246,6 +284,7 @@ class JpaReservationServiceTest {
         assertThat(responses).hasSize(2);
         assertThat(responses.get(0).customerId()).isEqualTo(99L);
         assertThat(responses).extracting(ReservationResponse::id).containsExactly(42L, 43L);
+        verify(outbox, never()).save(any(OutboxEventEntity.class));
     }
 
     private SeatEntity seat(long id, String section, String row, int number, int priceCents) {
