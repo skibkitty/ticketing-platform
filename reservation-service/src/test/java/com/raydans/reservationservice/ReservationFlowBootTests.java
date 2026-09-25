@@ -204,7 +204,9 @@ class ReservationFlowBootTests {
         String expiredPayload = jdbc.queryForObject(
                 "SELECT payload FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationExpired'",
                 String.class, reservationId);
-        assertThat(expiredPayload)
+        // The payload column is Postgres jsonb, which re-orders keys and re-formats with spaces;
+        // collapse whitespace so assertions are formatting-independent.
+        assertThat(compactJson(expiredPayload))
                 .contains("\"reservationId\":" + reservationId)
                 .contains("\"customerId\":21")
                 .contains("\"eventId\":" + created.eventId())
@@ -263,7 +265,7 @@ class ReservationFlowBootTests {
         String expiredPayload = jdbc.queryForObject(
                 "SELECT payload FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationExpired'",
                 String.class, reservationId);
-        assertThat(expiredPayload).contains("\"seatIds\":[]").contains("\"amountCents\":0");
+        assertThat(compactJson(expiredPayload)).contains("\"seatIds\":[]").contains("\"amountCents\":0");
     }
 
     @Test
@@ -365,7 +367,7 @@ class ReservationFlowBootTests {
         String expiredPayload = jdbc.queryForObject(
                 "SELECT payload FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationExpired'",
                 String.class, reservationId);
-        assertThat(expiredPayload).contains("\"seatIds\":[]").contains("\"amountCents\":0");
+        assertThat(compactJson(expiredPayload)).contains("\"seatIds\":[]").contains("\"amountCents\":0");
     }
 
     @Test
@@ -492,6 +494,10 @@ class ReservationFlowBootTests {
                 "SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationExpired'",
                 Integer.class, reservationId);
         return count == null ? 0 : count;
+    }
+
+    private static String compactJson(String json) {
+        return json.replaceAll("\\s+", "");
     }
 
     private ConsumerRecord<String, String> awaitOnTopic(String expectedKey, String mustContain) {
