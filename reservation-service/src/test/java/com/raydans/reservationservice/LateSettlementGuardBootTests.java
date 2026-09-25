@@ -161,7 +161,7 @@ class LateSettlementGuardBootTests {
     }
 
     @Test
-    void lateSucceededAfterSweepExpiryIsClaimedExactlyOnceAndNeverDeadLettered() throws Exception {
+    void lateSucceededAfterSweepExpiryIsIdempotentAndNeverDeadLettered() throws Exception {
         CreatedEvent created = postEvent(List.of(
                 Map.of("section", "Balcony", "row", "A", "seatNumber", 1, "priceCents", 5000)));
         long lateReservationId = postReservation(created.eventId(), created.seatIds(), 92L);
@@ -195,7 +195,7 @@ class LateSettlementGuardBootTests {
         awaitProcessed(sentinelEventId);
 
         assertThat(processedCount(outcomeEventId))
-                .as("the guarded outcome is claimed exactly once, however often it is delivered")
+                .as("the duplicate delivery must not create another processed-event claim")
                 .isEqualTo(1);
         assertThat(processedCount(sentinelEventId))
                 .as("the sentinel is a distinct event, so it claims its own row")
