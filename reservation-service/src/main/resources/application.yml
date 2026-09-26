@@ -35,8 +35,11 @@ app:
   kafka:
     topics:
       payment-outcome: ${PAYMENT_EVENTS_TOPIC:payment.events.v1}
-    topic-partitions: ${PAYMENT_TOPIC_PARTITIONS:1}
-    topic-replicas: ${PAYMENT_TOPIC_REPLICAS:1}
+      # This service produces reservation.events.v1 and owns its topology; its consumers
+      # deliberately do not declare it, so startup order cannot decide the partition count.
+      reservation-events: ${RESERVATION_EVENTS_TOPIC:reservation.events.v1}
+    topic-partitions: ${RESERVATION_TOPIC_PARTITIONS:1}
+    topic-replicas: ${RESERVATION_TOPIC_REPLICAS:1}
 
 management:
   endpoints:
