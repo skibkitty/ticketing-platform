@@ -1,6 +1,8 @@
 package com.raydans.notificationservice.notification;
 
+import java.time.Instant;
 import java.util.List;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -35,6 +37,39 @@ public interface NotificationRepository extends JpaRepository<NotificationEntity
             @Param("type") String type,
             @Param("payload") String payload);
 
-    /** A Customer's Notifications, newest first — the order a notification inbox is read in. */
-    List<NotificationEntity> findByRecipientCustomerIdOrderBySentAtDescIdDesc(long recipientCustomerId);
+    /**
+     * A Customer's Notifications, newest first — the order a notification inbox is read in.
+     *
+     * <p>Paged by the database ({@code Pageable} carries the limit), so the size of a
+     * Customer's history can never become the size of a query.
+     */
+    List<NotificationEntity> findByRecipientCustomerIdOrderBySentAtDescIdDesc(
+            long recipientCustomerId, Pageable pageable);
+
+    /**
+     * The next page after a cursor, using keyset pagination on the same
+     * {@code (sent_at DESC, id DESC)} order the inbox is read in.
+     *
+     * <p>Keyset rather than an offset: new Notifications arrive at the head of this order
+     * constantly, so an offset page would silently shift rows between requests and a client
+     * paging through history could read one row twice or skip one. The {@code id} tiebreak
+     * is not optional — {@code sent_at} is a database timestamp and a burst of inserts
+     * shares one, so {@code sent_at} alone is not a unique position.
+     *
+     * <p>Strictly less-than, so a page never repeats the cursor row itself.
+     */
+    @Query(
+            value =
+                    "SELECT * FROM notification.notifications "
+                            + "WHERE recipient_customer_id = :recipientCustomerId "
+                            + "AND (sent_at < :beforeSentAt "
+                            + "     OR (sent_at = :beforeSentAt AND id < :beforeId)) "
+                            + "ORDER BY sent_at DESC, id DESC "
+                            + "LIMIT :limit",
+            nativeQuery = true)
+    List<NotificationEntity> findPageAfter(
+            @Param("recipientCustomerId") long recipientCustomerId,
+            @Param("beforeSentAt") Instant beforeSentAt,
+            @Param("beforeId") long beforeId,
+            @Param("limit") int limit);
 }

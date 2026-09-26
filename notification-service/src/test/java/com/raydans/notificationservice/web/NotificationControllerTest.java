@@ -25,7 +25,12 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 class NotificationControllerTest {
 
-    NotificationService notifications = mock(NotificationService.class, Mockito.withSettings().stubOnly());
+    private static final int DEFAULT_PAGE_SIZE = 50;
+
+    // Not stubOnly: the paging tests have to verify what the controller passed on, which
+    // is the whole claim being made — that a limit and cursor reach the service rather
+    // than being applied or dropped in the transport layer.
+    NotificationService notifications = mock(NotificationService.class);
 
     MockMvc mvc;
 
@@ -38,7 +43,7 @@ class NotificationControllerTest {
                 .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
                 .build();
         mvc = MockMvcBuilders
-                .standaloneSetup(new NotificationController(notifications))
+                .standaloneSetup(new NotificationController(notifications, DEFAULT_PAGE_SIZE))
                 .setMessageConverters(new MappingJackson2HttpMessageConverter(objectMapper))
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .build();
@@ -46,7 +51,7 @@ class NotificationControllerTest {
 
     @Test
     void listForCustomerReturnsTheirNotificationsNewestFirst() throws Exception {
-        when(notifications.listForCustomer(99L))
+        when(notifications.listForCustomer(99L, DEFAULT_PAGE_SIZE, null))
                 .thenReturn(List.of(
                         new NotificationResponse(
                                 2L, 202L, 99L, NotificationType.RESERVATION_EXPIRED,
@@ -68,7 +73,7 @@ class NotificationControllerTest {
 
     @Test
     void listForCustomerWithNothingRecordedIsAnEmptyArray() throws Exception {
-        when(notifications.listForCustomer(404L)).thenReturn(List.of());
+        when(notifications.listForCustomer(404L, DEFAULT_PAGE_SIZE, null)).thenReturn(List.of());
 
         mvc.perform(get("/api/v1/notifications").param("customerId", "404"))
                 .andExpect(status().isOk())
@@ -95,7 +100,7 @@ class NotificationControllerTest {
 
     @Test
     void nonPositiveCustomerIdIs400() throws Exception {
-        when(notifications.listForCustomer(0L))
+        when(notifications.listForCustomer(0L, DEFAULT_PAGE_SIZE, null))
                 .thenThrow(new IllegalArgumentException("customerId must be a positive id: 0"));
 
         mvc.perform(get("/api/v1/notifications").param("customerId", "0"))
@@ -109,4 +114,50 @@ class NotificationControllerTest {
     // The catch-all advice must not answer a bad request with a 500, or this would pass
     // while the real service rejected the id for a different reason. NotificationFlowBootTests
     // makes the same call over real HTTP against the real service.
+
+    @Test
+    void withoutALimitTheConfiguredDefaultPageSizeIsUsed() throws Exception {
+        when(notifications.listForCustomer(99L, DEFAULT_PAGE_SIZE, null)).thenReturn(List.of());
+
+        mvc.perform(get("/api/v1/notifications").param("customerId", "99"))
+                .andExpect(status().isOk());
+
+        Mockito.verify(notifications).listForCustomer(99L, DEFAULT_PAGE_SIZE, null);
+    }
+
+    @Test
+    void limitAndCursorArePassedThroughToTheService() throws Exception {
+        when(notifications.listForCustomer(99L, 5, "Y3Vyc29y")).thenReturn(List.of());
+
+        mvc.perform(get("/api/v1/notifications")
+                        .param("customerId", "99")
+                        .param("limit", "5")
+                        .param("cursor", "Y3Vyc29y"))
+                .andExpect(status().isOk());
+
+        // The controller must not second-guess the size: the service owns the ceiling,
+        // so the limit reaching it is the limit the caller asked for.
+        Mockito.verify(notifications).listForCustomer(99L, 5, "Y3Vyc29y");
+    }
+
+    @Test
+    void anUnreadableCursorIs400() throws Exception {
+        when(notifications.listForCustomer(99L, DEFAULT_PAGE_SIZE, "not-a-cursor"))
+                .thenThrow(new IllegalArgumentException("cursor is not a valid page position: not-a-cursor"));
+
+        mvc.perform(get("/api/v1/notifications")
+                        .param("customerId", "99")
+                        .param("cursor", "not-a-cursor"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value(Matchers.containsString("cursor")));
+    }
+
+    @Test
+    void nonNumericLimitIs400() throws Exception {
+        mvc.perform(get("/api/v1/notifications")
+                        .param("customerId", "99")
+                        .param("limit", "lots"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value(Matchers.containsString("limit")));
+    }
 }

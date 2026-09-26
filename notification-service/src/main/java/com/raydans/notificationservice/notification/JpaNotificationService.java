@@ -8,6 +8,8 @@ import com.raydans.common.event.EventEnvelope;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -19,12 +21,17 @@ class JpaNotificationService implements NotificationService {
     private final ProcessedEventRepository processedEvents;
     private final NotificationRepository notifications;
     private final ObjectMapper objectMapper;
+    private final int maxPageSize;
 
     JpaNotificationService(
-            ProcessedEventRepository processedEvents, NotificationRepository notifications, ObjectMapper objectMapper) {
+            ProcessedEventRepository processedEvents,
+            NotificationRepository notifications,
+            ObjectMapper objectMapper,
+            @Value("${app.notifications.max-page-size:200}") int maxPageSize) {
         this.processedEvents = processedEvents;
         this.notifications = notifications;
         this.objectMapper = objectMapper;
+        this.maxPageSize = maxPageSize;
     }
 
     /**
@@ -103,13 +110,36 @@ class JpaNotificationService implements NotificationService {
 
     @Override
     @Transactional(readOnly = true)
-    public List<NotificationResponse> listForCustomer(long customerId) {
+    public List<NotificationResponse> listForCustomer(long customerId, int limit, String cursor) {
         if (customerId <= 0) {
             throw new IllegalArgumentException("customerId must be a positive id: " + customerId);
         }
-        return notifications.findByRecipientCustomerIdOrderBySentAtDescIdDesc(customerId).stream()
+        List<NotificationEntity> page = cursor == null || cursor.isBlank()
+                ? notifications.findByRecipientCustomerIdOrderBySentAtDescIdDesc(
+                        customerId, PageRequest.of(0, clampedLimit(limit)))
+                : pageAfterCursor(customerId, cursor, clampedLimit(limit));
+        return page.stream()
                 .map(row -> NotificationResponse.from(row, messageOf(row)))
                 .toList();
+    }
+
+    /**
+     * A request may ask for any page size it likes; the query never runs at more than the
+     * configured maximum. Clamping rather than rejecting keeps a client that hard-codes a
+     * large limit working, while still bounding the query.
+     */
+    private int clampedLimit(int limit) {
+        return Math.min(Math.max(limit, 1), maxPageSize);
+    }
+
+    private List<NotificationEntity> pageAfterCursor(long customerId, String cursor, int limit) {
+        NotificationCursor position = NotificationCursor.decode(cursor);
+        return notifications.findPageAfter(customerId, position.sentAt(), position.id(), limit);
+    }
+
+    @Override
+    public String cursorAfter(NotificationResponse response) {
+        return NotificationCursor.of(response.sentAt(), response.id()).encode();
     }
 
     private ReservationTerminalPayload parseTerminal(JsonNode payload) {

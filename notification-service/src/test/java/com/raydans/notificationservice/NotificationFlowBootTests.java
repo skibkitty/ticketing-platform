@@ -9,12 +9,17 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.raydans.common.event.EventEnvelope;
 import com.raydans.common.web.CorrelationIdFilter;
+import com.raydans.notificationservice.notification.NotificationResponse;
 import com.raydans.notificationservice.notification.NotificationService;
+import com.raydans.notificationservice.notification.NotificationType;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.sql.Timestamp;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -26,16 +31,22 @@ import java.util.function.Predicate;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
+import org.springframework.kafka.core.KafkaAdmin;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -52,6 +63,7 @@ import org.testcontainers.utility.DockerImageName;
  */
 @Testcontainers
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@Import(NotificationFlowBootTests.TopicOwner.class)
 class NotificationFlowBootTests {
 
     static final String RESERVATION_EVENTS_TOPIC = "reservation.events.v1";
@@ -85,13 +97,49 @@ class NotificationFlowBootTests {
     @Autowired
     NotificationService notifications;
 
+    @Autowired
+    ApplicationContext context;
+
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("spring.kafka.bootstrap-servers", KAFKA::getBootstrapServers);
-        registry.add("app.kafka.topics.reservation-events", () -> RESERVATION_EVENTS_TOPIC);
+    }
+
+    /**
+     * The test provisions the topic it consumes, because in production it does not.
+     *
+     * <p>reservation-service produces {@code reservation.events.v1} and owns its topology;
+     * this service consumes it and deliberately declares nothing (see
+     * {@code notificationTopicOwnershipIsNotThisServicesToDecide}). The test therefore has
+     * to stand in for the owner that is not running here, or the broker's own
+     * auto-creation would decide the partition count and the test would prove nothing
+     * about the real topology.
+     */
+    @TestConfiguration
+    static class TopicOwner {
+
+        @Bean
+        KafkaAdmin.NewTopics testOwnedTopics() {
+            return new KafkaAdmin.NewTopics(
+                    new NewTopic(RESERVATION_EVENTS_TOPIC, 1, (short) 1),
+                    new NewTopic(DEAD_LETTER_TOPIC, 1, (short) 1));
+        }
+    }
+
+    @Test
+    void notificationTopicOwnershipIsNotThisServicesToDecide() {
+        // The regression this whole test class's setup depends on: if this service ever
+        // starts declaring the shared topic again, whichever service booted first would be
+        // silently deciding the partition and replication count for payment-service too,
+        // and startup order would be the only thing setting the topology.
+        assertThat(context.getBeansOfType(KafkaAdmin.NewTopics.class))
+                .as("notification-service must not provision shared topic topology; "
+                        + "reservation-service owns %s as its producer",
+                        RESERVATION_EVENTS_TOPIC)
+                .containsOnlyKeys("testOwnedTopics");
     }
 
     @Test
@@ -354,6 +402,149 @@ class NotificationFlowBootTests {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody()).isEmpty();
+    }
+
+    @Test
+    void pagesThroughTheWholeInboxWithoutRepeatingOrSkippingANotification() throws Exception {
+        long customerId = 903L;
+        // Six Notifications, so a limit of 2 needs three pages and the last page is exact.
+        for (int i = 0; i < 6; i++) {
+            produce(CONFIRMED, UUID.randomUUID(), 600L + i, customerId, List.of(10L), 45000);
+        }
+        awaitNotificationCount(customerId, 6);
+
+        List<Long> walked = new ArrayList<>();
+        String cursor = null;
+        for (int pages = 0; pages < 10; pages++) {
+            ResponseEntity<List> page = page(customerId, 2, cursor);
+            assertThat(page.getStatusCode()).isEqualTo(HttpStatus.OK);
+            List<?> body = page.getBody();
+            assertThat(body).isNotNull().hasSizeLessThanOrEqualTo(2);
+            if (body.isEmpty()) {
+                break;
+            }
+            walked.addAll(idsOf(body));
+            cursor = notifications.cursorAfter(responseOf(body.get(body.size() - 1)));
+            if (body.size() < 2) {
+                break;
+            }
+        }
+
+        // Every row exactly once: no repeat (which an offset page would cause the moment
+        // anything new arrived) and nothing missing (which a mis-keyed cursor would cause).
+        assertThat(walked).hasSize(6).doesNotHaveDuplicates();
+        assertThat(walked).containsExactlyInAnyOrderElementsOf(
+                jdbc.queryForList(
+                        "SELECT id FROM notification.notifications WHERE recipient_customer_id = ? ORDER BY sent_at DESC, id DESC",
+                        Long.class, customerId));
+    }
+
+    @Test
+    void aNotificationArrivingBetweenPagesDoesNotShiftThePageUnderTheClient() throws Exception {
+        long customerId = 904L;
+        for (int i = 0; i < 4; i++) {
+            produce(CONFIRMED, UUID.randomUUID(), 700L + i, customerId, List.of(10L), 45000);
+        }
+        awaitNotificationCount(customerId, 4);
+
+        // Read the first page, then let something new arrive at the head of the order.
+        ResponseEntity<List> first = page(customerId, 2, null);
+        assertThat(first.getBody()).hasSize(2);
+        String cursor = notifications.cursorAfter(
+                responseOf(first.getBody().get(first.getBody().size() - 1)));
+
+        produce(CONFIRMED, UUID.randomUUID(), 799L, customerId, List.of(10L), 45000);
+        awaitNotificationCount(customerId, 5);
+
+        // The reason this is a keyset and not an offset: the row the cursor names is still
+        // the boundary, so the second page resumes exactly where the first stopped. With
+        // OFFSET 2 the new row at the head would push everything down one and the client
+        // would be handed a row it has already read, and never reach the oldest.
+        ResponseEntity<List> second = page(customerId, 2, cursor);
+        List<Long> secondIds = idsOf(second.getBody());
+
+        assertThat(idsOf(first.getBody())).doesNotContainAnyElementsOf(secondIds);
+        assertThat(secondIds).hasSize(2);
+    }
+
+    @Test
+    void notificationsSharingOneSentTimestampAreEachReturnedExactlyOnce() throws Exception {
+        long customerId = 905L;
+        // Three rows forced to share a sent_at: the timestamp is a database default, so
+        // backdating it in the database is the only way to construct the collision. This is
+        // the case the id tiebreak exists for -- a cursor carrying only a timestamp would
+        // either repeat these or skip them.
+        Instant shared = Instant.now().minusSeconds(60).truncatedTo(ChronoUnit.MICROS);
+        for (int i = 0; i < 3; i++) {
+            produce(CONFIRMED, UUID.randomUUID(), 800L + i, customerId, List.of(10L), 45000);
+        }
+        awaitNotificationCount(customerId, 3);
+        jdbc.update(
+                "UPDATE notification.notifications SET sent_at = ? WHERE recipient_customer_id = ?",
+                Timestamp.from(shared), customerId);
+        assertThat(jdbc.queryForObject(
+                "SELECT count(DISTINCT sent_at) FROM notification.notifications WHERE recipient_customer_id = ?",
+                Integer.class, customerId)).isEqualTo(1);
+
+        List<Long> walked = new ArrayList<>();
+        String cursor = null;
+        for (int pages = 0; pages < 5; pages++) {
+            ResponseEntity<List> current = page(customerId, 1, cursor);
+            List<?> body = current.getBody();
+            if (body == null || body.isEmpty()) {
+                break;
+            }
+            walked.addAll(idsOf(body));
+            cursor = notifications.cursorAfter(responseOf(body.get(body.size() - 1)));
+        }
+
+        assertThat(walked).hasSize(3).doesNotHaveDuplicates();
+    }
+
+    @Test
+    void aLimitBeyondTheCeilingIsClampedRatherThanHonoured() throws Exception {
+        long customerId = 906L;
+        produce(CONFIRMED, UUID.randomUUID(), 900L, customerId, List.of(10L), 45000);
+        awaitNotificationCount(customerId, 1);
+
+        // Over the max, the response is still a success -- the ask is bounded, not refused.
+        ResponseEntity<List> response = rest.getForEntity(
+                "/api/v1/notifications?customerId=" + customerId + "&limit=100000", List.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).hasSize(1);
+    }
+
+    @Test
+    void anUnreadableCursorIs400() throws Exception {
+        ResponseEntity<Map> response = rest.getForEntity(
+                "/api/v1/notifications?customerId=907&cursor=not-a-cursor", Map.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat((String) response.getBody().get("message")).contains("cursor");
+    }
+
+    private ResponseEntity<List> page(long customerId, int limit, String cursor) {
+        String url = "/api/v1/notifications?customerId=" + customerId + "&limit=" + limit
+                + (cursor == null ? "" : "&cursor=" + cursor);
+        return rest.getForEntity(url, List.class);
+    }
+
+    private List<Long> idsOf(List<?> body) {
+        return body.stream()
+                .map(row -> ((Number) ((Map<?, ?>) row).get("id")).longValue())
+                .toList();
+    }
+
+    private NotificationResponse responseOf(Object row) {
+        Map<?, ?> map = (Map<?, ?>) row;
+        return new NotificationResponse(
+                ((Number) map.get("id")).longValue(),
+                ((Number) map.get("reservationId")).longValue(),
+                ((Number) map.get("recipientCustomerId")).longValue(),
+                NotificationType.valueOf((String) map.get("type")),
+                (String) map.get("message"),
+                Instant.parse((String) map.get("sentAt")));
     }
 
     private void produce(String eventType, UUID eventId, long reservationId, long customerId, List<Long> seatIds,

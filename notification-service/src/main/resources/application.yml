@@ -24,18 +24,20 @@ spring:
       # Per-record offsets so a poison record can be retried and dead-lettered
       # without re-delivering its batch siblings (ADR 008).
       ack-mode: record
-    admin:
-      # The service provisions its own topic + DLT via KafkaAdmin on startup
-      # (see KafkaTopicConfig); no reliance on broker auto-creation.
-      auto-create: true
 
 app:
   kafka:
     topics:
-      # Shared with payment-service: same topic, different consumer group.
+      # Which topic this service consumes from. Knowing the name is configuration; owning
+      # the topic is not this service's job — reservation-service produces it and provisions
+      # it, so startup order here cannot decide its partitions (see adr/002, adr/008).
       reservation-events: ${RESERVATION_EVENTS_TOPIC:reservation.events.v1}
-    topic-partitions: ${RESERVATION_TOPIC_PARTITIONS:1}
-    topic-replicas: ${RESERVATION_TOPIC_REPLICAS:1}
+  notifications:
+    # An inbox is read a page at a time. The default keeps a normal read small; the
+    # maximum is the hard ceiling no single request can ask past, so one customer's
+    # history can never become an unbounded query or response.
+    default-page-size: ${NOTIFICATION_PAGE_SIZE:50}
+    max-page-size: ${NOTIFICATION_MAX_PAGE_SIZE:200}
 
 management:
   endpoints:

@@ -31,6 +31,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.LoggerFactory;
+import org.springframework.data.domain.Pageable;
 import org.springframework.test.util.ReflectionTestUtils;
 
 @ExtendWith(MockitoExtension.class)
@@ -48,6 +49,8 @@ class JpaNotificationServiceTest {
 
     final ObjectMapper objectMapper = new ObjectMapper();
 
+    static final int MAX_PAGE_SIZE = 200;
+
     JpaNotificationService service;
 
     /**
@@ -59,7 +62,7 @@ class JpaNotificationServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new JpaNotificationService(processedEvents, notifications, objectMapper);
+        service = new JpaNotificationService(processedEvents, notifications, objectMapper, MAX_PAGE_SIZE);
         sends.start();
         serviceLogger().addAppender(sends);
     }
@@ -385,10 +388,10 @@ class JpaNotificationServiceTest {
                 "{\"message\":\"Your reservation 202 expired before payment completed.\"}");
         NotificationEntity older = row(1L, 99L, 201L, NotificationType.RESERVATION_CONFIRMED,
                 "{\"message\":\"Your reservation 201 is confirmed. Seats 10 are yours.\"}");
-        when(notifications.findByRecipientCustomerIdOrderBySentAtDescIdDesc(99L))
+        when(notifications.findByRecipientCustomerIdOrderBySentAtDescIdDesc(eq(99L), any(Pageable.class)))
                 .thenReturn(List.of(newest, older));
 
-        List<NotificationResponse> listed = service.listForCustomer(99L);
+        List<NotificationResponse> listed = service.listForCustomer(99L, 50, null);
 
         assertThat(listed).hasSize(2);
         assertThat(listed.get(0).id()).isEqualTo(2L);
@@ -401,10 +404,10 @@ class JpaNotificationServiceTest {
 
     @Test
     void listForCustomerFallsBackToTheTypeWordingWhenThePayloadHasNoReadableMessage() {
-        when(notifications.findByRecipientCustomerIdOrderBySentAtDescIdDesc(99L))
+        when(notifications.findByRecipientCustomerIdOrderBySentAtDescIdDesc(eq(99L), any(Pageable.class)))
                 .thenReturn(List.of(row(1L, 99L, 201L, NotificationType.RESERVATION_CANCELLED, "{not-json")));
 
-        List<NotificationResponse> listed = service.listForCustomer(99L);
+        List<NotificationResponse> listed = service.listForCustomer(99L, 50, null);
 
         assertThat(listed.get(0).message())
                 .isEqualTo("Your reservation 201 was cancelled because the payment was declined.");
@@ -412,20 +415,172 @@ class JpaNotificationServiceTest {
 
     @Test
     void listForCustomerWithNothingRecordedIsAnEmptyList() {
-        when(notifications.findByRecipientCustomerIdOrderBySentAtDescIdDesc(404L)).thenReturn(List.of());
+        when(notifications.findByRecipientCustomerIdOrderBySentAtDescIdDesc(eq(404L), any(Pageable.class))).thenReturn(List.of());
 
-        assertThat(service.listForCustomer(404L)).isEmpty();
+        assertThat(service.listForCustomer(404L, 50, null)).isEmpty();
+    }
+
+    // ---- Bounded pages ----------------------------------------------------------------------------
+    //
+    // An inbox has no natural end, so the page size is the only thing standing between one
+    // request and the size of a Customer's whole history. These pin the bound and the
+    // cursor; the arithmetic across a real boundary is NotificationFlowBootTests's job,
+    // against a real database with real timestamps.
+
+    @Test
+    void anOverLargeLimitIsClampedToTheConfiguredMaximum() {
+        when(notifications.findByRecipientCustomerIdOrderBySentAtDescIdDesc(eq(99L), any(Pageable.class)))
+                .thenReturn(List.of());
+
+        service.listForCustomer(99L, 100_000, null);
+
+        // The bound the query actually runs at, not the one the caller asked for: a caller
+        // must not be able to ask its way to an unbounded read.
+        ArgumentCaptor<Pageable> page = ArgumentCaptor.forClass(Pageable.class);
+        verify(notifications).findByRecipientCustomerIdOrderBySentAtDescIdDesc(eq(99L), page.capture());
+        assertThat(page.getValue().getPageSize()).isEqualTo(MAX_PAGE_SIZE);
+    }
+
+    @Test
+    void aLimitWithinTheMaximumIsUsedAsAsked() {
+        when(notifications.findByRecipientCustomerIdOrderBySentAtDescIdDesc(eq(99L), any(Pageable.class)))
+                .thenReturn(List.of());
+
+        service.listForCustomer(99L, 7, null);
+
+        ArgumentCaptor<Pageable> page = ArgumentCaptor.forClass(Pageable.class);
+        verify(notifications).findByRecipientCustomerIdOrderBySentAtDescIdDesc(eq(99L), page.capture());
+        assertThat(page.getValue().getPageSize()).isEqualTo(7);
+    }
+
+    @Test
+    void aNonsensicalLimitBecomesASingleRowRatherThanAnUnboundedRead() {
+        when(notifications.findByRecipientCustomerIdOrderBySentAtDescIdDesc(eq(99L), any(Pageable.class)))
+                .thenReturn(List.of());
+
+        service.listForCustomer(99L, -5, null);
+
+        ArgumentCaptor<Pageable> page = ArgumentCaptor.forClass(Pageable.class);
+        verify(notifications).findByRecipientCustomerIdOrderBySentAtDescIdDesc(eq(99L), page.capture());
+        assertThat(page.getValue().getPageSize()).isEqualTo(1);
+    }
+
+    @Test
+    void aClampedLimitAlsoBoundsACursoredPage() {
+        String cursor = service.cursorAfter(
+                new NotificationResponse(5L, 50L, 99L, NotificationType.RESERVATION_CONFIRMED,
+                        "m", Instant.parse("2026-09-25T10:15:30Z")));
+
+        service.listForCustomer(99L, 100_000, cursor);
+
+        verify(notifications).findPageAfter(99L, Instant.parse("2026-09-25T10:15:30Z"), 5L, MAX_PAGE_SIZE);
+    }
+
+    @Test
+    void aCursorPagesTheDatabaseRatherThanTheWholeInbox() {
+        String cursor = service.cursorAfter(
+                new NotificationResponse(5L, 50L, 99L, NotificationType.RESERVATION_CONFIRMED,
+                        "m", Instant.parse("2026-09-25T10:15:30Z")));
+
+        service.listForCustomer(99L, 3, cursor);
+
+        // The whole-inbox read is not the fallback for a cursored request: a cursor means
+        // the client already holds the head of the list, so re-reading it unfiltered would
+        // hand back rows it has already seen.
+        verify(notifications, never())
+                .findByRecipientCustomerIdOrderBySentAtDescIdDesc(eq(99L), any(Pageable.class));
+        verify(notifications).findPageAfter(99L, Instant.parse("2026-09-25T10:15:30Z"), 5L, 3);
+    }
+
+    @Test
+    void aBlankCursorIsTheNewestPageNotACursoredOne() {
+        when(notifications.findByRecipientCustomerIdOrderBySentAtDescIdDesc(eq(99L), any(Pageable.class)))
+                .thenReturn(List.of());
+
+        service.listForCustomer(99L, 10, "  ");
+
+        // An empty query parameter has to mean "no cursor", or a client whose cursor was
+        // lost would get a 400 instead of the top of the inbox.
+        verify(notifications).findByRecipientCustomerIdOrderBySentAtDescIdDesc(eq(99L), any(Pageable.class));
+    }
+
+    @Test
+    void aCursorRoundTripsTheFullInstantAndStaysOpaque() {
+        // Microsecond precision: the cursor must carry the whole instant, not a truncated
+        // one, or resuming lands between two rows that shared a millisecond.
+        Instant sentAt = Instant.parse("2026-09-25T10:15:30.123456Z");
+        String cursor = service.cursorAfter(
+                new NotificationResponse(7L, 50L, 99L, NotificationType.RESERVATION_EXPIRED, "m", sentAt));
+
+        // Opaque: no structure a client could come to depend on, nothing that needs
+        // escaping to sit in a query parameter, and nothing in the standard base64
+        // alphabet's +, / or = that would have to be encoded again on the way out.
+        assertThat(cursor).doesNotContain(":").matches("[A-Za-z0-9_-]+");
+
+        service.listForCustomer(99L, 1, cursor);
+        verify(notifications).findPageAfter(99L, sentAt, 7L, 1);
+    }
+
+    @Test
+    void aCursorIsAPositionNotAGrant() {
+        // It names a row, and the row is looked up within the customerId given in the same
+        // request, so a cursor issued for one Customer cannot make the query read another's
+        // rows — it can only ever come back empty.
+        when(notifications.findPageAfter(404L, Instant.parse("2026-09-25T10:15:30Z"), 5L, 10))
+                .thenReturn(List.of());
+
+        String issuedForCustomer99 = service.cursorAfter(
+                new NotificationResponse(5L, 50L, 99L, NotificationType.RESERVATION_CONFIRMED,
+                        "m", Instant.parse("2026-09-25T10:15:30Z")));
+
+        assertThat(service.listForCustomer(404L, 10, issuedForCustomer99)).isEmpty();
+    }
+
+    @Test
+    void aCorruptCursorIsRejectedRatherThanPagingFromSomewhereArbitrary() {
+        for (String corrupt : new String[] {
+            "not base64 at all !!",
+            "bm90LWEtY3Vyc29y", // valid base64, but not a position
+            "MTIz",             // an instant with no id
+            "MTIzOg",           // a trailing separator with no id
+            "OnBoc3RvcnM",      // no instant
+            "MTAwMDpk",         // an id of zero
+        }) {
+            assertThatThrownBy(() -> service.listForCustomer(99L, 10, corrupt))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("cursor");
+        }
+    }
+
+    @Test
+    void aCursorCannotBeTakenFromARowThatWasNeverReadBack() {
+        // sent_at is a database default, so a row that was inserted and not re-read has no
+        // position in the order to record.
+        assertThatThrownBy(() -> service.cursorAfter(
+                        new NotificationResponse(5L, 50L, 99L, NotificationType.RESERVATION_CONFIRMED, "m", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("sentAt");
     }
 
     private NotificationEntity row(
             Long id, long customerId, long reservationId, NotificationType type, String payload) {
+        return row(id, customerId, reservationId, type, payload, Instant.parse("2026-09-25T10:15:30Z"));
+    }
+
+    private NotificationEntity row(
+            Long id,
+            long customerId,
+            long reservationId,
+            NotificationType type,
+            String payload,
+            Instant sentAt) {
         NotificationEntity row = new NotificationEntity();
         ReflectionTestUtils.setField(row, "id", id);
         ReflectionTestUtils.setField(row, "recipientCustomerId", customerId);
         ReflectionTestUtils.setField(row, "reservationId", reservationId);
         ReflectionTestUtils.setField(row, "type", type);
         ReflectionTestUtils.setField(row, "payload", payload);
-        ReflectionTestUtils.setField(row, "sentAt", Instant.parse("2026-09-25T10:15:30Z"));
+        ReflectionTestUtils.setField(row, "sentAt", sentAt);
         return row;
     }
 
