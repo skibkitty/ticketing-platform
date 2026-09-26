@@ -18,5 +18,8 @@ Single-context: one `CONTEXT.md` at the repo root, ADRs under `docs/adr/`. See `
 
 Never commit or push to `main`. Work on a feature branch per ticket
 (`feat/<issue-number>-<kebab-slug>`), open a PR with `Closes #<issue>`, and
-merge only when CI is green. See `docs/agents/git-workflow.md`. Enable the
-guardrail hooks once per clone with `git config core.hooksPath .githooks`.
+stop there: **merging is the human's decision, never the agent's** — green CI
+is a precondition for a merge, not authorisation to perform one. See
+`docs/agents/git-workflow.md`. Enable the guardrail hooks once per clone with
+`git config core.hooksPath .githooks`; note they cover pushes only and cannot
+guard the merge path.
