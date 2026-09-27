@@ -1,0 +1,66 @@
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      mvc:
+        # Strip the route prefix is deliberately not set: the services already
+        # serve the paths the gateway is asked for, so a rewrite would mean two
+        # places to change a URL.
+        routes:
+          - id: reservation-service
+            uri: ${RESERVATION_SERVICE_URL:http://localhost:8082}
+            predicates:
+              - Path=/api/v1/events/**,/api/v1/reservations/**
+          - id: payment-service
+            uri: ${PAYMENT_SERVICE_URL:http://localhost:8083}
+            predicates:
+              - Path=/api/v1/payments/**
+          - id: notification-service
+            uri: ${NOTIFICATION_SERVICE_URL:http://localhost:8084}
+            predicates:
+              - Path=/api/v1/notifications/**
+
+app:
+  cors:
+    # The gateway is the only service that answers a browser, so this is the only
+    # place a cross-origin policy is applied to anything (ADR 002).
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000}
+  gateway:
+    jwt:
+      # A demo secret, and one that is meant to be replaced: the whole point of
+      # keeping it in configuration is that swapping it needs no rebuild. Refused
+      # at startup if shorter than HS256 requires rather than silently weakening
+      # the signature — see JwtProperties.
+      secret: ${JWT_SECRET:change-me-in-a-real-deployment-this-is-a-demo-secret}
+      ttl: ${JWT_TTL:PT1H}
+    users:
+      # The demo caller set, in configuration so the passwords are not in version
+      # control. A real deployment replaces this whole map with an identity
+      # provider (explicitly out of scope); nothing else here would change.
+      customer:
+        password: customer
+        roles: [CUSTOMER]
+      organizer:
+        password: organizer
+        roles: [ORGANIZER]
+      admin:
+        password: admin
+        roles: [ADMIN]
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Deliberately short: health and info, and nothing that would report on
+        # the gateway's internals. Every endpoint listed here is reachable only
+        # with an ADMIN token, so the list is the blast radius, not the
+        # authentication.
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+logging:
+  level:
+    com.raydans.apigateway: INFO
