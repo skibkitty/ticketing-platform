@@ -1,0 +1,46 @@
+spring:
+  application:
+    name: notification-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/platform?currentSchema=notification}
+    username: ${DB_USER:platform}
+    password: ${DB_PASSWORD:platform}
+  flyway:
+    schemas: notification
+    create-schemas: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+    # No producer of our own: the only thing ever sent from this service is the
+    # dead-letter copy a poison record is quarantined as (ADR 008).
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    consumer:
+      group-id: notification-service
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      auto-offset-reset: earliest
+    listener:
+      # Per-record offsets so a poison record can be retried and dead-lettered
+      # without re-delivering its batch siblings (ADR 008).
+      ack-mode: record
+
+app:
+  kafka:
+    topics:
+      # Which topic this service consumes from. Knowing the name is configuration; owning
+      # the topic is not this service's job — reservation-service produces it and provisions
+      # it, so startup order here cannot decide its partitions (see adr/002, adr/008).
+      reservation-events: ${RESERVATION_EVENTS_TOPIC:reservation.events.v1}
+  notifications:
+    # An inbox is read a page at a time. The default keeps a normal read small; the
+    # maximum is the hard ceiling no single request can ask past, so one customer's
+    # history can never become an unbounded query or response.
+    default-page-size: ${NOTIFICATION_PAGE_SIZE:50}
+    max-page-size: ${NOTIFICATION_MAX_PAGE_SIZE:200}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

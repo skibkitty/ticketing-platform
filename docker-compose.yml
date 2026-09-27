@@ -64,8 +64,13 @@ services:
       DB_USER: platform
       DB_PASSWORD: platform
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    # Internal service: reachable only from this machine, never from the network.
+    # ADR 002 puts trust in the gateway's forwarded identity header on network hygiene --
+    # nothing but our own services may reach this port -- so the binding is to loopback,
+    # not to every interface. Host-side debugging (curl localhost:8082) still works; a
+    # colleague on the LAN forging that header does not.
     ports:
-      - "8082:8080"
+      - "127.0.0.1:8082:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -86,8 +91,13 @@ services:
       # payment, so the compensating (seat-release) path is easy to trigger
       # on purpose when demoing.
       PAYMENT_DECLINE_THRESHOLD_CENTS: 50000
+    # Internal service: reachable only from this machine, never from the network.
+    # ADR 002 puts trust in the gateway's forwarded identity header on network hygiene --
+    # nothing but our own services may reach this port -- so the binding is to loopback,
+    # not to every interface. Host-side debugging (curl localhost:8082) still works; a
+    # colleague on the LAN forging that header does not.
     ports:
-      - "8083:8080"
+      - "127.0.0.1:8083:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -103,8 +113,13 @@ services:
       DB_USER: platform
       DB_PASSWORD: platform
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    # Internal service: reachable only from this machine, never from the network.
+    # ADR 002 puts trust in the gateway's forwarded identity header on network hygiene --
+    # nothing but our own services may reach this port -- so the binding is to loopback,
+    # not to every interface. Host-side debugging (curl localhost:8082) still works; a
+    # colleague on the LAN forging that header does not.
     ports:
-      - "8084:8080"
+      - "127.0.0.1:8084:8080"
     depends_on:
       postgres:
         condition: service_healthy
