@@ -1,5 +1,6 @@
 package com.raydans.notificationservice.web;
 
+import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -10,6 +11,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.raydans.notificationservice.notification.NotificationPage;
 import com.raydans.notificationservice.notification.NotificationResponse;
 import com.raydans.notificationservice.notification.NotificationService;
 import com.raydans.notificationservice.notification.NotificationType;
@@ -52,32 +54,60 @@ class NotificationControllerTest {
     @Test
     void listForCustomerReturnsTheirNotificationsNewestFirst() throws Exception {
         when(notifications.listForCustomer(99L, DEFAULT_PAGE_SIZE, null))
-                .thenReturn(List.of(
-                        new NotificationResponse(
-                                2L, 202L, 99L, NotificationType.RESERVATION_EXPIRED,
-                                "Your reservation 202 expired before payment completed.", Instant.parse("2026-09-25T10:15:30Z")),
-                        new NotificationResponse(
-                                1L, 201L, 99L, NotificationType.RESERVATION_CONFIRMED,
-                                "Your reservation 201 is confirmed. Seats 10 are yours.", Instant.parse("2026-09-25T10:14:00Z"))));
+                .thenReturn(page(null, expired(), confirmed()));
 
         mvc.perform(get("/api/v1/notifications").param("customerId", "99"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$[0].reservationId").value(202))
-                .andExpect(jsonPath("$[0].recipientCustomerId").value(99))
-                .andExpect(jsonPath("$[0].type").value("RESERVATION_EXPIRED"))
-                .andExpect(jsonPath("$[0].message").value("Your reservation 202 expired before payment completed."))
-                .andExpect(jsonPath("$[0].sentAt").value("2026-09-25T10:15:30Z"))
-                .andExpect(jsonPath("$[1].reservationId").value(201))
-                .andExpect(jsonPath("$[1].type").value("RESERVATION_CONFIRMED"));
+                .andExpect(jsonPath("$.items[0].reservationId").value(202))
+                .andExpect(jsonPath("$.items[0].recipientCustomerId").value(99))
+                .andExpect(jsonPath("$.items[0].type").value("RESERVATION_EXPIRED"))
+                .andExpect(jsonPath("$.items[0].message").value("Your reservation 202 expired before payment completed."))
+                .andExpect(jsonPath("$.items[0].sentAt").value("2026-09-25T10:15:30Z"))
+                .andExpect(jsonPath("$.items[1].reservationId").value(201))
+                .andExpect(jsonPath("$.items[1].type").value("RESERVATION_CONFIRMED"));
+    }
+
+    // The page carries the position of the next one, because a keyset cursor a client is
+    // never handed is a cursor no client can page from: page two is only reachable if the
+    // response says where it starts. These three pin both ends of that — a page with more
+    // behind it names the position, a page that is the last one does not.
+
+    @Test
+    void aPageWithAnotherPageBehindItCarriesTheCursorForIt() throws Exception {
+        // Deliberately not something the controller could have built: the response must
+        // carry the value the service issued, not one re-derived from the rows on the page.
+        when(notifications.listForCustomer(99L, 2, null))
+                .thenReturn(page("next-page-position-from-the-service", expired(), confirmed()));
+
+        mvc.perform(get("/api/v1/notifications")
+                        .param("customerId", "99")
+                        .param("limit", "2"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items.length()").value(2))
+                .andExpect(jsonPath("$.nextCursor").value("next-page-position-from-the-service"));
     }
 
     @Test
-    void listForCustomerWithNothingRecordedIsAnEmptyArray() throws Exception {
-        when(notifications.listForCustomer(404L, DEFAULT_PAGE_SIZE, null)).thenReturn(List.of());
+    void theLastPageCarriesNoCursor() throws Exception {
+        when(notifications.listForCustomer(99L, 2, "Y3Vyc29y")).thenReturn(page(null, confirmed()));
+
+        mvc.perform(get("/api/v1/notifications")
+                        .param("customerId", "99")
+                        .param("limit", "2")
+                        .param("cursor", "Y3Vyc29y"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items.length()").value(1))
+                .andExpect(jsonPath("$.nextCursor").value(nullValue()));
+    }
+
+    @Test
+    void aPageWithNoNotificationsIsEmptyAndOffersNoCursor() throws Exception {
+        when(notifications.listForCustomer(404L, DEFAULT_PAGE_SIZE, null)).thenReturn(page(null));
 
         mvc.perform(get("/api/v1/notifications").param("customerId", "404"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$").isEmpty());
+                .andExpect(jsonPath("$.items").isEmpty())
+                .andExpect(jsonPath("$.nextCursor").value(nullValue()));
     }
 
     @Test
@@ -117,7 +147,7 @@ class NotificationControllerTest {
 
     @Test
     void withoutALimitTheConfiguredDefaultPageSizeIsUsed() throws Exception {
-        when(notifications.listForCustomer(99L, DEFAULT_PAGE_SIZE, null)).thenReturn(List.of());
+        when(notifications.listForCustomer(99L, DEFAULT_PAGE_SIZE, null)).thenReturn(page(null));
 
         mvc.perform(get("/api/v1/notifications").param("customerId", "99"))
                 .andExpect(status().isOk());
@@ -127,7 +157,7 @@ class NotificationControllerTest {
 
     @Test
     void limitAndCursorArePassedThroughToTheService() throws Exception {
-        when(notifications.listForCustomer(99L, 5, "Y3Vyc29y")).thenReturn(List.of());
+        when(notifications.listForCustomer(99L, 5, "Y3Vyc29y")).thenReturn(page(null));
 
         mvc.perform(get("/api/v1/notifications")
                         .param("customerId", "99")
@@ -136,7 +166,8 @@ class NotificationControllerTest {
                 .andExpect(status().isOk());
 
         // The controller must not second-guess the size: the service owns the ceiling,
-        // so the limit reaching it is the limit the caller asked for.
+        // so the limit reaching it is the limit the caller asked for. Nor may it read the
+        // cursor — a position only means anything to the code that issued it.
         Mockito.verify(notifications).listForCustomer(99L, 5, "Y3Vyc29y");
     }
 
@@ -159,5 +190,24 @@ class NotificationControllerTest {
                         .param("limit", "lots"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.message").value(Matchers.containsString("limit")));
+    }
+
+    /** The service's answer for a page, so these tests are about the transport, not paging. */
+    private NotificationPage page(String nextCursor, NotificationResponse... items) {
+        return new NotificationPage(List.of(items), nextCursor);
+    }
+
+    private NotificationResponse expired() {
+        return new NotificationResponse(
+                2L, 202L, 99L, NotificationType.RESERVATION_EXPIRED,
+                "Your reservation 202 expired before payment completed.",
+                Instant.parse("2026-09-25T10:15:30Z"));
+    }
+
+    private NotificationResponse confirmed() {
+        return new NotificationResponse(
+                1L, 201L, 99L, NotificationType.RESERVATION_CONFIRMED,
+                "Your reservation 201 is confirmed. Seats 10 are yours.",
+                Instant.parse("2026-09-25T10:14:00Z"));
     }
 }

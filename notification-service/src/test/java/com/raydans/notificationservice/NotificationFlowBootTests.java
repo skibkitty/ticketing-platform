@@ -9,9 +9,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.raydans.common.event.EventEnvelope;
 import com.raydans.common.web.CorrelationIdFilter;
-import com.raydans.notificationservice.notification.NotificationResponse;
 import com.raydans.notificationservice.notification.NotificationService;
-import com.raydans.notificationservice.notification.NotificationType;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.sql.Timestamp;
@@ -19,7 +17,6 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.ArrayList;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -178,11 +175,14 @@ class NotificationFlowBootTests {
         produce(CONFIRMED, UUID.randomUUID(), 504L, otherCustomerId, List.of(20L), 20000);
         awaitNotificationCount(otherCustomerId, 1);
 
-        ResponseEntity<List> listed =
-                rest.getForEntity("/api/v1/notifications?customerId=" + customerId, List.class);
+        ResponseEntity<Map> listed =
+                rest.getForEntity("/api/v1/notifications?customerId=" + customerId, Map.class);
         assertThat(listed.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(listed.getBody()).hasSize(3);
-        List<Map<String, Object>> rows = rowsOf(listed);
+        List<Map<String, Object>> rows = itemsOf(listed.getBody());
+        assertThat(rows).hasSize(3);
+        assertThat(nextCursorOf(listed.getBody()))
+                .as("three notifications on one page is the end of this inbox")
+                .isNull();
         assertThat(rows.stream().map(row -> longValue(row, "reservationId")).toList())
                 .as("newest first")
                 .containsExactly(503L, 502L, 501L);
@@ -397,37 +397,45 @@ class NotificationFlowBootTests {
     }
 
     @Test
-    void aCustomerWithNothingRecordedGetsAnEmptyList() {
-        ResponseEntity<List> response = rest.getForEntity("/api/v1/notifications?customerId=997", List.class);
+    void aCustomerWithNothingRecordedGetsAnEmptyPage() {
+        ResponseEntity<Map> response =
+                rest.getForEntity("/api/v1/notifications?customerId=997", Map.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(response.getBody()).isEmpty();
+        assertThat(itemsOf(response.getBody())).isEmpty();
+        assertThat(nextCursorOf(response.getBody())).isNull();
     }
 
     @Test
-    void pagesThroughTheWholeInboxWithoutRepeatingOrSkippingANotification() throws Exception {
+    void aClientPagesTheWholeInboxWithOnlyTheCursorItWasHanded() throws Exception {
         long customerId = 903L;
-        // Six Notifications, so a limit of 2 needs three pages and the last page is exact.
+        // Six Notifications, so a limit of 2 needs three pages and the last one comes back
+        // full. A full last page is the case that matters: there is nothing behind it, so it
+        // must not offer a cursor, and the end of the inbox is stated rather than guessed.
         for (int i = 0; i < 6; i++) {
             produce(CONFIRMED, UUID.randomUUID(), 600L + i, customerId, List.of(10L), 45000);
         }
         awaitNotificationCount(customerId, 6);
 
+        Map<String, Object> first = page(customerId, 2, null);
+        String cursor = nextCursorOf(first);
+        assertThat(cursor)
+                .as("an inbox with more behind this page must say where the next one starts")
+                .isNotNull();
+
         List<Long> walked = new ArrayList<>();
-        String cursor = null;
+        Map<String, Object> current = first;
+        // Nothing here knows how a cursor is encoded: every page is fetched with the
+        // previous page's nextCursor, which is the whole of the contract a client is given.
         for (int pages = 0; pages < 10; pages++) {
-            ResponseEntity<List> page = page(customerId, 2, cursor);
-            assertThat(page.getStatusCode()).isEqualTo(HttpStatus.OK);
-            List<?> body = page.getBody();
-            assertThat(body).isNotNull().hasSizeLessThanOrEqualTo(2);
-            if (body.isEmpty()) {
+            List<Map<String, Object>> items = itemsOf(current);
+            assertThat(items).hasSizeLessThanOrEqualTo(2);
+            walked.addAll(idsOf(items));
+            cursor = nextCursorOf(current);
+            if (cursor == null) {
                 break;
             }
-            walked.addAll(idsOf(body));
-            cursor = notifications.cursorAfter(responseOf(body.get(body.size() - 1)));
-            if (body.size() < 2) {
-                break;
-            }
+            current = page(customerId, 2, cursor);
         }
 
         // Every row exactly once: no repeat (which an offset page would cause the moment
@@ -437,6 +445,10 @@ class NotificationFlowBootTests {
                 jdbc.queryForList(
                         "SELECT id FROM notification.notifications WHERE recipient_customer_id = ? ORDER BY sent_at DESC, id DESC",
                         Long.class, customerId));
+        assertThat(itemsOf(current)).as("the walk ended on a full page").hasSize(2);
+        assertThat(nextCursorOf(current))
+                .as("a full page that is also the last one has nothing to page to")
+                .isNull();
     }
 
     @Test
@@ -448,10 +460,9 @@ class NotificationFlowBootTests {
         awaitNotificationCount(customerId, 4);
 
         // Read the first page, then let something new arrive at the head of the order.
-        ResponseEntity<List> first = page(customerId, 2, null);
-        assertThat(first.getBody()).hasSize(2);
-        String cursor = notifications.cursorAfter(
-                responseOf(first.getBody().get(first.getBody().size() - 1)));
+        Map<String, Object> first = page(customerId, 2, null);
+        assertThat(itemsOf(first)).hasSize(2);
+        String cursor = nextCursorOf(first);
 
         produce(CONFIRMED, UUID.randomUUID(), 799L, customerId, List.of(10L), 45000);
         awaitNotificationCount(customerId, 5);
@@ -460,10 +471,9 @@ class NotificationFlowBootTests {
         // the boundary, so the second page resumes exactly where the first stopped. With
         // OFFSET 2 the new row at the head would push everything down one and the client
         // would be handed a row it has already read, and never reach the oldest.
-        ResponseEntity<List> second = page(customerId, 2, cursor);
-        List<Long> secondIds = idsOf(second.getBody());
+        List<Long> secondIds = idsOf(itemsOf(page(customerId, 2, cursor)));
 
-        assertThat(idsOf(first.getBody())).doesNotContainAnyElementsOf(secondIds);
+        assertThat(idsOf(itemsOf(first))).doesNotContainAnyElementsOf(secondIds);
         assertThat(secondIds).hasSize(2);
     }
 
@@ -489,15 +499,16 @@ class NotificationFlowBootTests {
         List<Long> walked = new ArrayList<>();
         String cursor = null;
         for (int pages = 0; pages < 5; pages++) {
-            ResponseEntity<List> current = page(customerId, 1, cursor);
-            List<?> body = current.getBody();
-            if (body == null || body.isEmpty()) {
+            Map<String, Object> current = page(customerId, 1, cursor);
+            walked.addAll(idsOf(itemsOf(current)));
+            cursor = nextCursorOf(current);
+            if (cursor == null) {
                 break;
             }
-            walked.addAll(idsOf(body));
-            cursor = notifications.cursorAfter(responseOf(body.get(body.size() - 1)));
         }
 
+        // The bound of 5 pages is only slack: three rows read one at a time can only end
+        // this walk on a page that offers no next page.
         assertThat(walked).hasSize(3).doesNotHaveDuplicates();
     }
 
@@ -508,11 +519,11 @@ class NotificationFlowBootTests {
         awaitNotificationCount(customerId, 1);
 
         // Over the max, the response is still a success -- the ask is bounded, not refused.
-        ResponseEntity<List> response = rest.getForEntity(
-                "/api/v1/notifications?customerId=" + customerId + "&limit=100000", List.class);
+        ResponseEntity<Map> response = rest.getForEntity(
+                "/api/v1/notifications?customerId=" + customerId + "&limit=100000", Map.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(response.getBody()).hasSize(1);
+        assertThat(itemsOf(response.getBody())).hasSize(1);
     }
 
     @Test
@@ -524,27 +535,34 @@ class NotificationFlowBootTests {
         assertThat((String) response.getBody().get("message")).contains("cursor");
     }
 
-    private ResponseEntity<List> page(long customerId, int limit, String cursor) {
+    /** One page over real HTTP, read the way a client reads it. */
+    private Map<String, Object> page(long customerId, int limit, String cursor) {
         String url = "/api/v1/notifications?customerId=" + customerId + "&limit=" + limit
                 + (cursor == null ? "" : "&cursor=" + cursor);
-        return rest.getForEntity(url, List.class);
+        ResponseEntity<Map> response = rest.getForEntity(url, Map.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).as("a page body").isNotNull();
+        return response.getBody();
     }
 
-    private List<Long> idsOf(List<?> body) {
-        return body.stream()
+    /** The page's Notifications, re-typed for readable assertions. */
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> itemsOf(Map<String, Object> page) {
+        return (List<Map<String, Object>>) (List<?>) page.get("items");
+    }
+
+    /**
+     * The position of the next page, handed back verbatim as the next request's
+     * {@code cursor} parameter. Null when this page was the last one.
+     */
+    private String nextCursorOf(Map<String, Object> page) {
+        return (String) page.get("nextCursor");
+    }
+
+    private List<Long> idsOf(List<?> items) {
+        return items.stream()
                 .map(row -> ((Number) ((Map<?, ?>) row).get("id")).longValue())
                 .toList();
-    }
-
-    private NotificationResponse responseOf(Object row) {
-        Map<?, ?> map = (Map<?, ?>) row;
-        return new NotificationResponse(
-                ((Number) map.get("id")).longValue(),
-                ((Number) map.get("reservationId")).longValue(),
-                ((Number) map.get("recipientCustomerId")).longValue(),
-                NotificationType.valueOf((String) map.get("type")),
-                (String) map.get("message"),
-                Instant.parse((String) map.get("sentAt")));
     }
 
     private void produce(String eventType, UUID eventId, long reservationId, long customerId, List<Long> seatIds,
@@ -580,12 +598,6 @@ class NotificationFlowBootTests {
                         "eventId", 7L,
                         "seatIds", seatIds,
                         "amountCents", amountCents)));
-    }
-
-    /** The read surface returns a JSON array; re-typed for readable assertions. */
-    @SuppressWarnings("unchecked")
-    private List<Map<String, Object>> rowsOf(ResponseEntity<List> response) {
-        return (List<Map<String, Object>>) (List<?>) response.getBody();
     }
 
     /**

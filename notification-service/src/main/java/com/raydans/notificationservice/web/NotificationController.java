@@ -1,8 +1,7 @@
 package com.raydans.notificationservice.web;
 
-import com.raydans.notificationservice.notification.NotificationResponse;
+import com.raydans.notificationservice.notification.NotificationPage;
 import com.raydans.notificationservice.notification.NotificationService;
-import java.util.List;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -46,12 +45,21 @@ public class NotificationController {
      * service owns these rules anyway — they are the same positive-id rule its inbound
      * payloads are held to.
      *
-     * <p>The response stays a bare array. Paging is additive, so a client that asks for
-     * nothing but {@code customerId} keeps reading a list, and the next page is one more
-     * request away rather than a different response shape to parse.
+     * <p>The response is a page and not a bare array, because the whole point of keyset
+     * pagination is the position after the page and a client cannot page from a cursor it
+     * was never handed. So the body is {@code {"items": [...], "nextCursor": "..."}}: a
+     * reader that wants page two sends the {@code nextCursor} of page one straight back as
+     * {@code cursor}, without knowing or caring how it is encoded. {@code nextCursor} is
+     * {@code null} on the last page, so the end of the inbox is something the response
+     * states rather than something a client infers from a page that happens to look full.
+     *
+     * <p>Only the shape changed: the parameters, the default and clamped page sizes and the
+     * cursor's meaning are as they were. Keeping the array would have meant putting
+     * {@code nextCursor} somewhere else — a header, a link — which is the same contract in
+     * a shape a client has to be told about out of band.
      */
     @GetMapping
-    List<NotificationResponse> listForCustomer(
+    NotificationPage listForCustomer(
             @RequestParam("customerId") long customerId,
             @RequestParam(name = "limit", required = false) Integer limit,
             @RequestParam(name = "cursor", required = false) String cursor) {
