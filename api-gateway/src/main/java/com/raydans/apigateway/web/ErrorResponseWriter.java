@@ -12,15 +12,11 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 
 /**
- * Writes the shared {@code ApiErrorResponse} shape for the failures that happen
- * in a servlet filter, before any {@code @RestControllerAdvice} can see them.
- *
- * <p>Exists because the two halves of this gateway reject requests in two
- * different places. A rejected login is an exception from a controller and goes
- * through the advice; a rejected reservation never reaches a controller at all,
- * so the advice is not on the path and something has to write the body. Two
- * writers would be two error contracts, so the filter borrows this one instead
- * of inventing a second.
+ * Writes the shared {@code ApiErrorResponse} shape for failures raised in a
+ * servlet filter, before any {@code @RestControllerAdvice} can see them: a
+ * rejected reservation never reaches a controller, so the advice is not on the
+ * path and something has to write the body. The advice builds its bodies here
+ * too, so a caller cannot tell which half of the gateway refused them.
  */
 public class ErrorResponseWriter {
 
@@ -35,8 +31,7 @@ public class ErrorResponseWriter {
      *
      * <p>Does nothing if the response is already committed, so a failure raised
      * after the proxied service has begun responding cannot append an error body
-     * to a half-written response — which would produce a payload that is neither
-     * the service's answer nor the gateway's.
+     * to a half-written response.
      */
     public void write(
             HttpServletRequest request, HttpServletResponse response, HttpStatus status, String message)
@@ -48,16 +43,17 @@ public class ErrorResponseWriter {
         response.setStatus(status.value());
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
-        objectMapper.writeValue(response.getOutputStream(), body(request, status, message));
+        objectMapper.writeValue(response.getOutputStream(), body(request, status, message, List.of()));
     }
 
-    private ApiErrorResponse body(HttpServletRequest request, HttpStatus status, String message) {
+    public ApiErrorResponse body(
+            HttpServletRequest request, HttpStatus status, String message, List<String> details) {
         return new ApiErrorResponse(
                 Instant.now(),
                 status.value(),
                 status.getReasonPhrase(),
                 message,
                 request.getRequestURI(),
-                List.of());
+                details);
     }
 }

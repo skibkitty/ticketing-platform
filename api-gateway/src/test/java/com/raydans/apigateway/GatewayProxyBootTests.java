@@ -41,18 +41,15 @@ import org.springframework.test.web.servlet.MockMvc;
  * real route table from {@code application.yml}, and a real HTTP server standing
  * in for a service.
  *
- * <p>The other gateway tests are deliberately isolated — a hand-built filter, a
- * hand-built chain — because that is the right way to find out <em>which</em>
- * piece is wrong. This one exists to find out whether the pieces are wired
- * together at all, and there is a class of bug only a full context can show: a
- * route whose predicate does not match, a header filter the proxy never
- * consults, a filter registered at an order that puts it after the thing it was
- * meant to guard. Each of those would pass every other test in this module.
+ * <p>The other gateway tests are isolated because that is the right way to find
+ * out <em>which</em> piece is wrong. This one asks whether the pieces are wired
+ * together, which is a class of bug only a full context shows: a route whose
+ * predicate does not match, a header filter the proxy never consults, a filter
+ * ordered after the thing it guards. Each would pass every other test here.
  *
- * <p>The downstream is the JDK's own {@code HttpServer} rather than a mock,
- * because the claim being tested is about bytes on a socket: that a header the
- * gateway decided is a header that arrives. A mock configured to agree with the
- * gateway's intentions would agree with them precisely when they were wrong.
+ * <p>The downstream is the JDK's own {@code HttpServer} rather than a mock
+ * because the claim is about bytes on a socket: a mock configured to agree with
+ * the gateway's intentions agrees precisely when they were wrong.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -88,22 +85,18 @@ class GatewayProxyBootTests {
     }
 
     /**
-     * Points the real route at the stand-in. Done through the real environment
-     * variable so the route table under test is the one in {@code application.yml}
-     * with its URI redirected — not a route rebuilt here, which would test a
-     * different route from the one that ships.
-     *
-     * <p>Set as {@code RESERVATION_SERVICE_URL} rather than as
-     * {@code spring.cloud.gateway.mvc.routes[0].uri} on purpose. Overriding one
-     * indexed child of a list in a YAML file replaces that whole element: the
-     * route arrives at the context with its id and predicates stripped out and no
-     * predicate to match, which fails at startup for reasons that have nothing to
-     * do with the gateway. Going through the variable the YAML already reads keeps
-     * the test honest about the same seam a deployment uses.
+     * Points the real route at the stand-in, through the same environment
+     * variable a deployment would set. Overriding
+     * {@code spring.cloud.gateway.mvc.routes[0].uri} instead would replace that
+     * whole list element, so the route would reach the context with its id and
+     * predicates stripped and no predicate to match.
      */
     @DynamicPropertySource
     static void redirectTheReservationRoute(DynamicPropertyRegistry registry) {
         registry.add("RESERVATION_SERVICE_URL", () -> reservationServiceUrl);
+        // No default signing key ships, so a test has to be a deployment and
+        // say what the key is.
+        registry.add("JWT_SECRET", () -> "a-signing-key-this-test-only-ever-signs-with");
     }
 
     @BeforeEach
@@ -125,9 +118,8 @@ class GatewayProxyBootTests {
         mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER)))
                 .andExpect(status().isOk());
 
-        // The services already serve the paths the gateway is asked for, so the
-        // proxy must not rewrite them. A rewrite configured "helpfully" here
-        // would 404 every route in the platform.
+        // The services already serve the paths the gateway is asked for, so a
+        // "helpful" rewrite would 404 every route in the platform.
         assertThat(received.get(0).method()).isEqualTo("GET");
         assertThat(received.get(0).path()).isEqualTo("/api/v1/events");
     }
@@ -150,16 +142,16 @@ class GatewayProxyBootTests {
         mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(Role.ORGANIZER)))
                 .andExpect(status().isOk());
 
-        // The acceptance criterion, end to end: a service with no authentication
-        // of its own (ADR 002) can still tell who is asking.
+        // A service with no authentication of its own (ADR 002) can still tell
+        // who is asking.
         assertThat(received.get(0).header("X-User-Roles")).isEqualTo("ORGANIZER");
     }
 
     @Test
     void aForgedRoleHeaderFromTheClientDoesNotReachTheService() throws Exception {
-        // The bypass, end to end. While the header filter left the inbound value
-        // in place this arrived as "CUSTOMER,ADMIN" — and a downstream reading
-        // only the first value would have believed the forgery.
+        // The bypass, end to end. With the inbound value left in place this
+        // arrived as "CUSTOMER,ADMIN", and a downstream reading only the first
+        // value would have believed the forgery.
         mvc.perform(get("/api/v1/events")
                         .header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER))
                         .header("X-User-Roles", "ADMIN"))
@@ -173,9 +165,8 @@ class GatewayProxyBootTests {
         mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER)))
                 .andExpect(status().isOk());
 
-        // Generated, not absent: user story 24 is that every request is
-        // traceable, and a request with no id is a request that cannot be
-        // followed through the services it touched.
+        // Generated, not absent: a request with no id cannot be followed through
+        // the services it touched.
         assertThat(received.get(0).header("X-Correlation-Id")).isNotBlank();
     }
 
@@ -224,9 +215,9 @@ class GatewayProxyBootTests {
 
     @Test
     void aTokenFromTheLoginRouteIsAcceptedOnTheNextRequest() throws Exception {
-        // The two halves of the story in sequence, because they are useless
-        // apart: a token that cannot be obtained, and an obtained token that
-        // cannot be used, are the same failure seen from a caller's side.
+        // The two halves in sequence, because they are useless apart: a token
+        // that cannot be obtained and one that cannot be used are the same
+        // failure from a caller's side.
         String loginBody = mvc.perform(post("/auth/login")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\": \"organizer\", \"password\": \"organizer\"}"))
@@ -256,10 +247,9 @@ class GatewayProxyBootTests {
 
     @Test
     void aPathBelongingToAnotherServiceIsNotSentToThisOne() throws Exception {
-        // The payments route points somewhere else entirely, and nothing is
-        // listening for it here — so what matters is only that it did not arrive
-        // at the stand-in. Asserting a status would be asserting on what an
-        // unreachable host happens to do.
+        // Nothing is listening for the payments route, so what matters is only
+        // that it did not arrive here. Asserting a status would be asserting on
+        // what an unreachable host happens to do.
         mvc.perform(get("/api/v1/payments/1").header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER)));
 
         assertThat(received).isEmpty();
@@ -274,11 +264,8 @@ class GatewayProxyBootTests {
 
     @Test
     void aManagementEndpointIsAnsweredForAnAdmin() throws Exception {
-        // The reason the authentication is a servlet filter rather than a gateway
-        // route filter: /actuator is a container route the proxy never sees, so a
-        // rule expressed as a route would leave the platform's own management
-        // surface the one thing in the process nobody checks. Only a full context
-        // can show that the filter really does run ahead of it.
+        // /actuator is a container route the proxy never sees, so only a full
+        // context can show that the filter runs ahead of it.
         mvc.perform(get("/actuator/health").header(HttpHeaders.AUTHORIZATION, bearerFor(Role.ADMIN)))
                 .andExpect(status().isOk());
 
@@ -290,10 +277,8 @@ class GatewayProxyBootTests {
 
     @Test
     void aPreflightFromAnAllowedOriginIsAnsweredWithoutAToken() throws Exception {
-        // A browser sends this before it has a token, and will never send a token
-        // with it. Answering 401 would break every browser client in a way that
-        // looks like a CORS misconfiguration, and OPTIONS performs no action, so
-        // there is nothing here to authorize.
+        // A browser sends this before it has a token, and never sends one with
+        // it; a 401 here would look to a client like a broken CORS setup.
         mvc.perform(options("/api/v1/events").header(HttpHeaders.ORIGIN, "http://localhost:3000")
                         .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "POST"))
                 .andExpect(status().is2xxSuccessful())
@@ -313,9 +298,7 @@ class GatewayProxyBootTests {
     }
 
     private static void record(HttpExchange exchange) throws IOException {
-        // Case-insensitive, because HTTP header names are, and a lookup that
-        // only worked for the exact casing the JDK happens to report would
-        // make a passing test a matter of luck.
+        // Case-insensitive, because HTTP header names are.
         Map<String, List<String>> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         exchange.getRequestHeaders().forEach((name, values) -> headers.put(name, List.copyOf(values)));
         received.add(new RecordedRequest(
@@ -333,8 +316,7 @@ class GatewayProxyBootTests {
             if (values == null || values.isEmpty()) {
                 return null;
             }
-            // Joined rather than first-only: a duplicate header would be a bug
-            // worth seeing whole, and taking the first value would hide it.
+            // Joined rather than first-only, so a duplicate header is visible whole.
             return String.join("|", values);
         }
     }

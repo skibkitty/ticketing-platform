@@ -1,5 +1,8 @@
 package com.raydans.apigateway.auth;
 
+import java.util.Collection;
+import java.util.List;
+
 /**
  * The three roles the platform authorizes against. A role is what a
  * Reservation's Customer, an Event's organizer, and the platform's operator
@@ -27,5 +30,14 @@ public enum Role {
      * Operates the platform: everything an organizer may do, plus the
      * management endpoints the gateway otherwise keeps to itself.
      */
-    ADMIN
+    ADMIN;
+
+    /**
+     * The wire form of a set of roles. Sorted so that a claim and the header
+     * derived from it are the same answer to "what does this caller hold" rather
+     * than two that differ by set iteration order.
+     */
+    public static List<String> namesOf(Collection<Role> roles) {
+        return roles.stream().map(Enum::name).sorted().toList();
+    }
 }

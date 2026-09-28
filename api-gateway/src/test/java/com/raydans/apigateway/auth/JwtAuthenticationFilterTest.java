@@ -2,6 +2,7 @@ package com.raydans.apigateway.auth;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.options;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -42,9 +43,8 @@ import org.springframework.web.bind.annotation.RestController;
  * asserting the status and the body shape and nothing about how the filter is
  * written.
  *
- * <p>{@code JwtAuthenticationFilter} is wired in by hand rather than through the
- * application context so that a failure here is the filter's, not the wiring's
- * — {@code GatewayBootTests} covers the wiring.
+ * <p>The filter is wired in by hand so a failure here is the filter's rather
+ * than the wiring's; {@code GatewayProxyBootTests} covers the wiring.
  */
 class JwtAuthenticationFilterTest {
 
@@ -63,11 +63,9 @@ class JwtAuthenticationFilterTest {
     }
 
     /**
-     * The same gateway, with the token service's clock as a parameter.
-     *
-     * <p>Needed because expiry is a property of the service doing the
-     * verifying, not of the token: to watch a token expire from the gateway's
-     * side the gateway has to be holding a clock that has moved past it.
+     * The same gateway with a clock as a parameter: expiry is a property of the
+     * service verifying, not of the token, so the gateway has to be holding a
+     * clock that has moved past it.
      */
     private MockMvc mvcUsing(JwtService verifier) {
         ObjectMapper objectMapper = JsonMapper.builder()
@@ -94,16 +92,15 @@ class JwtAuthenticationFilterTest {
 
     @Test
     void aRequestWithAnInventedTokenIsRefused() throws Exception {
-        // Not merely "a token this gateway did not issue" — a string that is not
-        // a token at all, which is what an unauthenticated scanner sends.
+        // A string that is not a token at all, which is what a scanner sends.
         mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, "Bearer not-a-jwt"))
                 .andExpect(status().isUnauthorized());
     }
 
     @Test
     void aNonBearerAuthorizationHeaderIsRefused() throws Exception {
-        // A valid token sent in the wrong scheme is not a valid token: accepting
-        // it would make "did you send it correctly" indistinguishable from "were
+        // A valid token in the wrong scheme is not a valid token: accepting it
+        // would make "did you send it correctly" indistinguishable from "were
         // you allowed to".
         mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, tokens.issue("admin", Set.of(Role.ADMIN)).token()))
                 .andExpect(status().isUnauthorized());
@@ -247,29 +244,29 @@ class JwtAuthenticationFilterTest {
     @Test
     void loginIsReachableWithoutAToken() throws Exception {
         // 404 rather than 401 is the point: it proves the request got past the
-        // filter and on to routing, where it found no GET handler. If the filter
-        // had refused it, the platform would have no way in at all and every
-        // client would be locked out rather than merely refused.
+        // filter and on to routing, where it found no GET handler.
         mvc.perform(get("/auth/login")).andExpect(status().isNotFound());
     }
 
     @Test
     void aCorsPreflightIsNotRefused() {
-        // Checked against the filter alone rather than through MockMvc: a
-        // preflight is handled by the DispatcherServlet's own CORS machinery,
-        // which has no handler adapter in a standalone setup and would fail for
-        // reasons that have nothing to do with the filter. What this test is
-        // actually about is whether the filter short-circuited, so it asks the
-        // filter directly.
-        //
-        // The browser sends this before it has a token, and it performs no
-        // action, so a 401 here reads to a client as a broken CORS setup.
+        // Asked of the filter directly: a preflight is handled by the
+        // DispatcherServlet's own CORS machinery, which has no handler adapter in
+        // a standalone setup. What matters is whether the filter short-circuited.
         assertThat(preflightReachesTheRestOfTheChain("/api/v1/reservations")).isTrue();
     }
 
     @Test
     void aCorsPreflightOnTheManagementEndpointsIsAlsoNotRefused() {
         assertThat(preflightReachesTheRestOfTheChain("/actuator/health")).isTrue();
+    }
+
+    @Test
+    void aBareOptionsIsNotTreatedAsAPreflight() throws Exception {
+        // A preflight is OPTIONS plus the two headers that make it one. Keying
+        // the exemption on the method alone would let any client ask the
+        // management endpoints a question with OPTIONS and get an answer.
+        mvc.perform(options("/actuator/health")).andExpect(status().isUnauthorized());
     }
 
     /** @return whether the filter passed the request on rather than answering it itself. */
@@ -298,11 +295,10 @@ class JwtAuthenticationFilterTest {
 
     @Test
     void aClientSuppliedRoleHeaderDoesNotAuthenticateAnyone() throws Exception {
-        // The trust boundary in one test. Downstream services read
-        // X-User-Roles and have no authentication of their own (ADR 002), so if
-        // a client could arrive already holding one, the gateway would be
-        // decorative. This asserts the *filter* half: no token, no access, no
-        // matter what the client claims to be.
+        // The trust boundary in one test: downstream services read X-User-Roles
+        // and have no authentication of their own (ADR 002), so if a client could
+        // arrive already holding one the gateway would be decorative. This
+        // asserts the filter half — no token, no access, whatever is claimed.
         mvc.perform(get("/api/v1/events").header("X-User-Roles", "ADMIN"))
                 .andExpect(status().isUnauthorized());
     }
@@ -322,14 +318,11 @@ class JwtAuthenticationFilterTest {
     }
 
     /**
-     * Stands in for the services behind the gateway. It exists so a permitted
-     * request has somewhere to land: without a handler, a 200 would prove
-     * nothing, because MockMvc answers an unrouted request with a 404 that is
-     * indistinguishable from the gateway having refused.
-     *
-     * <p>Each handler echoes back the caller the filter authenticated, so the
-     * tests check that a request not only got through but arrived as the right
-     * person.
+     * Stands in for the services behind the gateway, so a permitted request has
+     * somewhere to land: without a handler a 200 would prove nothing, because
+     * MockMvc answers an unrouted request with a 404 indistinguishable from a
+     * refusal. Each handler echoes the caller the filter authenticated, so a
+     * test can check the request arrived as the right person.
      */
     @RestController
     static class StandInForTheProxiedServices {

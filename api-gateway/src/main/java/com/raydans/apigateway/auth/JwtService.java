@@ -21,14 +21,12 @@ import org.springframework.stereotype.Component;
  * produced or checked, which is what makes "one place to audit and rotate keys"
  * (ADR 002) true rather than aspirational.
  *
- * <p>Symmetric on purpose. The gateway is the only party that needs to verify a
- * token — the services downstream trust a header instead (ADR 002) — so a
- * signing key that only this process can read is a strictly smaller secret to
- * protect than a private key plus a public key distributed to parties that have
- * no use for it.
+ * <p>Symmetric on purpose: the services downstream trust a header instead of a
+ * token (ADR 002), so a key only this process can read is a smaller secret than
+ * a keypair handed to parties with no use for it.
  *
- * <p>Every failure to accept a token arrives as {@link InvalidTokenException},
- * and none of them carry their reason outward: see that type for why.
+ * <p>Every refusal arrives as {@link InvalidTokenException}, carrying no reason
+ * outward: see that type for why.
  */
 @Component
 public class JwtService {
@@ -55,18 +53,13 @@ public class JwtService {
         this.clock = clock;
     }
 
-    /**
-     * Signs a token for an authenticated caller.
-     *
-     * <p>The roles go in as their names rather than as an enum ordinal, so the
-     * claim stays readable in a log and survives someone reordering this enum.
-     */
+    /** Roles go in as names rather than enum ordinals, so the claim survives a reorder. */
     public IssuedToken issue(String username, Collection<Role> roles) {
         Instant issuedAt = clock.instant();
         Instant expiresAt = issuedAt.plus(ttl);
         String token = Jwts.builder()
                 .subject(username)
-                .claim(ROLES_CLAIM, roles.stream().map(Enum::name).sorted().toList())
+                .claim(ROLES_CLAIM, Role.namesOf(roles))
                 .issuedAt(Date.from(issuedAt))
                 .expiration(Date.from(expiresAt))
                 .signWith(key)
@@ -102,12 +95,11 @@ public class JwtService {
     /**
      * Reads the roles claim, refusing anything that is not a list of role names.
      *
-     * <p>A token this gateway signed always has the claim in the shape it wrote
-     * it, so a claim in any other shape means a token from somewhere else that
-     * happened to verify. Treating that as "no roles" would be the quiet
-     * failure — a caller with an unreadable claim reaching the downstreams with
-     * an empty role list and a route that grants on emptiness. Refusing is the
-     * only answer that cannot be mistaken for a decision.
+     * <p>A token this gateway signed always has the claim in the shape it wrote,
+     * so any other shape means a token from elsewhere that happened to verify.
+     * Reading that as "no roles" would be the quiet failure: an unreadable claim
+     * reaching the downstreams as an empty role list, and a route that grants on
+     * emptiness.
      */
     private Set<Role> rolesFrom(Claims claims) {
         Object raw = claims.get(ROLES_CLAIM);

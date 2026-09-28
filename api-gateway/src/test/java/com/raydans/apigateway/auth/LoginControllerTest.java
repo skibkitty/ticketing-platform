@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.raydans.apigateway.web.ErrorResponseWriter;
 import com.raydans.apigateway.web.GatewayExceptionHandler;
 import java.time.Clock;
 import java.time.Duration;
@@ -24,7 +25,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
 import org.springframework.http.converter.json.MappingJackson2HttpMessageConverter;
 import org.springframework.test.web.servlet.MockMvc;
-import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 /**
  * The login surface as a caller experiences it.
@@ -43,21 +45,22 @@ class LoginControllerTest {
     private final JwtService tokens = new JwtService(
             new JwtProperties(SECRET, TTL), Clock.fixed(NOW, ZoneOffset.UTC));
 
+    private final ObjectMapper objectMapper = JsonMapper.builder()
+            .addModule(new JavaTimeModule())
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+            .build();
+
     MockMvc mvc;
 
     @BeforeEach
     void setUp() {
-        ObjectMapper objectMapper = JsonMapper.builder()
-                .addModule(new JavaTimeModule())
-                .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
-                .build();
-        UserProperties users = new UserProperties(Map.of(
-                "customer", new UserProperties.UserAccountProperties("customer", List.of("CUSTOMER")),
-                "organizer", new UserProperties.UserAccountProperties("organizer", List.of("ORGANIZER")),
-                "admin", new UserProperties.UserAccountProperties("admin", List.of("ADMIN"))));
-        mvc = MockMvcBuilders.standaloneSetup(new LoginController(new MapUserDirectory(users), tokens))
+        CallerDirectoryProperties callers = new CallerDirectoryProperties(Map.of(
+                "customer", new CallerDirectoryProperties.Credentials("customer", List.of("CUSTOMER")),
+                "organizer", new CallerDirectoryProperties.Credentials("organizer", List.of("ORGANIZER")),
+                "admin", new CallerDirectoryProperties.Credentials("admin", List.of("ADMIN"))));
+        mvc = MockMvcBuilders.standaloneSetup(new LoginController(new MapCallerDirectory(callers), tokens))
                 .setMessageConverters(new MappingJackson2HttpMessageConverter(objectMapper))
-                .setControllerAdvice(new GatewayExceptionHandler())
+                .setControllerAdvice(new GatewayExceptionHandler(new ErrorResponseWriter(objectMapper)))
                 .build();
     }
 
@@ -177,10 +180,10 @@ class LoginControllerTest {
         // Configured with a role set, so the token is issued and carries it.
         // A caller with none is a configuration state the login surface does not
         // invent an opinion about; what matters is that it is not a 500.
-        UserProperties noRoles = new UserProperties(
-                Map.of("ghost", new UserProperties.UserAccountProperties("ghost", List.of())));
-        MockMvc mvc = MockMvcBuilders.standaloneSetup(new LoginController(new MapUserDirectory(noRoles), tokens))
-                .setControllerAdvice(new GatewayExceptionHandler())
+        CallerDirectoryProperties noRoles = new CallerDirectoryProperties(
+                Map.of("ghost", new CallerDirectoryProperties.Credentials("ghost", List.of())));
+        MockMvc mvc = MockMvcBuilders.standaloneSetup(new LoginController(new MapCallerDirectory(noRoles), tokens))
+                .setControllerAdvice(new GatewayExceptionHandler(new ErrorResponseWriter(objectMapper)))
                 .build();
 
         mvc.perform(login("ghost", "ghost")).andExpect(status().isOk()).andExpect(jsonPath("$.roles").isEmpty());
@@ -191,18 +194,18 @@ class LoginControllerTest {
         // Better a gateway that will not start than one that mints a caller who
         // can log in and then be refused by every rule: that is a failure the
         // user reports as "my account is broken", not as a config error.
-        UserProperties typo = new UserProperties(
-                Map.of("organiser", new UserProperties.UserAccountProperties("organiser", List.of("ORGANISER"))));
+        CallerDirectoryProperties typo = new CallerDirectoryProperties(
+                Map.of("organiser", new CallerDirectoryProperties.Credentials("organiser", List.of("ORGANISER"))));
 
-        assertThatThrownBy(() -> new MapUserDirectory(typo))
+        assertThatThrownBy(() -> new MapCallerDirectory(typo))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("ORGANISER");
     }
 
     @Test
     void aDirectoryWithNoConfiguredCallersRefusesEveryone() throws Exception {
-        MockMvc empty = MockMvcBuilders.standaloneSetup(new LoginController(new MapUserDirectory(UserProperties.empty()), tokens))
-                .setControllerAdvice(new GatewayExceptionHandler())
+        MockMvc empty = MockMvcBuilders.standaloneSetup(new LoginController(new MapCallerDirectory(CallerDirectoryProperties.empty()), tokens))
+                .setControllerAdvice(new GatewayExceptionHandler(new ErrorResponseWriter(objectMapper)))
                 .build();
 
         empty.perform(login("customer", "customer")).andExpect(status().isUnauthorized());

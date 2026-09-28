@@ -6,7 +6,6 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
-import java.util.List;
 import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,27 +15,22 @@ import org.springframework.http.HttpStatus;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 /**
- * The platform's authentication and authorization boundary (ADR 002): it turns
- * a {@code Authorization: Bearer} header into an {@link AuthenticatedCaller},
- * decides whether the caller may make this request, and puts the result where
- * the proxy can see it.
+ * The platform's authentication and authorization boundary (ADR 002): turns a
+ * bearer header into an {@link AuthenticatedCaller} and decides whether the
+ * caller may make this request.
  *
- * <p>A servlet filter rather than a controller or a gateway route filter,
- * because it has to run for paths that are not routed at all —
- * {@code /actuator/**} most of all, which is a container route the proxy never
- * sees. A rule that only runs on proxied requests would leave the management
+ * <p>A servlet filter rather than a gateway route filter because it has to run
+ * for paths the proxy never sees — {@code /actuator/**} most of all, which is a
+ * container route. A rule expressed as a route would leave the management
  * endpoints as the one thing in the process nobody checks.
  */
 public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
     /**
-     * Where the authenticated caller is left for the rest of the request.
-     *
-     * <p>A request attribute and not the security context: this is a gateway,
-     * not an application, and it authenticates a request it is about to forward
-     * rather than establishing a session it will use. The proxy filter reads it
-     * from the same request, so there is no thread-local to leak across a
-     * pooled worker.
+     * Where the authenticated caller is left for the rest of the request. An
+     * attribute rather than the security context: this is a gateway
+     * authenticating a request it is about to forward, not establishing a
+     * session, so there is no thread-local to leak across a pooled worker.
      */
     public static final String CALLER_ATTRIBUTE = JwtAuthenticationFilter.class.getName() + ".CALLER";
 
@@ -56,13 +50,8 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
-        RoleAuthorizer.Access access = authorizer.decide(request.getMethod(), request.getRequestURI());
+        RoleAuthorizer.Access access = authorizer.decide(request.getMethod(), pathOf(request));
 
-        // A CORS preflight carries no credentials by design — the browser sends
-        // it before it has, or will ever have, the token. Answering it 401 would
-        // break every browser client in a way that looks like a CORS
-        // misconfiguration rather than an auth failure, and OPTIONS performs no
-        // action, so there is nothing to authorize.
         if (isPreflight(request)) {
             chain.doFilter(request, response);
             return;
@@ -81,7 +70,7 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
         String refusal = refuse(access, caller);
         if (refusal != null) {
-            log.info("Refused {} {} to {}: {}", request.getMethod(), request.getRequestURI(), caller.username(), refusal);
+            log.info("Refused {} {} to {}: {}", request.getMethod(), pathOf(request), caller.username(), refusal);
             errors.write(request, response, HttpStatus.FORBIDDEN, refusal);
             return;
         }
@@ -99,37 +88,52 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         try {
             return tokens.parse(header.substring(BEARER_PREFIX.length()).trim());
         } catch (InvalidTokenException ex) {
-            // Logged, not returned: the reason a token was refused is exactly
-            // what an operator needs and exactly what a caller must not get. At
-            // debug so a scanning client cannot flood the log at info.
-            log.debug("Rejected a bearer token on {}: {}", request.getRequestURI(), ex.getMessage());
+            // Logged, not returned: the reason a token was refused is what an
+            // operator needs and what a caller must not get. At debug so a
+            // scanning client cannot flood the log at info.
+            log.debug("Rejected a bearer token on {}: {}", pathOf(request), ex.getMessage());
             return null;
         }
     }
 
-    /**
-     * @return the reason to answer 403, or null to let the request through
-     */
+    /** @return the reason to answer 403, or null to let the request through. */
     private String refuse(RoleAuthorizer.Access access, AuthenticatedCaller caller) {
         if (access instanceof RoleAuthorizer.Access.AnyOfRoles required && !caller.holdsAny(required.roles())) {
-            List<String> names = required.roles().stream().map(Enum::name).sorted().toList();
-            return "This action requires one of: " + String.join(", ", names);
+            return "This action requires one of: " + String.join(", ", Role.namesOf(required.roles()));
         }
         return null;
     }
 
     /**
      * @return the caller left on the request, or empty when the request was not
-     *     authenticated — the only correct way for a downstream header filter to
-     *     tell "no roles" from "not authenticated", since a token with no roles
-     *     and no token at all both mean an empty role list on the wire
+     *     authenticated — the only way a downstream header filter can tell "no
+     *     roles" from "not authenticated", since both mean an empty role list on
+     *     the wire
      */
     public static Optional<AuthenticatedCaller> callerOn(HttpServletRequest request) {
         Object attribute = request.getAttribute(CALLER_ATTRIBUTE);
         return attribute instanceof AuthenticatedCaller caller ? Optional.of(caller) : Optional.empty();
     }
 
+    /**
+     * A CORS preflight is OPTIONS plus the two headers that make it one. The
+     * browser sends it before it has a token and will never send one with it, so
+     * a 401 here reads to a client as a broken CORS setup, and it performs no
+     * action. Keyed on the whole definition rather than the method so a plain
+     * OPTIONS to a management endpoint is still answered by this filter.
+     */
     private static boolean isPreflight(HttpServletRequest request) {
-        return HttpMethod.OPTIONS.matches(request.getMethod());
+        return HttpMethod.OPTIONS.matches(request.getMethod())
+                && request.getHeader(HttpHeaders.ORIGIN) != null
+                && request.getHeader(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD) != null;
+    }
+
+    /**
+     * The path as the rules are written, without the context path. A rule that
+     * missed because the deployment was given one would be an endpoint nobody
+     * checks.
+     */
+    private static String pathOf(HttpServletRequest request) {
+        return request.getRequestURI().substring(request.getContextPath().length());
     }
 }

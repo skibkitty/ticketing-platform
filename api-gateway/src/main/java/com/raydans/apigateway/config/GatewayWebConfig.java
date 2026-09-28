@@ -16,22 +16,18 @@ import org.springframework.core.Ordered;
 /**
  * Wires the gateway's filter chain, and the order of it.
  *
- * <p>Two filters, and the order between them is the only thing that makes a 401
- * traceable: the correlation id has to be on the request before auth can refuse
- * it, or a rejected call is the one request in the system with no id to grep its
- * logs by. That is the opposite of the usual instinct to put the cheap filter
- * first.
+ * <p>The correlation id is ahead of everything, and that is the opposite of the
+ * usual instinct to put the cheap filter first: the id has to be on the request
+ * before auth can refuse it, or a rejected call is the one request in the
+ * system with no id to grep its logs by.
  */
 @Configuration
 public class GatewayWebConfig {
 
     /**
-     * Correlation id, ahead of everything.
-     *
-     * <p>Registered here rather than picked up from {@code common}'s
-     * auto-configuration because that is a {@code WebMvcConfigurer} for CORS and
-     * a filter has to be registered explicitly — the same way every other
-     * service in this repo does it.
+     * The correlation id filter, registered rather than picked up from
+     * {@code common}'s auto-configuration because a filter has to be registered
+     * explicitly.
      */
     @Bean
     public FilterRegistrationBean<CorrelationIdFilter> correlationIdFilter() {
@@ -47,6 +43,20 @@ public class GatewayWebConfig {
     }
 
     /**
+     * Immediately after the correlation id, and before anything that could route:
+     * an unauthenticated request should not reach a route handler, an actuator
+     * endpoint, or an error page that renders it.
+     */
+    @Bean
+    public FilterRegistrationBean<JwtAuthenticationFilter> jwtAuthenticationFilter(
+            JwtService tokens, ErrorResponseWriter errors) {
+        FilterRegistrationBean<JwtAuthenticationFilter> registration =
+                new FilterRegistrationBean<>(new JwtAuthenticationFilter(tokens, new RoleAuthorizer(), errors));
+        registration.setOrder(Ordered.HIGHEST_PRECEDENCE + 10);
+        return registration;
+    }
+
+    /**
      * Teaches the gateway which predicate names {@code application.yml} may use.
      *
      * <p>The {@code Path=/api/v1/events/**} lines under
@@ -59,17 +69,5 @@ public class GatewayWebConfig {
     @Bean
     public PredicateSupplier mvcPredicateSupplier() {
         return new MvcPredicateSupplier();
-    }
-
-    @Bean
-    public FilterRegistrationBean<JwtAuthenticationFilter> jwtAuthenticationFilter(
-            JwtService tokens, ErrorResponseWriter errors) {
-        FilterRegistrationBean<JwtAuthenticationFilter> registration =
-                new FilterRegistrationBean<>(new JwtAuthenticationFilter(tokens, new RoleAuthorizer(), errors));
-        // Immediately after the correlation id, and before anything that could
-        // route: an unauthenticated request should not reach a route handler,
-        // an actuator endpoint, or an error page that renders it.
-        registration.setOrder(Ordered.HIGHEST_PRECEDENCE + 10);
-        return registration;
     }
 }

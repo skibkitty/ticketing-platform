@@ -23,18 +23,18 @@ spring:
 
 app:
   cors:
-    # The gateway is the only service that answers a browser, so this is the only
-    # place a cross-origin policy is applied to anything (ADR 002).
+    # Read by the CORS configuration in common, which every service shares; this
+    # is where a deployment states who its browsers are (ADR 002).
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000}
   gateway:
     jwt:
-      # A demo secret, and one that is meant to be replaced: the whole point of
-      # keeping it in configuration is that swapping it needs no rebuild. Refused
-      # at startup if shorter than HS256 requires rather than silently weakening
-      # the signature — see JwtProperties.
-      secret: ${JWT_SECRET:change-me-in-a-real-deployment-this-is-a-demo-secret}
+      # No default on purpose. A fallback here would be a signing key in the
+      # repository that passes the length check in JwtProperties and signs every
+      # token in a deployment that forgot to set one, so the gateway refuses to
+      # start instead. Generate one with: openssl rand -base64 48
+      secret: ${JWT_SECRET}
       ttl: ${JWT_TTL:PT1H}
-    users:
+    callers:
       # The demo caller set, in configuration so the passwords are not in version
       # control. A real deployment replaces this whole map with an identity
       # provider (explicitly out of scope); nothing else here would change.
