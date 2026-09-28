@@ -19,7 +19,13 @@ spring:
           - id: notification-service
             uri: ${NOTIFICATION_SERVICE_URL:http://localhost:8084}
             predicates:
-              - Path=/api/v1/notifications/**
+              # The admin prefix too: /api/v1/admin/customers/{id}/notifications
+              # reads this service's rows, and the ADMIN rule in RoleAuthorizer is
+              # what makes it an operator route rather than a customer's (ADR 011).
+              # The prefix is claimed whole because a path pattern cannot hold a
+              # variable in the middle; an admin route for another service's data
+              # goes in a route ahead of this one. See ADR 011's closing caveat.
+              - Path=/api/v1/notifications/**,/api/v1/admin/**
 
 app:
   cors:
@@ -38,14 +44,33 @@ app:
       # The demo caller set, in configuration so the passwords are not in version
       # control. A real deployment replaces this whole map with an identity
       # provider (explicitly out of scope); nothing else here would change.
+      #
+      # No password below has a value, and none is given one here: a fallback in
+      # this file would be a working credential in the repository, committed to
+      # every clone and every fork. Each is read from the environment, and a
+      # gateway started without one refuses to start rather than quietly
+      # rejecting every login. See .env.example for a local setup.
+      #
+      # The caller-id is the other half, and it is here for the same reason: the
+      # token's subject is the caller's own id (ADR 002), so which login name
+      # belongs to which identity is data the gateway is configured with — never
+      # something parsed out of the username, and never a table in source.
+      #
+      # It is called caller-id and not customer-id because not every caller is a
+      # Customer. Only the first entry below holds CUSTOMER, so only its id is a
+      # Customer.id; the other two are the organizers' and the admin's own ids
+      # and are never forwarded as X-Customer-Id (CONTEXT.md).
       customer:
-        password: customer
+        caller-id: 42
+        password: ${DEMO_CUSTOMER_PASSWORD}
         roles: [CUSTOMER]
       organizer:
-        password: organizer
+        caller-id: 43
+        password: ${DEMO_ORGANIZER_PASSWORD}
         roles: [ORGANIZER]
       admin:
-        password: admin
+        caller-id: 44
+        password: ${DEMO_ADMIN_PASSWORD}
         roles: [ADMIN]
 
 management:

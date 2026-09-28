@@ -29,9 +29,21 @@ Docker image tag in `docker-compose.yml`.
 
 ## Running it
 
+The gateway needs a signing key and the demo callers need passwords, and none
+of them is committed — a key or a working password in this repository is a
+credential in every clone and every fork. Both are supplied at runtime:
+
 ```bash
+cp .env.example .env
+# fill in the four values; generate the key with: openssl rand -base64 48
 docker compose up --build
 ```
+
+Compose stops with the name of the missing variable rather than substituting
+an empty one, and the gateway independently refuses to start without a signing
+key of at least 32 bytes or without a password for every configured caller —
+so forgetting one is a startup failure, not a deployment signing tokens with a
+key nobody chose. `.env` is gitignored; `.env.example` holds placeholders only.
 
 - Gateway: `http://localhost:8080`
 - Kafka UI: `http://localhost:8090`
@@ -42,11 +54,31 @@ docker compose up --build
 
 *(To be filled in with real, tested commands as part of T14 (#15).)*
 
+The demo logins are `customer`, `organizer` and `admin`, with the passwords you
+set in `.env`. A token's subject is the caller's own id — `42` for `customer` —
+and for a caller that is a Customer that id is its `Customer.id`, which is the
+only case the gateway puts `X-Customer-Id` on the request it forwards. An
+organizer and an admin have ids too, but holding those roles is not being a
+Customer, so they get no such header and a value you set by hand is overwritten
+or dropped either way.
+
+Reservations are the Customer's alone: `POST /api/v1/reservations` answers an
+organizer with 403, because a Reservation belongs to a Customer and there is no
+Customer id to book an organizer's against. Browsing Events stays open to any
+authenticated caller, since a Customer has to be able to look before buying.
+
+`GET /api/v1/notifications` is the Customer's own inbox and takes no customer id
+at all — it reads the one the gateway verified, so a `?customerId=` on it is
+either redundant or refused. An operator reads someone else's inbox on a separate,
+`ADMIN`-only route, kept separate so the self-service read can never be widened:
+`GET /api/v1/admin/customers/<id>/notifications`. See
+`docs/adr/011-notification-read-ownership.md`.
+
 ```bash
 # 1. Log in
 curl -X POST localhost:8080/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"organizer","password":"organizer"}'
+  -d '{"username":"organizer","password":"<your DEMO_ORGANIZER_PASSWORD>"}'
 
 # 2. Create an event with seats (ORGANIZER/ADMIN token)
 curl -X POST localhost:8080/api/v1/events \
@@ -58,7 +90,7 @@ curl -X POST localhost:8080/api/v1/events \
 curl localhost:8080/api/v1/events/1/seats?status=AVAILABLE \
   -H "Authorization: Bearer <token>"
 
-# 4. Reserve seats (any authenticated role) — low amount, expect it to
+# 4. Reserve seats (CUSTOMER token) — low amount, expect it to
 #    succeed through the saga
 curl -X POST localhost:8080/api/v1/reservations \
   -H "Authorization: Bearer <customer-token>" \
@@ -73,8 +105,9 @@ curl localhost:8080/api/v1/reservations/1 \
 curl localhost:8080/api/v1/payments/1 \
   -H "Authorization: Bearer <customer-token>"
 
-# 7. Check the simulated notification
-curl "localhost:8080/api/v1/notifications?customerId=<id>" \
+# 7. Check the simulated notification — the inbox is the caller's own,
+#    scoped by the id the gateway verified, not by anything in the URL
+curl localhost:8080/api/v1/notifications \
   -H "Authorization: Bearer <customer-token>"
 
 # 8. To see the compensating path: reserve enough seats that the total

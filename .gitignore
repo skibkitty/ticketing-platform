@@ -32,5 +32,8 @@ logs/
 # Env / secrets
 .env
 .env.*
+# ...except the template, which is the documented way to find out what has to be
+# set. It holds placeholders only, so there is nothing in it to leak.
+!.env.example
 *.pem
 *.key

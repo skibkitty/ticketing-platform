@@ -139,9 +139,15 @@ flow itself, since that's fully async via Kafka.
 
 ## Why JWT validation and CORS live only at the gateway
 
-One trust boundary to audit and rotate keys for; downstream services trust
-the `X-User-Roles` header the gateway sets, which only holds because the
-internal services aren't reachable except through the gateway. See
+One trust boundary to audit and rotate keys for; downstream services trust the
+`X-User-Roles` and `X-Customer-Id` headers the gateway sets, which only holds
+because the internal services aren't reachable except through the gateway. The
+token's subject is the caller's own id, so the customer a request runs as is
+read out of a signature the gateway checked rather than a header the client sent
+— which matters because `X-Customer-Id` is what a reservation is booked against.
+A role is a capability and not an identity, so that header is set only for a
+caller holding `CUSTOMER`: an organizer authenticates and is forwarded, but gets
+no Customer id, because the domain does not make it one. See
 `docs/adr/002-gateway-trust-boundary.md` for the tradeoff this creates.
 
 ## What's intentionally out of scope

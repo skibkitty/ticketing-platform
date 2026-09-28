@@ -32,7 +32,13 @@ public class LoginController {
                 .filter(candidate -> secretsMatch(candidate.password(), request.password()))
                 .orElseThrow(InvalidCredentialsException::new);
 
-        IssuedToken issued = tokens.issue(account.username(), account.roles());
+        // The subject is the identity this login name belongs to, not the login
+        // name: everything the gateway tells a downstream service about the
+        // caller is derived from the subject (ADR 002). The username does its job
+        // here and goes no further. Note that for an organizer this is the
+        // organizer's own id, not a Customer's — it becomes a Customer id only
+        // for a caller that holds CUSTOMER, and is published as one only then.
+        IssuedToken issued = tokens.issue(account.callerId(), account.roles());
         return new LoginResponse(
                 issued.token(),
                 Role.namesOf(account.roles()),

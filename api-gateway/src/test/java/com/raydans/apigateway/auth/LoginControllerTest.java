@@ -50,15 +50,24 @@ class LoginControllerTest {
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
             .build();
 
+    /**
+     * The demo directory. Each login name is bound to the Customer it stands
+     * for, and that id is what ends up in the token's subject (ADR 002).
+     */
+    private static final Map<String, CallerDirectoryProperties.Credentials> DEMO_CALLERS = Map.of(
+            "customer", new CallerDirectoryProperties.Credentials(42L, "customer", List.of("CUSTOMER")),
+            "organizer", new CallerDirectoryProperties.Credentials(43L, "organizer", List.of("ORGANIZER")),
+            "admin", new CallerDirectoryProperties.Credentials(44L, "admin", List.of("ADMIN")));
+
     MockMvc mvc;
 
     @BeforeEach
     void setUp() {
-        CallerDirectoryProperties callers = new CallerDirectoryProperties(Map.of(
-                "customer", new CallerDirectoryProperties.Credentials("customer", List.of("CUSTOMER")),
-                "organizer", new CallerDirectoryProperties.Credentials("organizer", List.of("ORGANIZER")),
-                "admin", new CallerDirectoryProperties.Credentials("admin", List.of("ADMIN"))));
-        mvc = MockMvcBuilders.standaloneSetup(new LoginController(new MapCallerDirectory(callers), tokens))
+        mvc = mvcLoggingInAs(new CallerDirectoryProperties(DEMO_CALLERS));
+    }
+
+    private MockMvc mvcLoggingInAs(CallerDirectoryProperties callers) {
+        return MockMvcBuilders.standaloneSetup(new LoginController(new MapCallerDirectory(callers), tokens))
                 .setMessageConverters(new MappingJackson2HttpMessageConverter(objectMapper))
                 .setControllerAdvice(new GatewayExceptionHandler(new ErrorResponseWriter(objectMapper)))
                 .build();
@@ -84,8 +93,38 @@ class LoginControllerTest {
                 .getContentAsString();
 
         String jwt = objectMapper().readTree(token).get("token").asText();
-        assertThat(tokens.parse(jwt).username()).isEqualTo("admin");
+        assertThat(tokens.parse(jwt).callerId()).isEqualTo(44L);
         assertThat(tokens.parse(jwt).roles()).containsExactly(Role.ADMIN);
+    }
+
+    @Test
+    void theTokensSubjectIsTheCallersIdAndNotTheUsernameTheCallerTyped() throws Exception {
+        // The decision ADR 002 records, asserted at the only place a subject is
+        // ever chosen. "customer" as the subject would be a name the caller
+        // controls, and every downstream header is derived from this claim.
+        String jwt = tokenFromLoggingInAs("customer", "customer");
+
+        assertThat(tokens.parse(jwt).callerId()).isEqualTo(42L);
+    }
+
+    @Test
+    void eachLoginNameResolvesToItsOwnCaller() throws Exception {
+        // Distinct ids, so a token cannot be minted for one caller and spent as
+        // another by any of the routes that act on the id.
+        assertThat(tokens.parse(tokenFromLoggingInAs("customer", "customer")).callerId()).isEqualTo(42L);
+        assertThat(tokens.parse(tokenFromLoggingInAs("organizer", "organizer")).callerId()).isEqualTo(43L);
+        assertThat(tokens.parse(tokenFromLoggingInAs("admin", "admin")).callerId()).isEqualTo(44L);
+    }
+
+    @Test
+    void onlyTheCustomerLoginMintsATokenThatIsACustomer() throws Exception {
+        // Where the roles are granted is the only place the platform decides who
+        // is a Customer, so it is where the distinction has to be right: the
+        // organizer and the admin have ids, and those ids are not Customer ids
+        // and must never be published as X-Customer-Id downstream.
+        assertThat(tokens.parse(tokenFromLoggingInAs("customer", "customer")).isCustomer()).isTrue();
+        assertThat(tokens.parse(tokenFromLoggingInAs("organizer", "organizer")).isCustomer()).isFalse();
+        assertThat(tokens.parse(tokenFromLoggingInAs("admin", "admin")).isCustomer()).isFalse();
     }
 
     @Test
@@ -180,11 +219,8 @@ class LoginControllerTest {
         // Configured with a role set, so the token is issued and carries it.
         // A caller with none is a configuration state the login surface does not
         // invent an opinion about; what matters is that it is not a 500.
-        CallerDirectoryProperties noRoles = new CallerDirectoryProperties(
-                Map.of("ghost", new CallerDirectoryProperties.Credentials("ghost", List.of())));
-        MockMvc mvc = MockMvcBuilders.standaloneSetup(new LoginController(new MapCallerDirectory(noRoles), tokens))
-                .setControllerAdvice(new GatewayExceptionHandler(new ErrorResponseWriter(objectMapper)))
-                .build();
+        MockMvc mvc = mvcLoggingInAs(new CallerDirectoryProperties(
+                Map.of("ghost", new CallerDirectoryProperties.Credentials(45L, "ghost", List.of()))));
 
         mvc.perform(login("ghost", "ghost")).andExpect(status().isOk()).andExpect(jsonPath("$.roles").isEmpty());
     }
@@ -194,8 +230,8 @@ class LoginControllerTest {
         // Better a gateway that will not start than one that mints a caller who
         // can log in and then be refused by every rule: that is a failure the
         // user reports as "my account is broken", not as a config error.
-        CallerDirectoryProperties typo = new CallerDirectoryProperties(
-                Map.of("organiser", new CallerDirectoryProperties.Credentials("organiser", List.of("ORGANISER"))));
+        CallerDirectoryProperties typo = new CallerDirectoryProperties(Map.of(
+                "organiser", new CallerDirectoryProperties.Credentials(43L, "organiser", List.of("ORGANISER"))));
 
         assertThatThrownBy(() -> new MapCallerDirectory(typo))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -203,12 +239,58 @@ class LoginControllerTest {
     }
 
     @Test
+    void aCallerWithNoPasswordRefusesToStart() throws Exception {
+        // The passwords come from the environment and none is committed, so a
+        // deployment that forgot one is the expected case rather than an exotic
+        // one. Refusing to start is the difference between "DEMO_CUSTOMER_PASSWORD
+        // is not set" and a gateway that 401s every login forever.
+        MapCallerDirectory directory = new MapCallerDirectory(new CallerDirectoryProperties(Map.of(
+                "customer", new CallerDirectoryProperties.Credentials(42L, null, List.of("CUSTOMER")))));
+
+        assertThatThrownBy(directory::refuseToStartWithUnusableCallers)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("customer")
+                .hasMessageContaining("password");
+    }
+
+    @Test
+    void aBlankPasswordIsAlsoRefusedRatherThanTreatedAsNoPassword() throws Exception {
+        MapCallerDirectory directory = new MapCallerDirectory(new CallerDirectoryProperties(Map.of(
+                "customer", new CallerDirectoryProperties.Credentials(42L, "   ", List.of("CUSTOMER")))));
+
+        assertThatThrownBy(directory::refuseToStartWithUnusableCallers).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void aCallerWithNoCustomerIdRefusesToStart() throws Exception {
+        // Without an id the gateway has nothing to put in the token's subject,
+        // and a token whose subject is not a Customer id is refused on the very
+        // next request (ADR 002). A gateway that started here would 401 its own
+        // callers with nothing in the logs to say why.
+        MapCallerDirectory directory = new MapCallerDirectory(new CallerDirectoryProperties(Map.of(
+                "customer", new CallerDirectoryProperties.Credentials(null, "customer", List.of("CUSTOMER")))));
+
+        assertThatThrownBy(directory::refuseToStartWithUnusableCallers)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("caller-id");
+    }
+
+    @Test
     void aDirectoryWithNoConfiguredCallersRefusesEveryone() throws Exception {
-        MockMvc empty = MockMvcBuilders.standaloneSetup(new LoginController(new MapCallerDirectory(CallerDirectoryProperties.empty()), tokens))
-                .setControllerAdvice(new GatewayExceptionHandler(new ErrorResponseWriter(objectMapper)))
-                .build();
+        MockMvc empty = mvcLoggingInAs(CallerDirectoryProperties.empty());
 
         empty.perform(login("customer", "customer")).andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void aDirectoryWithNoConfiguredCallersAtAllRefusesToStart() throws Exception {
+        // The other half of the same gap: an app.gateway.callers map that failed
+        // to bind leaves a gateway that 401s every login with no other symptom.
+        MapCallerDirectory directory = new MapCallerDirectory(CallerDirectoryProperties.empty());
+
+        assertThatThrownBy(directory::refuseToStartWithUnusableCallers)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("app.gateway.callers");
     }
 
     @Test
@@ -217,13 +299,7 @@ class LoginControllerTest {
         // surface mints is a bearer token, which is the only scheme the filter
         // accepts. Without this, a client could hold a perfectly valid token and
         // be refused for sending it correctly-but-differently.
-        String jwt = objectMapper()
-                .readTree(mvc.perform(login("customer", "customer"))
-                        .andReturn()
-                        .getResponse()
-                        .getContentAsString())
-                .get("token")
-                .asText();
+        String jwt = tokenFromLoggingInAs("customer", "customer");
 
         assertThat(jwt.split("\\.")).hasSize(3);
         assertThat(tokens.parse(jwt).roles()).isEqualTo(Set.of(Role.CUSTOMER));
@@ -233,6 +309,18 @@ class LoginControllerTest {
         return post("/auth/login")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("{\"username\": \"%s\", \"password\": \"%s\"}".formatted(username, password));
+    }
+
+    /** Logs in and returns the token, so a test can read what was actually minted. */
+    private String tokenFromLoggingInAs(String username, String password) throws Exception {
+        return objectMapper()
+                .readTree(mvc.perform(login(username, password))
+                        .andExpect(status().isOk())
+                        .andReturn()
+                        .getResponse()
+                        .getContentAsString())
+                .get("token")
+                .asText();
     }
 
     private String jsonField(String body, String field) {

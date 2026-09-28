@@ -27,12 +27,28 @@ import org.springframework.stereotype.Component;
  *
  * <p>Every refusal arrives as {@link InvalidTokenException}, carrying no reason
  * outward: see that type for why.
+ *
+ * <p>The subject is the id of the caller's own identity, never a username
+ * (ADR 002), which is why {@link #parse} refuses a token whose subject is not
+ * one instead of passing the string on for something downstream to interpret.
+ * For a caller that is a Customer that id <em>is</em> its {@code Customer.id};
+ * for an organizer or an admin it is that caller's own, and is never published
+ * as a Customer's (CONTEXT.md).
  */
 @Component
 public class JwtService {
 
     /** The claim the roles travel in, and the key the header is derived from. */
     public static final String ROLES_CLAIM = "roles";
+
+    /**
+     * What the subject has to be for a token to be usable: a caller's id is a
+     * positive integer the identity store gave out, so anything else in the
+     * subject means the token is not one this gateway issued — or came from
+     * somewhere else entirely.
+     */
+    private static final String CALLER_ID_EXPLANATION =
+            "Token subject is not a caller id";
 
     private final SecretKey key;
     private final Duration ttl;
@@ -53,12 +69,21 @@ public class JwtService {
         this.clock = clock;
     }
 
-    /** Roles go in as names rather than enum ordinals, so the claim survives a reorder. */
-    public IssuedToken issue(String username, Collection<Role> roles) {
+    /**
+     * Mints a token whose subject is the caller's own id, which is the identity
+     * every downstream header is derived from (ADR 002).
+     *
+     * <p>The id is passed in rather than looked up from a username here: the
+     * subject is an assertion about which identity this is, and the only place
+     * entitled to make that assertion is whatever authenticated the caller.
+     */
+    public IssuedToken issue(long callerId, Collection<Role> roles) {
         Instant issuedAt = clock.instant();
         Instant expiresAt = issuedAt.plus(ttl);
         String token = Jwts.builder()
-                .subject(username)
+                .subject(Long.toString(callerId))
+                // Roles go in as names rather than enum ordinals, so the claim
+                // survives a reorder.
                 .claim(ROLES_CLAIM, Role.namesOf(roles))
                 .issuedAt(Date.from(issuedAt))
                 .expiration(Date.from(expiresAt))
@@ -71,8 +96,9 @@ public class JwtService {
      * Verifies a token and reads the caller out of it.
      *
      * @throws InvalidTokenException if the token is not one this gateway issued
-     *     and has not expired — malformed, wrong signature, expired, or carrying
-     *     a {@code roles} claim that is not a list of role names
+     *     and has not expired — malformed, wrong signature, expired, carrying a
+     *     {@code roles} claim that is not a list of role names, or carrying a
+     *     subject that is not a caller id
      */
     public AuthenticatedCaller parse(String token) {
         Claims claims;
@@ -89,7 +115,41 @@ public class JwtService {
             // null-ish token throws before it is ever parsed.
             throw new InvalidTokenException("Token is not valid", ex);
         }
-        return new AuthenticatedCaller(claims.getSubject(), rolesFrom(claims));
+        return new AuthenticatedCaller(callerIdFrom(claims), rolesFrom(claims));
+    }
+
+    /**
+     * Reads the subject as the caller's id it is (ADR 002).
+     *
+     * <p>Refused rather than repaired, and this is the load-bearing refusal of
+     * the whole identity decision: a subject that is not a caller's id cannot be
+     * turned into one, because every way of turning it into one — reading it as a
+     * username, matching it against a table, dropping the characters that are not
+     * digits — invents an identity the signature never asserted. A caller is then
+     * refused with 401, instead of reaching a service that would book the seats
+     * against a guessed id.
+     *
+     * <p>Note what is <em>not</em> decided here: whether the subject is a
+     * Customer's. The roles claim answers that, and a subject is a valid caller id
+     * whether or not its holder is a Customer, so an organizer's token carries one
+     * too. Refusing it here would make the gateway unable to say who an organizer
+     * is.
+     */
+    private long callerIdFrom(Claims claims) {
+        String subject = claims.getSubject();
+        if (subject == null || subject.isBlank()) {
+            throw new InvalidTokenException(CALLER_ID_EXPLANATION + ": it carries no subject", null);
+        }
+        long callerId;
+        try {
+            callerId = Long.parseLong(subject);
+        } catch (NumberFormatException ex) {
+            throw new InvalidTokenException(CALLER_ID_EXPLANATION, ex);
+        }
+        if (callerId < 1) {
+            throw new InvalidTokenException(CALLER_ID_EXPLANATION, null);
+        }
+        return callerId;
     }
 
     /**

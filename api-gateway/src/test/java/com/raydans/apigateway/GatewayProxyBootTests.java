@@ -13,16 +13,22 @@ import com.raydans.apigateway.auth.JwtService;
 import com.raydans.apigateway.auth.Role;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.Keys;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Date;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.IntStream;
+import javax.crypto.SecretKey;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -55,6 +61,21 @@ import org.springframework.test.web.servlet.MockMvc;
 @AutoConfigureMockMvc
 class GatewayProxyBootTests {
 
+    /** The Customer ids the demo callers in {@code application.yml} belong to. */
+    private static final long CUSTOMER_ID = 42L;
+    private static final long ORGANIZER_ID = 43L;
+    private static final long ADMIN_ID = 44L;
+
+    private static final String CUSTOMER_PASSWORD = "the-customer-password";
+    private static final String ORGANIZER_PASSWORD = "the-organizer-password";
+    private static final String ADMIN_PASSWORD = "the-admin-password";
+
+    private static final String SIGNING_KEY = "a-signing-key-this-test-only-ever-signs-with";
+    private static final Duration TTL = Duration.ofHours(1);
+
+    /** Stated by this test rather than inherited from {@code application.yml}'s default. */
+    private static final String ALLOWED_ORIGIN = "http://localhost:3000";
+
     @Autowired
     MockMvc mvc;
 
@@ -73,6 +94,11 @@ class GatewayProxyBootTests {
         reservationService = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         reservationService.createContext("/api/v1/events", GatewayProxyBootTests::recordAndReply);
         reservationService.createContext("/api/v1/reservations", GatewayProxyBootTests::recordAndReply);
+        // The notification routes, including the operator's, so a request that the
+        // authorization table admits can be observed reaching an upstream rather
+        // than refused by an unreachable host (ADR 011).
+        reservationService.createContext("/api/v1/notifications", GatewayProxyBootTests::recordAndReply);
+        reservationService.createContext("/api/v1/admin", GatewayProxyBootTests::recordAndReply);
         reservationService.start();
         reservationServiceUrl = "http://127.0.0.1:" + reservationService.getAddress().getPort();
     }
@@ -94,9 +120,18 @@ class GatewayProxyBootTests {
     @DynamicPropertySource
     static void redirectTheReservationRoute(DynamicPropertyRegistry registry) {
         registry.add("RESERVATION_SERVICE_URL", () -> reservationServiceUrl);
-        // No default signing key ships, so a test has to be a deployment and
-        // say what the key is.
-        registry.add("JWT_SECRET", () -> "a-signing-key-this-test-only-ever-signs-with");
+        // The same stand-in, so the operator's notification route has an upstream to
+        // reach. These tests assert what the gateway forwards and to whom, not which
+        // service implements it.
+        registry.add("NOTIFICATION_SERVICE_URL", () -> reservationServiceUrl);
+        // Nothing secret ships with the gateway, so a test has to be a
+        // deployment and say what the key is — as does every password in the
+        // caller directory, which is how a real one is configured.
+        registry.add("JWT_SECRET", () -> SIGNING_KEY);
+        registry.add("DEMO_CUSTOMER_PASSWORD", () -> CUSTOMER_PASSWORD);
+        registry.add("DEMO_ORGANIZER_PASSWORD", () -> ORGANIZER_PASSWORD);
+        registry.add("DEMO_ADMIN_PASSWORD", () -> ADMIN_PASSWORD);
+        registry.add("CORS_ALLOWED_ORIGINS", () -> ALLOWED_ORIGIN);
     }
 
     @BeforeEach
@@ -106,7 +141,7 @@ class GatewayProxyBootTests {
 
     @Test
     void anAuthorizedRequestIsProxiedToTheService() throws Exception {
-        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER)))
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.eventId").value(1));
 
@@ -115,7 +150,7 @@ class GatewayProxyBootTests {
 
     @Test
     void thePathAndMethodArriveUnchanged() throws Exception {
-        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER)))
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)))
                 .andExpect(status().isOk());
 
         // The services already serve the paths the gateway is asked for, so a
@@ -127,7 +162,7 @@ class GatewayProxyBootTests {
     @Test
     void aRequestBodyIsForwardedIntact() throws Exception {
         mvc.perform(post("/api/v1/reservations")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"eventId\": 7, \"seatIds\": [1, 2]}"))
                 .andExpect(status().isOk());
@@ -139,7 +174,7 @@ class GatewayProxyBootTests {
 
     @Test
     void theCallersRolesArriveDownstream() throws Exception {
-        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(Role.ORGANIZER)))
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(ORGANIZER_ID, Role.ORGANIZER)))
                 .andExpect(status().isOk());
 
         // A service with no authentication of its own (ADR 002) can still tell
@@ -153,16 +188,243 @@ class GatewayProxyBootTests {
         // arrived as "CUSTOMER,ADMIN", and a downstream reading only the first
         // value would have believed the forgery.
         mvc.perform(get("/api/v1/events")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
                         .header("X-User-Roles", "ADMIN"))
                 .andExpect(status().isOk());
 
         assertThat(received.get(0).header("X-User-Roles")).isEqualTo("CUSTOMER");
     }
 
+    // --- X-Customer-Id: the identity a reservation is booked against -----------
+
+    @Test
+    void theCustomersIdFromTheTokenIsForwardedDownstream() throws Exception {
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)))
+                .andExpect(status().isOk());
+
+        // The token's subject, and nothing else (ADR 002): the service books
+        // the reservation against 42 because that is the Customer the gateway
+        // verified the signature for.
+        assertThat(received.get(0).header("X-Customer-Id")).isEqualTo("42");
+    }
+
+    @Test
+    void theCustomerIdIsForwardedOnAReservationTheCallerHasToOwn() throws Exception {
+        // The route where the id actually decides something. Booking seats
+        // against the wrong Customer is the whole harm, so it is asserted there
+        // rather than only on a browse.
+        mvc.perform(post("/api/v1/reservations")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"eventId\": 1, \"seatIds\": [1]}"))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(0).header("X-Customer-Id")).isEqualTo("42");
+    }
+
+    @Test
+    void anOrganizerIsForwardedNoCustomerIdBecauseTheyAreNotOne() throws Exception {
+        // The distinction the whole identity model turns on, end to end. The
+        // organizer authenticates and is forwarded, but there is no Customer id
+        // to give them, so the header is absent rather than carrying the
+        // organizer's own id dressed up as a Customer's.
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(ORGANIZER_ID, Role.ORGANIZER)))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(0).header("X-Customer-Id")).isNull();
+        assertThat(received.get(0).header("X-User-Roles")).isEqualTo("ORGANIZER");
+    }
+
+    @Test
+    void anOrganizersForgedCustomerIdIsStrippedEvenThoughTheyGetNoReplacement() throws Exception {
+        // The case that makes the strip unconditional. This caller is given no
+        // header, so a strip deferred to the code that sets one would leave the
+        // client's value standing — the organizer's token would then carry
+        // customer 42 into a service that trusts it.
+        mvc.perform(get("/api/v1/events")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(ORGANIZER_ID, Role.ORGANIZER))
+                        .header("X-Customer-Id", "42"))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(0).header("X-Customer-Id")).isNull();
+    }
+
+    @Test
+    void anOrganizerCannotReserveASeat() throws Exception {
+        // A Reservation belongs to a Customer, so there is nothing for the
+        // gateway to book this against. Refused here rather than at the service,
+        // which is one hop further and has no authentication of its own to
+        // refuse it with.
+        mvc.perform(post("/api/v1/reservations")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(ORGANIZER_ID, Role.ORGANIZER))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"eventId\": 1, \"seatIds\": [1]}"))
+                .andExpect(status().isForbidden());
+
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void anAdminCannotReserveASeatEither() throws Exception {
+        mvc.perform(post("/api/v1/reservations")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(ADMIN_ID, Role.ADMIN))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"eventId\": 1, \"seatIds\": [1]}"))
+                .andExpect(status().isForbidden());
+
+        assertThat(received).isEmpty();
+    }
+
+    // --- whose notifications, and who may read whose (ADR 011) -------------------
+
+    @Test
+    void aCustomersInboxRequestIsForwardedWithTheirVerifiedId() throws Exception {
+        // The gateway's half of identity-bound reads: it puts the caller's own id on
+        // the request, so the service never has to be told whose inbox to read and
+        // never has to believe a parameter (ADR 002, ADR 011).
+        mvc.perform(get("/api/v1/notifications").header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(0).header("X-Customer-Id")).isEqualTo("42");
+    }
+
+    @Test
+    void anOrganizerIsNotForwardedToAnyCustomersInbox() throws Exception {
+        // An organizer holds no CUSTOMER role, so it is refused here rather than
+        // forwarded to arrive with no id. The two agree — a caller with no id could
+        // not be given an inbox — and the gateway is the one that says so first.
+        mvc.perform(get("/api/v1/notifications").header(HttpHeaders.AUTHORIZATION, bearerFor(ORGANIZER_ID, Role.ORGANIZER)))
+                .andExpect(status().isForbidden());
+
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void aCustomerCannotReadAnInboxThroughTheOperatorRoute() throws Exception {
+        // The whole reason the operator's read is a separate path rather than a flag
+        // on this one: nothing about the self-service route changes to widen it.
+        mvc.perform(get("/api/v1/admin/customers/" + CUSTOMER_ID + "/notifications")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)))
+                .andExpect(status().isForbidden());
+
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void anOrganizerCannotReadAnInboxThroughTheOperatorRouteEither() throws Exception {
+        mvc.perform(get("/api/v1/admin/customers/" + CUSTOMER_ID + "/notifications")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(ORGANIZER_ID, Role.ORGANIZER)))
+                .andExpect(status().isForbidden());
+
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void anAdminMayReadAnyCustomersInboxThroughTheOperatorRoute() throws Exception {
+        // The deliberate capability from ADR 011, and the only role that has it.
+        mvc.perform(get("/api/v1/admin/customers/" + CUSTOMER_ID + "/notifications")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(ADMIN_ID, Role.ADMIN)))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(0).path())
+                .isEqualTo("/api/v1/admin/customers/42/notifications");
+        // The admin is not a Customer, so no X-Customer-Id rides along: the route's
+        // scope is the path, and a header implying otherwise would be a second,
+        // contradictory statement about who the request is for.
+        assertThat(received.get(0).header("X-Customer-Id")).isNull();
+    }
+
+    @Test
+    void anAdminReadingAnotherCustomersInboxCannotForgeTheHeader() throws Exception {
+        mvc.perform(get("/api/v1/admin/customers/" + CUSTOMER_ID + "/notifications")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(ADMIN_ID, Role.ADMIN))
+                        .header("X-Customer-Id", "999"))
+                .andExpect(status().isOk());
+
+        // Stripped even though this caller is never given one. The strip is not inside
+        // the branch that sets the header, so a value the client sent cannot survive
+        // on any authenticated request.
+        assertThat(received.get(0).header("X-Customer-Id")).isNull();
+    }
+
+    @Test
+    void theAdminPrefixIsGatedWholesaleRatherThanPerRoute() throws Exception {
+        // ADMIN's reach is decided by the prefix, so a path under it that no service
+        // serves is still refused to a Customer — which is the property that makes it
+        // safe to add an operator route later without re-deciding the boundary.
+        mvc.perform(get("/api/v1/admin/anything-at-all")
+                .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)))
+                .andExpect(status().isForbidden());
+
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void aCustomerIdForgedByTheClientIsReplacedByTheOnesInTheToken() throws Exception {
+        // The bypass, end to end. A valid token for customer 42 plus a header
+        // naming 999 is a request to book someone else's seats, and the service
+        // that would act on it has no authentication of its own to notice.
+        mvc.perform(get("/api/v1/events")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                        .header("X-Customer-Id", "999"))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(0).header("X-Customer-Id")).isEqualTo("42");
+    }
+
+    @Test
+    void aForgedCustomerIdIsNotAppendedToTheRealOne() throws Exception {
+        // "42,999" or "999,42" — a downstream reading only the first value would
+        // believe whichever half it read.
+        mvc.perform(get("/api/v1/events")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                        .header("X-Customer-Id", "999", "1"))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(0).header("X-Customer-Id")).isEqualTo("42");
+    }
+
+    @Test
+    void anUnauthenticatedRequestPropagatesNoCustomerIdentity() throws Exception {
+        // No token, no identity: the header must not be the one thing a request
+        // gets through without one.
+        mvc.perform(get("/api/v1/events").header("X-Customer-Id", "999"))
+                .andExpect(status().isUnauthorized());
+
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void aTokenWhoseSubjectIsNotACustomerIdIsRefusedAndPropagatesNothing() throws Exception {
+        // Signed with the real key, so the signature check has nothing to say
+        // about it: what refuses it is a subject that is not a Customer id
+        // (ADR 002). Guessing an id out of the string is what must not happen.
+        mvc.perform(get("/api/v1/events")
+                        .header(HttpHeaders.AUTHORIZATION, bearerWithSubject("customer"))
+                        .header("X-Customer-Id", "999"))
+                .andExpect(status().isUnauthorized());
+
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void aTokenFromTheLoginRouteSpeaksForTheCustomersIdAndNotTheUsername() throws Exception {
+        // The two halves in sequence, because they are useless apart: the token
+        // the login surface mints has to carry the id, or nothing downstream can
+        // know who the caller is. The caller types "customer" and the request
+        // goes out as 42.
+        String token = logInAs("customer", CUSTOMER_PASSWORD);
+
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(0).header("X-Customer-Id")).isEqualTo("42");
+        assertThat(received.get(0).header("X-User-Roles")).isEqualTo("CUSTOMER");
+    }
+
     @Test
     void aCorrelationIdIsGeneratedWhenTheCallerSuppliesNone() throws Exception {
-        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER)))
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)))
                 .andExpect(status().isOk());
 
         // Generated, not absent: a request with no id cannot be followed through
@@ -173,7 +435,7 @@ class GatewayProxyBootTests {
     @Test
     void aCorrelationIdTheCallerSuppliesIsForwardedRatherThanReplaced() throws Exception {
         mvc.perform(get("/api/v1/events")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
                         .header("X-Correlation-Id", "trace-me-123"))
                 .andExpect(status().isOk())
                 .andExpect(header().string("X-Correlation-Id", "trace-me-123"));
@@ -184,7 +446,7 @@ class GatewayProxyBootTests {
     @Test
     void aRefusedRequestNeverReachesTheService() throws Exception {
         mvc.perform(post("/api/v1/events")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
                 .andExpect(status().isForbidden());
@@ -205,7 +467,7 @@ class GatewayProxyBootTests {
     void theLoginRouteIsNotProxiedAndDoesNotNeedAToken() throws Exception {
         mvc.perform(post("/auth/login")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"username\": \"customer\", \"password\": \"customer\"}"))
+                        .content("{\"username\": \"customer\", \"password\": \"%s\"}".formatted(CUSTOMER_PASSWORD)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.token").isNotEmpty())
                 .andExpect(jsonPath("$.roles[0]").value("CUSTOMER"));
@@ -214,18 +476,20 @@ class GatewayProxyBootTests {
     }
 
     @Test
+    void anArbitraryPathUnderAuthIsNotPublicJustBecauseLoginIs() throws Exception {
+        // The regression for a public "/auth/**": anything added under /auth
+        // would have been reachable with no token at all, and the next routes
+        // there are a refresh and a password reset.
+        mvc.perform(get("/auth/foo")).andExpect(status().isUnauthorized());
+        assertThat(received).isEmpty();
+    }
+
+    @Test
     void aTokenFromTheLoginRouteIsAcceptedOnTheNextRequest() throws Exception {
         // The two halves in sequence, because they are useless apart: a token
         // that cannot be obtained and one that cannot be used are the same
         // failure from a caller's side.
-        String loginBody = mvc.perform(post("/auth/login")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"username\": \"organizer\", \"password\": \"organizer\"}"))
-                .andExpect(status().isOk())
-                .andReturn()
-                .getResponse()
-                .getContentAsString();
-        String token = new ObjectMapper().readTree(loginBody).get("token").asText();
+        String token = logInAs("organizer", ORGANIZER_PASSWORD);
 
         mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
                 .andExpect(status().isOk());
@@ -236,7 +500,7 @@ class GatewayProxyBootTests {
     @Test
     void theReservationRouteIsProxiedToo() throws Exception {
         mvc.perform(post("/api/v1/reservations")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
                 .andExpect(status().isOk());
@@ -250,7 +514,7 @@ class GatewayProxyBootTests {
         // Nothing is listening for the payments route, so what matters is only
         // that it did not arrive here. Asserting a status would be asserting on
         // what an unreachable host happens to do.
-        mvc.perform(get("/api/v1/payments/1").header(HttpHeaders.AUTHORIZATION, bearerFor(Role.CUSTOMER)));
+        mvc.perform(get("/api/v1/payments/1").header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)));
 
         assertThat(received).isEmpty();
     }
@@ -266,23 +530,106 @@ class GatewayProxyBootTests {
     void aManagementEndpointIsAnsweredForAnAdmin() throws Exception {
         // /actuator is a container route the proxy never sees, so only a full
         // context can show that the filter runs ahead of it.
-        mvc.perform(get("/actuator/health").header(HttpHeaders.AUTHORIZATION, bearerFor(Role.ADMIN)))
+        mvc.perform(get("/actuator/health").header(HttpHeaders.AUTHORIZATION, bearerFor(ADMIN_ID, Role.ADMIN)))
                 .andExpect(status().isOk());
 
         // And not to an organizer, who has every reason to want a service's
         // internals and no business reading them.
-        mvc.perform(get("/actuator/health").header(HttpHeaders.AUTHORIZATION, bearerFor(Role.ORGANIZER)))
+        mvc.perform(get("/actuator/health").header(HttpHeaders.AUTHORIZATION, bearerFor(ORGANIZER_ID, Role.ORGANIZER)))
                 .andExpect(status().isForbidden());
     }
+
+    // --- CORS: the browser's two-step, and where the boundary is ---------------
 
     @Test
     void aPreflightFromAnAllowedOriginIsAnsweredWithoutAToken() throws Exception {
         // A browser sends this before it has a token, and never sends one with
         // it; a 401 here would look to a client like a broken CORS setup.
-        mvc.perform(options("/api/v1/events").header(HttpHeaders.ORIGIN, "http://localhost:3000")
+        mvc.perform(options("/api/v1/events").header(HttpHeaders.ORIGIN, ALLOWED_ORIGIN)
                         .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "POST"))
                 .andExpect(status().is2xxSuccessful())
-                .andExpect(header().string(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, "http://localhost:3000"));
+                .andExpect(header().string(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, ALLOWED_ORIGIN));
+    }
+
+    @Test
+    void aPreflightFromADisallowedOriginIsNotGrantedTheAllowedOrigin() throws Exception {
+        // The other side of the same boundary. Answering a preflight is not
+        // itself a disclosure, but reflecting an arbitrary origin back with
+        // allow-credentials is a browser asking "may I read this customer's
+        // data", and the answer has to be no.
+        int status = mvc.perform(options("/api/v1/events").header(HttpHeaders.ORIGIN, "http://attacker.example")
+                        .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "POST"))
+                .andExpect(header().doesNotExist(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN))
+                .andReturn()
+                .getResponse()
+                .getStatus();
+
+        // Not "is it 403": that is Spring's choice of refusal. The property is
+        // that a disallowed origin is not told it may read the response.
+        assertThat(status).isNotIn(IntStream.rangeClosed(200, 299).boxed().toList());
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void aPreflightDoesNotCarryAnyOfTheProtectedEndpointsData() throws Exception {
+        // The exemption is for the browser's handshake, not for reading the
+        // route. The response is the CORS headers and nothing else, and the
+        // service behind the route is never asked.
+        String body = mvc.perform(options("/api/v1/reservations").header(HttpHeaders.ORIGIN, ALLOWED_ORIGIN)
+                        .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "POST"))
+                .andExpect(status().is2xxSuccessful())
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+
+        assertThat(body).isEmpty();
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void aPreflightIsNotAskedToAuthenticateAndAnOrdinaryRequestStillIs() throws Exception {
+        // The pair that keeps the exemption honest: the same origin, the same
+        // path, and the preflight is answered while the real request is not. A
+        // CORS fix that had quietly widened the public rule would pass the first
+        // and fail this.
+        mvc.perform(options("/api/v1/events").header(HttpHeaders.ORIGIN, ALLOWED_ORIGIN)
+                        .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "POST"))
+                .andExpect(status().is2xxSuccessful());
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.ORIGIN, ALLOWED_ORIGIN))
+                .andExpect(status().isUnauthorized());
+
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void anOrdinaryRequestFromADisallowedOriginIsNotGrantedThatOrigin() throws Exception {
+        // CORS decides what a browser may read, not who the caller is, so it
+        // never produces a grant for an origin the deployment did not list. What
+        // it does with the request itself is Spring's business and not this
+        // gateway's; the property asserted here is the missing header.
+        mvc.perform(get("/api/v1/events")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                        .header(HttpHeaders.ORIGIN, "http://attacker.example"))
+                .andExpect(header().doesNotExist(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN));
+    }
+
+    @Test
+    void anOrdinaryRequestFromADisallowedOriginStillNeedsAToken() throws Exception {
+        // The filter runs ahead of the CORS machinery, so a disallowed origin
+        // is not a way to skip authentication — and an unauthenticated request
+        // never reaches the service, from anywhere.
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.ORIGIN, "http://attacker.example"))
+                .andExpect(status().isUnauthorized());
+
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void aNormalRequestFromAnAllowedOriginStillNeedsAToken() throws Exception {
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.ORIGIN, ALLOWED_ORIGIN))
+                .andExpect(status().isUnauthorized());
+
+        assertThat(received).isEmpty();
     }
 
     // --- the stand-in service -------------------------------------------------
@@ -321,7 +668,42 @@ class GatewayProxyBootTests {
         }
     }
 
-    private String bearerFor(Role role) {
-        return "Bearer " + tokens.issue(role.name().toLowerCase(Locale.ROOT), Set.of(role)).token();
+    private String logInAs(String username, String password) throws Exception {
+        return new ObjectMapper()
+                .readTree(mvc.perform(post("/auth/login")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{\"username\": \"%s\", \"password\": \"%s\"}".formatted(username, password)))
+                        .andExpect(status().isOk())
+                        .andReturn()
+                        .getResponse()
+                        .getContentAsString())
+                .get("token")
+                .asText();
+    }
+
+    private String bearerFor(long customerId, Role... roles) {
+        return "Bearer " + tokens.issue(customerId, Set.of(roles)).token();
+    }
+
+    /**
+     * A correctly signed token carrying a subject {@link JwtService#issue} would
+     * never mint, so the subject check can be exercised over HTTP. Without this
+     * seam the only way to reach the shape would be to weaken the code it
+     * guards.
+     */
+    private static String bearerWithSubject(String subject) {
+        // Dated from the real clock, unlike the tokens minted by the bean: a
+        // fixed date would make this an expired token, and the request would be
+        // refused for the wrong reason — which is the failure mode a test like
+        // this is most prone to.
+        Instant now = Instant.now();
+        SecretKey key = Keys.hmacShaKeyFor(SIGNING_KEY.getBytes(StandardCharsets.UTF_8));
+        return "Bearer " + Jwts.builder()
+                .subject(subject)
+                .claim(JwtService.ROLES_CLAIM, Role.namesOf(Set.of(Role.CUSTOMER)))
+                .issuedAt(Date.from(now))
+                .expiration(Date.from(now.plus(TTL)))
+                .signWith(key)
+                .compact();
     }
 }

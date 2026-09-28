@@ -135,7 +135,20 @@ services:
       PAYMENT_SERVICE_URL: http://payment-service:8080
       NOTIFICATION_SERVICE_URL: http://notification-service:8080
       CORS_ALLOWED_ORIGINS: http://localhost:3000
-      JWT_SECRET: change-me-in-a-real-deployment-this-is-a-demo-secret
+      # No signing key and no demo passwords are committed. A default here would
+      # be a credential in version control that passes the gateway's own
+      # length check and signs every token in a deployment that never chose one
+      # (ADR 002). `:?` makes Compose stop with the variable's name rather than
+      # substituting an empty string and leaving the gateway to fail later.
+      #
+      #   cp .env.example .env    # then fill in the four values
+      #
+      # The gateway still enforces its own minimum length on JWT_SECRET, so a
+      # too-short value fails at startup with a message that says why.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is not set - copy .env.example to .env and generate one with 'openssl rand -base64 48'}
+      DEMO_CUSTOMER_PASSWORD: ${DEMO_CUSTOMER_PASSWORD:?DEMO_CUSTOMER_PASSWORD is not set - copy .env.example to .env and fill it in}
+      DEMO_ORGANIZER_PASSWORD: ${DEMO_ORGANIZER_PASSWORD:?DEMO_ORGANIZER_PASSWORD is not set - copy .env.example to .env and fill it in}
+      DEMO_ADMIN_PASSWORD: ${DEMO_ADMIN_PASSWORD:?DEMO_ADMIN_PASSWORD is not set - copy .env.example to .env and fill it in}
     ports:
       - "8080:8080"
     depends_on:

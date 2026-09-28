@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.raydans.common.event.EventEnvelope;
 import com.raydans.common.web.CorrelationIdFilter;
 import com.raydans.notificationservice.notification.NotificationService;
+import com.raydans.notificationservice.web.NotificationController;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.sql.Timestamp;
@@ -19,6 +20,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.net.URI;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -37,6 +39,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -69,6 +74,26 @@ class NotificationFlowBootTests {
     static final String CONFIRMED = "reservation.ReservationConfirmed";
     static final String CANCELLED = "reservation.ReservationCancelled";
     static final String EXPIRED = "reservation.ReservationExpired";
+
+    /** The header the gateway writes the verified caller id into, and this read is scoped by. */
+    static final String CUSTOMER_ID = NotificationController.CUSTOMER_HEADER;
+
+    /**
+     * The self-service read, as the gateway makes it: the verified id in the header
+     * and nothing else on the request to steer it.
+     *
+     * <p>Sent as a real header rather than as a URI variable. {@code getForEntity}'s
+     * trailing varargs are template variables, and handing one to a URL with no
+     * {@code {}} placeholder expands nothing and sends nothing — which fails as a
+     * 400 on every call, the same answer a genuinely missing header gives, so it is
+     * worth being explicit about which one a test is exercising.
+     */
+    private ResponseEntity<Map> readInboxAs(long customerId, String query) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(CUSTOMER_ID, Long.toString(customerId));
+        return rest.exchange(
+                URI.create("/api/v1/notifications" + query), HttpMethod.GET, new HttpEntity<>(headers), Map.class);
+    }
 
     @Container
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine")
@@ -176,7 +201,7 @@ class NotificationFlowBootTests {
         awaitNotificationCount(otherCustomerId, 1);
 
         ResponseEntity<Map> listed =
-                rest.getForEntity("/api/v1/notifications?customerId=" + customerId, Map.class);
+                readInboxAs(customerId, "");
         assertThat(listed.getStatusCode()).isEqualTo(HttpStatus.OK);
         List<Map<String, Object>> rows = itemsOf(listed.getBody());
         assertThat(rows).hasSize(3);
@@ -387,7 +412,7 @@ class NotificationFlowBootTests {
     @Test
     void aNonPositiveCustomerIdIsRejectedWith400RatherThanQueryingForNobody() {
         ResponseEntity<Map> response =
-                rest.getForEntity("/api/v1/notifications?customerId=0", Map.class);
+                readInboxAs(0L, "");
 
         // Also proves the constraint violation is not swallowed by the catch-all advice,
         // which would turn a bad request into a 500.
@@ -399,7 +424,7 @@ class NotificationFlowBootTests {
     @Test
     void aCustomerWithNothingRecordedGetsAnEmptyPage() {
         ResponseEntity<Map> response =
-                rest.getForEntity("/api/v1/notifications?customerId=997", Map.class);
+                readInboxAs(997L, "");
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(itemsOf(response.getBody())).isEmpty();
@@ -519,8 +544,7 @@ class NotificationFlowBootTests {
         awaitNotificationCount(customerId, 1);
 
         // Over the max, the response is still a success -- the ask is bounded, not refused.
-        ResponseEntity<Map> response = rest.getForEntity(
-                "/api/v1/notifications?customerId=" + customerId + "&limit=100000", Map.class);
+        ResponseEntity<Map> response = readInboxAs(customerId, "?limit=100000");
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(itemsOf(response.getBody())).hasSize(1);
@@ -528,18 +552,155 @@ class NotificationFlowBootTests {
 
     @Test
     void anUnreadableCursorIs400() throws Exception {
-        ResponseEntity<Map> response = rest.getForEntity(
-                "/api/v1/notifications?customerId=907&cursor=not-a-cursor", Map.class);
+        ResponseEntity<Map> response = readInboxAs(907L, "?cursor=not-a-cursor");
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat((String) response.getBody().get("message")).contains("cursor");
     }
 
+    // --- whose inbox is this, over the wire -------------------------------------
+
+    /**
+     * Two Customers with real, distinct rows in the database, read back through the
+     * only route a Customer has. Everything above this asserts an inbox's shape; this
+     * asserts the thing that makes an inbox private.
+     */
+    @Test
+    void aCustomersInboxContainsOnlyTheirOwnNotifications() throws Exception {
+        long one = 8001L;
+        long two = 8002L;
+        produce(CONFIRMED, UUID.randomUUID(), 85001L, one, List.of(10L), 20000);
+        produce(CONFIRMED, UUID.randomUUID(), 85002L, one, List.of(11L), 20000);
+        produce(CONFIRMED, UUID.randomUUID(), 85003L, two, List.of(12L), 20000);
+        awaitNotificationCount(one, 2);
+        awaitNotificationCount(two, 1);
+
+        // Both rows exist before either read, so a missing one is isolation rather
+        // than a race against the consumer.
+        List<Map<String, Object>> firstInbox = itemsOf(page(one, 50, null));
+        assertThat(firstInbox)
+                .hasSize(2)
+                .allSatisfy(row -> assertThat(longValue(row, "recipientCustomerId")).isEqualTo(one));
+        List<Map<String, Object>> secondInbox = itemsOf(page(two, 50, null));
+        assertThat(secondInbox)
+                .hasSize(1)
+                .allSatisfy(row -> assertThat(longValue(row, "recipientCustomerId")).isEqualTo(two));
+    }
+
+    @Test
+    void aCustomerAskingForAnotherCustomersInboxByParameterIsRefused() throws Exception {
+        long mine = 8003L;
+        long theirs = 8004L;
+        produce(CONFIRMED, UUID.randomUUID(), 85041L, theirs, List.of(10L), 20000);
+        awaitNotificationCount(theirs, 1);
+
+        // The bypass this route used to have, and the one the header closes: the id
+        // that arrives is the caller's own, so the parameter cannot redirect the read.
+        ResponseEntity<Map> response = readInboxAs(mine, "?customerId=" + theirs);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat((String) response.getBody().get("message"))
+                .contains(String.valueOf(theirs))
+                .contains(String.valueOf(mine));
+        // Refused before the query, so their row was never read — not returned empty
+        // after being fetched, which would be the same leak wearing a smaller hat.
+        assertThat(response.getBody()).doesNotContainKey("items");
+    }
+
+    @Test
+    void aReadWithNoIdentityHeaderIsRefusedRatherThanGuessedAt() throws Exception {
+        long someone = 8005L;
+        produce(CONFIRMED, UUID.randomUUID(), 85051L, someone, List.of(10L), 20000);
+        awaitNotificationCount(someone, 1);
+
+        // The direct-service case: anything that did not come through the gateway, on
+        // the compose network or a host-local debugger, has no header and so cannot
+        // read anything. Not 500 either — a missing proof of identity is the caller's
+        // to fix (ADR 011).
+        ResponseEntity<Map> response =
+                rest.getForEntity("/api/v1/notifications?customerId=" + someone, Map.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat((String) response.getBody().get("message")).contains(CUSTOMER_ID);
+    }
+
+    @Test
+    void theOperatorRouteReadsACustomerTheOperatorIsNot() throws Exception {
+        long subject = 8006L;
+        long other = 8007L;
+        produce(CONFIRMED, UUID.randomUUID(), 85061L, subject, List.of(10L), 20000);
+        produce(CONFIRMED, UUID.randomUUID(), 85062L, subject, List.of(11L), 20000);
+        produce(CONFIRMED, UUID.randomUUID(), 85063L, other, List.of(12L), 20000);
+        awaitNotificationCount(subject, 2);
+        awaitNotificationCount(other, 1);
+
+        // The deliberate capability from ADR 011. Asserted with rows in the database so
+        // it is a real read of someone else's inbox, and with the other Customer's row
+        // present so a route that ignored the path variable would be caught.
+        ResponseEntity<Map> response = rest.getForEntity(
+                "/api/v1/admin/customers/" + subject + "/notifications", Map.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        List<Map<String, Object>> subjectInbox = itemsOf(response.getBody());
+        assertThat(subjectInbox)
+                .hasSize(2)
+                .allSatisfy(row -> assertThat(longValue(row, "recipientCustomerId")).isEqualTo(subject));
+    }
+
+    @Test
+    void theOperatorRouteStillPagesAndClampsLikeTheSelfServiceOne() throws Exception {
+        long subject = 8008L;
+        for (int i = 1; i <= 3; i++) {
+            produce(CONFIRMED, UUID.randomUUID(), 85080L + i, subject, List.of((long) i), 20000);
+        }
+        awaitNotificationCount(subject, 3);
+
+        // The operator read and the self-service read are the same query, so an
+        // operator paging with limit and cursor gets the same contract rather than a
+        // second implementation that drifts.
+        ResponseEntity<Map> first = rest.getForEntity(
+                "/api/v1/admin/customers/" + subject + "/notifications?limit=2", Map.class);
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(itemsOf(first.getBody())).hasSize(2);
+
+        String cursor = nextCursorOf(first.getBody());
+        assertThat(cursor).as("two of three is not the last page").isNotNull();
+
+        ResponseEntity<Map> second = rest.getForEntity(
+                "/api/v1/admin/customers/" + subject + "/notifications?limit=2&cursor=" + cursor, Map.class);
+        assertThat(second.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(itemsOf(second.getBody())).hasSize(1);
+        assertThat(nextCursorOf(second.getBody())).isNull();
+    }
+
+    @Test
+    void aCursorFromOneCustomersInboxPagesAnEmptyOneForAnother() throws Exception {
+        // The isolation property for paging, which is a different code path from the
+        // first page: a cursor is a position, and this is what stops a position issued
+        // for one Customer from being replayed against another's read.
+        long mine = 8009L;
+        long theirs = 8010L;
+        for (int i = 1; i <= 3; i++) {
+            produce(CONFIRMED, UUID.randomUUID(), 85090L + i, mine, List.of((long) i), 20000);
+            produce(CONFIRMED, UUID.randomUUID(), 85100L + i, theirs, List.of((long) 10 + i), 20000);
+        }
+        awaitNotificationCount(mine, 3);
+        awaitNotificationCount(theirs, 3);
+
+        String stolenCursor = nextCursorOf(page(mine, 2, null));
+        assertThat(stolenCursor).isNotNull();
+
+        Map<String, Object> replayed = readInboxAs(theirs, "?limit=2&cursor=" + stolenCursor).getBody();
+        List<Map<String, Object>> replayedItems = itemsOf(replayed);
+        assertThat(replayedItems)
+                .as("a position from another Customer's inbox resolves to nothing of theirs")
+                .allSatisfy(row -> assertThat(longValue(row, "recipientCustomerId")).isEqualTo(theirs));
+    }
+
     /** One page over real HTTP, read the way a client reads it. */
     private Map<String, Object> page(long customerId, int limit, String cursor) {
-        String url = "/api/v1/notifications?customerId=" + customerId + "&limit=" + limit
-                + (cursor == null ? "" : "&cursor=" + cursor);
-        ResponseEntity<Map> response = rest.getForEntity(url, Map.class);
+        String query = "?limit=" + limit + (cursor == null ? "" : "&cursor=" + cursor);
+        ResponseEntity<Map> response = readInboxAs(customerId, query);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody()).as("a page body").isNotNull();
         return response.getBody();

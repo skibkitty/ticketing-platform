@@ -14,9 +14,10 @@ import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.web.servlet.function.ServerRequest;
 
 /**
- * What the downstream services are told about the caller.
+ * What the downstream services are told about the caller's roles.
  *
- * <p>This is the trust boundary in isolation (ADR 002). Every service in the
+ * <p>This is half the trust boundary in isolation (ADR 002); the other half,
+ * the Customer id, is {@code CustomerIdHeaderFilterTest}. Every service in the
  * platform authorizes on the header this class writes and has no authentication
  * of its own, so the tests here are about the one property that must hold no
  * matter what arrives from outside: what a service reads is what the gateway
@@ -28,7 +29,7 @@ class UserRolesHeaderFilterTest {
 
     @Test
     void anAuthenticatedCallersRolesAreForwarded() {
-        HttpHeaders forwarded = apply(inbound(), requestAuthenticatedAs("customer", Role.CUSTOMER));
+        HttpHeaders forwarded = apply(inbound(), requestAuthenticatedAs(42L, Role.CUSTOMER));
 
         assertThat(forwarded.getFirst(UserRolesHeaderFilter.HEADER_NAME)).isEqualTo("CUSTOMER");
     }
@@ -36,7 +37,7 @@ class UserRolesHeaderFilterTest {
     @Test
     void severalRolesAreForwardedTogether() {
         HttpHeaders forwarded = apply(
-                inbound(), requestAuthenticatedAs("root", Role.CUSTOMER, Role.ORGANIZER, Role.ADMIN));
+                inbound(), requestAuthenticatedAs(45L, Role.CUSTOMER, Role.ORGANIZER, Role.ADMIN));
 
         // Comma-separated in a stable order, so a downstream that compares the
         // header as a string sees the same value for the same token every time.
@@ -51,7 +52,7 @@ class UserRolesHeaderFilterTest {
         // wearing one would be acting as anyone, with no token at all.
         HttpHeaders forwarded = apply(
                 inbound(UserRolesHeaderFilter.HEADER_NAME, "ADMIN"),
-                requestAuthenticatedAs("customer", Role.CUSTOMER));
+                requestAuthenticatedAs(42L, Role.CUSTOMER));
 
         assertThat(forwarded.get(UserRolesHeaderFilter.HEADER_NAME)).containsExactly("CUSTOMER");
     }
@@ -63,7 +64,7 @@ class UserRolesHeaderFilterTest {
         // would believe.
         HttpHeaders forwarded = apply(
                 inbound(UserRolesHeaderFilter.HEADER_NAME, "ADMIN"),
-                requestAuthenticatedAs("organizer", Role.ORGANIZER));
+                requestAuthenticatedAs(43L, Role.ORGANIZER));
 
         assertThat(forwarded.get(UserRolesHeaderFilter.HEADER_NAME)).containsExactly("ORGANIZER");
     }
@@ -93,19 +94,20 @@ class UserRolesHeaderFilterTest {
         // A token that is valid but carries nothing: the request is
         // authenticated and permitted to proceed, and the downstream learns
         // there is no role to act on rather than learning nothing happened.
-        HttpHeaders forwarded = apply(inbound(), requestAuthenticatedAs("ghost"));
+        HttpHeaders forwarded = apply(inbound(), requestAuthenticatedAs(46L));
 
         assertThat(forwarded.containsKey(UserRolesHeaderFilter.HEADER_NAME)).isFalse();
     }
 
     @Test
     void theOtherInboundHeadersAreLeftAlone() {
-        // This filter's job is the caller's identity and nothing else. A filter
-        // that rebuilt the whole header set would quietly drop content
-        // negotiation and tracing headers on their way downstream.
+        // This filter's job is the caller's roles and nothing else — the
+        // Customer id is CustomerIdHeaderFilter's. A filter that rebuilt the
+        // whole header set would quietly drop content negotiation and tracing
+        // headers on their way downstream.
         HttpHeaders inbound = inbound("Accept", "application/json", "X-Correlation-Id", "abc-123");
 
-        HttpHeaders forwarded = apply(inbound, requestAuthenticatedAs("customer", Role.CUSTOMER));
+        HttpHeaders forwarded = apply(inbound, requestAuthenticatedAs(42L, Role.CUSTOMER));
 
         assertThat(forwarded.getFirst("Accept")).isEqualTo("application/json");
         assertThat(forwarded.getFirst("X-Correlation-Id")).isEqualTo("abc-123");
@@ -129,9 +131,9 @@ class UserRolesHeaderFilterTest {
         return inbound(new String[0]);
     }
 
-    private static MockHttpServletRequest requestAuthenticatedAs(String username, Role... roles) {
+    private static MockHttpServletRequest requestAuthenticatedAs(long callerId, Role... roles) {
         MockHttpServletRequest request = new MockHttpServletRequest();
-        request.setAttribute(JwtAuthenticationFilter.CALLER_ATTRIBUTE, new AuthenticatedCaller(username, Set.of(roles)));
+        request.setAttribute(JwtAuthenticationFilter.CALLER_ATTRIBUTE, new AuthenticatedCaller(callerId, Set.of(roles)));
         return request;
     }
 }

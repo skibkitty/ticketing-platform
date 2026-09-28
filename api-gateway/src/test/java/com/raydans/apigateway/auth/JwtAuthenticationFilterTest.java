@@ -12,17 +12,22 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.raydans.apigateway.web.ErrorResponseWriter;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.Keys;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Date;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.crypto.SecretKey;
 import org.hamcrest.Matchers;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -102,7 +107,7 @@ class JwtAuthenticationFilterTest {
         // A valid token in the wrong scheme is not a valid token: accepting it
         // would make "did you send it correctly" indistinguishable from "were
         // you allowed to".
-        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, tokens.issue("admin", Set.of(Role.ADMIN)).token()))
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, tokens.issue(44L, Set.of(Role.ADMIN)).token()))
                 .andExpect(status().isUnauthorized());
     }
 
@@ -112,13 +117,13 @@ class JwtAuthenticationFilterTest {
                 new JwtProperties("a-different-secret-that-is-also-long-enough", TTL), Clock.fixed(NOW, ZoneOffset.UTC));
 
         mvc.perform(get("/api/v1/events")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(someoneElse.issue("admin", Set.of(Role.ADMIN)))))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(someoneElse.issue(44L, Set.of(Role.ADMIN)))))
                 .andExpect(status().isUnauthorized());
     }
 
     @Test
     void anExpiredTokenIsRefused() throws Exception {
-        String token = tokens.issue("admin", Set.of(Role.ADMIN)).token();
+        String token = tokens.issue(44L, Set.of(Role.ADMIN)).token();
         MockMvc afterExpiry = mvcUsing(new JwtService(
                 new JwtProperties(SECRET, TTL), Clock.fixed(NOW.plus(TTL).plusSeconds(1), ZoneOffset.UTC)));
 
@@ -141,7 +146,7 @@ class JwtAuthenticationFilterTest {
     @Test
     void aCustomerMayNotCreateAnEvent() throws Exception {
         mvc.perform(post("/api/v1/events")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue("customer", Set.of(Role.CUSTOMER))))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue(42L, Set.of(Role.CUSTOMER))))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
                 .andExpect(status().isForbidden())
@@ -154,7 +159,7 @@ class JwtAuthenticationFilterTest {
         // So a caller denied an action learns what to log in as, without having
         // to guess which of the three roles is the one that works.
         mvc.perform(post("/api/v1/events")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue("customer", Set.of(Role.CUSTOMER))))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue(42L, Set.of(Role.CUSTOMER))))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
                 .andExpect(jsonPath("$.message").value(Matchers.containsString("ORGANIZER")))
@@ -164,7 +169,7 @@ class JwtAuthenticationFilterTest {
     @Test
     void anOrganizerMayCreateAnEvent() throws Exception {
         mvc.perform(post("/api/v1/events")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue("organizer", Set.of(Role.ORGANIZER))))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue(43L, Set.of(Role.ORGANIZER))))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
                 .andExpect(status().isOk());
@@ -173,7 +178,7 @@ class JwtAuthenticationFilterTest {
     @Test
     void anAdminMayCreateAnEvent() throws Exception {
         mvc.perform(post("/api/v1/events")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue("admin", Set.of(Role.ADMIN))))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue(44L, Set.of(Role.ADMIN))))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
                 .andExpect(status().isOk());
@@ -184,21 +189,21 @@ class JwtAuthenticationFilterTest {
         // The failure mode a containsAny check would let through: an organizer
         // token is not an admin token.
         mvc.perform(get("/actuator/health")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue("organizer", Set.of(Role.ORGANIZER)))))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue(43L, Set.of(Role.ORGANIZER)))))
                 .andExpect(status().isForbidden());
     }
 
     @Test
     void aCustomerMayNotReachTheManagementEndpoints() throws Exception {
         mvc.perform(get("/actuator/health")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue("customer", Set.of(Role.CUSTOMER)))))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue(42L, Set.of(Role.CUSTOMER)))))
                 .andExpect(status().isForbidden());
     }
 
     @Test
     void anAdminMayReachTheManagementEndpoints() throws Exception {
         mvc.perform(get("/actuator/health")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue("admin", Set.of(Role.ADMIN)))))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue(44L, Set.of(Role.ADMIN)))))
                 .andExpect(status().isOk());
     }
 
@@ -212,20 +217,24 @@ class JwtAuthenticationFilterTest {
     // --- what an authorized caller gets --------------------------------------
 
     @Test
-    void anyAuthenticatedRoleMayHoldSeats() throws Exception {
+    void onlyACustomerMayHoldSeats() throws Exception {
+        // A Reservation belongs to a Customer (CONTEXT.md), and an organizer's
+        // token is not one — it is authenticated, which is why this is 403 and
+        // not 401. Asserted here as well as in RoleAuthorizerTest because the
+        // filter is what actually reads the table.
         mvc.perform(post("/api/v1/reservations")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue("organizer", Set.of(Role.ORGANIZER))))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue(43L, Set.of(Role.ORGANIZER))))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
-                .andExpect(status().isOk());
+                .andExpect(status().isForbidden());
     }
 
     @Test
     void anAuthorizedRequestReachesTheHandlerWithTheCallerOnIt() throws Exception {
         mvc.perform(get("/api/v1/events")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue("customer", Set.of(Role.CUSTOMER)))))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue(42L, Set.of(Role.CUSTOMER)))))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.username").value("customer"));
+                .andExpect(jsonPath("$.customerId").value(42));
     }
 
     @Test
@@ -233,7 +242,7 @@ class JwtAuthenticationFilterTest {
         mvc.perform(post("/api/v1/events")
                         .header(
                                 HttpHeaders.AUTHORIZATION,
-                                bearerFor(tokens.issue("root", Set.of(Role.CUSTOMER, Role.ORGANIZER))))
+                                bearerFor(tokens.issue(45L, Set.of(Role.CUSTOMER, Role.ORGANIZER))))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
                 .andExpect(status().isOk());
@@ -243,9 +252,36 @@ class JwtAuthenticationFilterTest {
 
     @Test
     void loginIsReachableWithoutAToken() throws Exception {
-        // 404 rather than 401 is the point: it proves the request got past the
-        // filter and on to routing, where it found no GET handler.
-        mvc.perform(get("/auth/login")).andExpect(status().isNotFound());
+        // POST, because that is the endpoint the rule names: the login surface
+        // is public per method, not per prefix. 404 rather than 401 is the
+        // point — it proves the request got past the filter and on to routing,
+        // where this standalone setup has no login handler.
+        mvc.perform(post("/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void anArbitraryPathUnderAuthIsNotReachableWithoutAToken() throws Exception {
+        // The regression for a public "/auth/**": an endpoint that does not
+        // exist there yet would have been public by default, and the next one
+        // written there — a token refresh, a password reset — would inherit that
+        // with nobody having decided it. 401 first, and only then the 404.
+        mvc.perform(get("/auth/foo")).andExpect(status().isUnauthorized());
+        mvc.perform(post("/auth/foo")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void anArbitraryPathUnderAuthIsStillReachableWithAToken() throws Exception {
+        // And the other half: narrowing the public rule must not make /auth
+        // unreachable, only authenticated. 404 rather than 401, because there is
+        // no such endpoint — the point is that the token was accepted.
+        mvc.perform(get("/auth/foo").header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue(42L, Set.of(Role.CUSTOMER)))))
+                .andExpect(status().isNotFound());
     }
 
     @Test
@@ -294,6 +330,19 @@ class JwtAuthenticationFilterTest {
     // --- the header the gateway must not take from a client -------------------
 
     @Test
+    void aTokenWhoseSubjectIsNotACustomerIdIsRefused() throws Exception {
+        // Signed with the real key, so the signature check has nothing to say.
+        // What refuses it is the subject (ADR 002): a token that does not say
+        // which Customer it is for must not be turned into one by guessing.
+        mvc.perform(get("/api/v1/events")
+                        .header(HttpHeaders.AUTHORIZATION, bearerWithSubject("customer")))
+                .andExpect(status().isUnauthorized());
+        mvc.perform(get("/api/v1/events")
+                        .header(HttpHeaders.AUTHORIZATION, bearerWithSubject("99999999999999999999999")))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
     void aClientSuppliedRoleHeaderDoesNotAuthenticateAnyone() throws Exception {
         // The trust boundary in one test: downstream services read X-User-Roles
         // and have no authentication of their own (ADR 002), so if a client could
@@ -306,7 +355,7 @@ class JwtAuthenticationFilterTest {
     @Test
     void aClientSuppliedRoleHeaderDoesNotLiftARoleRefusal() throws Exception {
         mvc.perform(post("/api/v1/events")
-                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue("customer", Set.of(Role.CUSTOMER))))
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue(42L, Set.of(Role.CUSTOMER))))
                         .header("X-User-Roles", "ADMIN")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
@@ -315,6 +364,23 @@ class JwtAuthenticationFilterTest {
 
     private static String bearerFor(IssuedToken token) {
         return "Bearer " + token.token();
+    }
+
+    /**
+     * A token signed with this gateway's real key and carrying a subject the
+     * gateway would never mint. {@link JwtService#issue} only speaks in
+     * Customer ids, so the shape under test is unreachable through it.
+     */
+    private String bearerWithSubject(String subject) {
+        SecretKey key = Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
+        Instant issuedAt = Instant.parse("2026-09-27T10:00:00Z");
+        return "Bearer " + Jwts.builder()
+                .subject(subject)
+                .claim(JwtService.ROLES_CLAIM, Role.namesOf(Set.of(Role.CUSTOMER)))
+                .issuedAt(Date.from(issuedAt))
+                .expiration(Date.from(issuedAt.plus(TTL)))
+                .signWith(key)
+                .compact();
     }
 
     /**
@@ -329,17 +395,17 @@ class JwtAuthenticationFilterTest {
 
         @GetMapping("/api/v1/events")
         Map<String, Object> listEvents(HttpServletRequest request) {
-            return Map.of("username", usernameOf(request), "ok", true);
+            return Map.of("customerId", customerIdOf(request), "ok", true);
         }
 
         @PostMapping("/api/v1/events")
         Map<String, Object> createEvent(HttpServletRequest request) {
-            return Map.of("username", usernameOf(request), "ok", true);
+            return Map.of("customerId", customerIdOf(request), "ok", true);
         }
 
         @PostMapping("/api/v1/reservations")
         Map<String, Object> createReservation(HttpServletRequest request) {
-            return Map.of("username", usernameOf(request), "ok", true);
+            return Map.of("customerId", customerIdOf(request), "ok", true);
         }
 
         @GetMapping("/actuator/health")
@@ -347,10 +413,11 @@ class JwtAuthenticationFilterTest {
             return Map.of("status", "UP");
         }
 
-        private static String usernameOf(HttpServletRequest request) {
+        /** The identity the gateway authenticated, which is the token subject (ADR 002). */
+        private static long customerIdOf(HttpServletRequest request) {
             return JwtAuthenticationFilter.callerOn(request)
-                    .map(AuthenticatedCaller::username)
-                    .orElse("nobody");
+                    .map(AuthenticatedCaller::callerId)
+                    .orElse(-1L);
         }
     }
 }

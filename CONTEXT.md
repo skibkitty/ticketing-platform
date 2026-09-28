@@ -39,8 +39,17 @@ The money movement for a Reservation — one per Reservation. States:
 
 **Customer**:
 The person a Reservation belongs to; referenced by identifier only, no
-profile data is stored.
+profile data is stored. A caller is a Customer when it holds the `CUSTOMER`
+role, and only then is its id a `Customer.id` — holding `ORGANIZER` or `ADMIN`
+is a capability, not a second kind of Customer, so an organizer's request
+carries no Customer identity.
 _Avoid_: user, account
+
+**Caller**:
+Whatever authenticated to the platform and holds roles — a Customer, an
+Event's organizer, or the platform operator. A caller has an id of its own,
+which is the token subject; for a Customer that id is its `Customer.id`, and
+for anything else it is only ever its own.
 
 **Notification**:
 The message a Customer is told about a Reservation reaching a terminal

@@ -70,7 +70,8 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
         String refusal = refuse(access, caller);
         if (refusal != null) {
-            log.info("Refused {} {} to {}: {}", request.getMethod(), pathOf(request), caller.username(), refusal);
+            log.info("Refused {} {} to caller {}: {}",
+                    request.getMethod(), pathOf(request), caller.callerId(), refusal);
             errors.write(request, response, HttpStatus.FORBIDDEN, refusal);
             return;
         }
