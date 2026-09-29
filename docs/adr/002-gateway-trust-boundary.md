@@ -86,6 +86,12 @@ it, so refusing the handshake would read to a client as a broken CORS setup
 rather than as a refusal. That is why `/api/**` and `/auth/**` — the routes a
 browser application actually calls — are exempt.
 
+Whether a route is browser-facing is a column of the same rule table that
+decides what a request requires, and a required argument of each row rather
+than a default. One table answers both questions, so a route cannot be added to
+one and forgotten in the other, and `RoleAuthorizerTest` checks every row against
+the policy so that an undeclared route fails the build instead of shipping.
+
 It is scoped to those routes rather than to the HTTP method, and the
 management endpoints are deliberately not on it. Keyed on the method, the
 exemption would make "/actuator/** is the operator's" true of every method but
@@ -97,8 +103,8 @@ want of a token. Nothing legitimate is put outside by that: no browser
 application calls the management endpoints, which are read by monitoring and by
 an operator directly. Both layers agree, which is what makes the invariant hold
 end to end — the filter declines to exempt the route, and the shared CORS mapping
-does not cover the actuator's handler mapping either, so Spring refuses the
-handshake even for a caller holding a valid ADMIN token.
+does not cover the actuator's handler mapping either, so a cross-origin
+management preflight is never answered, whatever token it carries.
 
 **Consequences:** One place to audit and rotate keys; downstream services
 carry no security dependency. A caller can no longer reserve seats in

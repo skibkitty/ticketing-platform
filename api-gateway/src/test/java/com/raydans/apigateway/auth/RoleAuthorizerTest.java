@@ -7,6 +7,7 @@ import com.raydans.apigateway.auth.RoleAuthorizer.Access;
 import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
+import org.springframework.web.util.pattern.PathPattern;
 
 /**
  * The authorization table, read as a table.
@@ -21,6 +22,21 @@ import org.junit.jupiter.api.Test;
 class RoleAuthorizerTest {
 
     private final RoleAuthorizer authorizer = new RoleAuthorizer();
+
+    /**
+     * The policy the table is checked against, not a second copy of it: the
+     * browser-facing surface is /api and /auth. A row that disagrees is a row
+     * whose preflight behaviour nobody decided, so it fails rather than ships.
+     */
+    private static final Set<String> BROWSER_FACING_PREFIXES = Set.of("/api/", "/auth/");
+
+    /** @return whether {@code pattern} lies under one of the browser-facing prefixes */
+    private static boolean browserCalls(String pattern) {
+        String directory = pattern.endsWith("/**")
+                ? pattern.substring(0, pattern.length() - "/**".length()) + "/"
+                : pattern + "/";
+        return BROWSER_FACING_PREFIXES.stream().anyMatch(directory::startsWith);
+    }
 
     @Test
     void loginIsTheOnlyRouteThatNeedsNoToken() {
@@ -105,10 +121,9 @@ class RoleAuthorizerTest {
 
     @Test
     void theBrowserSurfaceIsWhereAPreflightIsAnsweredWithoutAToken() {
-        // The two halves of the preflight exemption, and they are the routes a
-        // browser application actually calls: it signs in over /auth and then
-        // talks to /api. Answering a preflight there without a token is not a
-        // hole, it is what makes CORS work — the browser has no token yet.
+        // The routes a browser application actually calls: it signs in over /auth
+        // and then talks to /api. Answering a preflight there without a token is
+        // what makes CORS work — the browser has no token yet.
         assertThat(authorizer.isPreflightExempt("/auth/login")).isTrue();
         assertThat(authorizer.isPreflightExempt("/api/v1/events")).isTrue();
         assertThat(authorizer.isPreflightExempt("/api/v1/admin/customers/42/notifications")).isTrue();
@@ -116,11 +131,10 @@ class RoleAuthorizerTest {
 
     @Test
     void theManagementEndpointsAreNotPartOfTheBrowserSurface() {
-        // The invariant this is here to hold: a preflight to /actuator/** goes
-        // through the ordinary authorization path, so "/actuator/** is ADMIN's"
-        // is a statement about the route rather than about the route for every
-        // verb but OPTIONS. No browser runs against the management endpoints, so
-        // nothing legitimate is put outside by refusing the handshake.
+        // A preflight to /actuator/** takes the ordinary authorization path, so
+        // "/actuator/** is ADMIN's" is a statement about the route rather than
+        // about the route for every verb but OPTIONS. No browser runs against
+        // the management endpoints.
         assertThat(authorizer.isPreflightExempt("/actuator/health")).isFalse();
         assertThat(authorizer.isPreflightExempt("/actuator/env")).isFalse();
         // "/actuator" alone would pass a startsWith check; the pattern must not.
@@ -131,11 +145,50 @@ class RoleAuthorizerTest {
     void aPreflightExemptionIsNotAPathPrefixMistake() {
         // A path that merely starts with a browser-facing one is not on the
         // browser surface: "/api-internal/..." is a different resource, and
-        // nothing has said a browser calls it. "/actuator" alone and a
-        // management subpath are both excluded for the same reason — a
-        // startsWith check would have included the first and missed the second.
+        // nothing has said a browser calls it.
         assertThat(authorizer.isPreflightExempt("/api-internal/metrics")).isFalse();
         assertThat(authorizer.isPreflightExempt("/authentic/health")).isFalse();
+    }
+
+    @Test
+    void everyRowSaysWhetherABrowserCallsIt() {
+        // The drift guard. Authorization and preflight are read off one table, so
+        // a new row has to declare this rather than default into it. The policy —
+        // the browser-facing surface is /api and /auth — is stated here, once, and
+        // a row that disagrees with it fails the build.
+        for (RoleAuthorizer.Rule rule : RoleAuthorizer.rules()) {
+            for (PathPattern path : rule.paths()) {
+                String pattern = path.getPatternString();
+                assertThat(rule.browserFacing()).as("%s", pattern).isEqualTo(browserCalls(pattern));
+            }
+        }
+    }
+
+    @Test
+    void preflightExemptionFollowsTheRowThatAuthorizesTheRoute() {
+        // The same guard read through the public API and the real matcher, so it
+        // also catches the flag being right on a row that a more specific row
+        // shadows — a row's answer being correct but never consulted.
+        for (RoleAuthorizer.Rule rule : RoleAuthorizer.rules()) {
+            for (PathPattern path : rule.paths()) {
+                String pattern = path.getPatternString();
+                String probe = pattern.endsWith("/**") ? pattern + "probe" : pattern;
+                assertThat(authorizer.isPreflightExempt(probe))
+                        .as("%s", pattern)
+                        .isEqualTo(rule.browserFacing());
+            }
+        }
+    }
+
+    @Test
+    void theBrowserSurfaceIsTheWholeSubtreeAndNotOnlyItsDeeperPaths() {
+        // Spring's PathPattern rather than a prefix check, so the edges are worth
+        // pinning: "/api/**" covers the bare "/api" and "/api/" as well as the
+        // versioned paths, and no rule here relies on the bare form matching a
+        // trailing slash the way "/api/v1/events" would not.
+        for (String path : List.of("/api", "/api/", "/api/v1", "/api/v1/", "/api/v1/events", "/auth", "/auth/", "/auth/login")) {
+            assertThat(authorizer.isPreflightExempt(path)).as(path).isTrue();
+        }
     }
 
     @Test

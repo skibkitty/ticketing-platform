@@ -7,6 +7,8 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import org.springframework.http.HttpStatus;
+import org.springframework.test.web.servlet.MvcResult;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.raydans.apigateway.auth.JwtService;
@@ -611,33 +613,30 @@ class GatewayProxyBootTests {
 
     @Test
     void aManagementPreflightIsNotAnsweredEvenForAnAdmin() throws Exception {
-        // The pair that makes the refusal above about authorization rather than
-        // about preflights being refused in general: this one carries a usable
-        // ADMIN token, so the filter lets it past — and the request is still not
-        // answered, because the shared CORS mapping in `common` is registered
-        // against the request-mapping handler and the actuator endpoints are
-        // served by a different one that has no CORS configuration at all. So
-        // Spring refuses the handshake rather than granting it.
+        // An ADMIN is authorized by the gateway's own rule — JwtAuthenticationFilterTest
+        // asserts the filter lets this past — and the handshake is still not granted,
+        // because the shared CORS mapping in `common` is registered against the
+        // request-mapping handler while the actuator is served by a different one with
+        // no CORS configuration.
         //
-        // Which is the answer that makes the invariant hold end to end: there is
-        // no configuration of this gateway in which a cross-origin client gets a
-        // management preflight answered, because the two layers that could answer
-        // it — the filter's exemption and the CORS mapping — both decline.
-        mvc.perform(options("/actuator/health")
+        // The status is deliberately not asserted. What this holds is that the
+        // management surface never gets a successful CORS answer, and how a refused
+        // handshake is spelled is Spring's business, not the contract.
+        MvcResult result = mvc.perform(options("/actuator/health")
                         .header(HttpHeaders.ORIGIN, ALLOWED_ORIGIN)
                         .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "GET")
                         .header(HttpHeaders.AUTHORIZATION, bearerFor(ADMIN_ID, Role.ADMIN)))
                 .andExpect(header().doesNotExist(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN))
-                .andExpect(status().isForbidden());
+                .andReturn();
+
+        assertThat(result.getResponse().getStatus()).isNotEqualTo(HttpStatus.OK.value());
     }
 
     @Test
     void aManagementPreflightCarriesNoManagementInformation() throws Exception {
-        // What the reviewer asked to be proven rather than argued: that nothing
-        // about the gateway's internals is reachable through a preflight. Not
-        // merely "the health endpoint answers 401" — that the body is the
-        // gateway's own error shape with no actuator payload in it, so there is
-        // no oracle to read the management surface through.
+        // Nothing about the gateway's internals is reachable through a preflight: the
+        // body is the gateway's own error shape with no actuator payload in it, so
+        // there is no oracle to read the management surface through.
         String body = mvc.perform(options("/actuator/health").header(HttpHeaders.ORIGIN, ALLOWED_ORIGIN)
                         .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "GET"))
                 .andExpect(status().isUnauthorized())
