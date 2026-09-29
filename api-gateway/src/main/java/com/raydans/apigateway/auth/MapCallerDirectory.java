@@ -1,8 +1,12 @@
 package com.raydans.apigateway.auth;
 
 import jakarta.annotation.PostConstruct;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
+import java.util.stream.Collectors;
 import org.springframework.stereotype.Component;
 
 /**
@@ -22,8 +26,9 @@ public class MapCallerDirectory {
     }
 
     /**
-     * Refuses to start with nobody in the directory, or with a caller the
-     * gateway could not actually authenticate or speak for.
+     * Refuses to start with nobody in the directory, with a caller the gateway
+     * could not actually authenticate or speak for, or with two callers claiming
+     * one identity.
      *
      * <p>Otherwise configuration that fails to bind is a gateway that answers
      * every login with 401 and no other symptom, and the operator goes looking
@@ -59,6 +64,52 @@ public class MapCallerDirectory {
                                 + " default ships, so nothing here is a usable credential by omission. Expected"
                                 + " 'app.gateway.callers." + username + ".password' to be set from the"
                                 + " environment.");
+            }
+        });
+        refuseToStartWithSharedCallerIds();
+    }
+
+    /**
+     * Refuses to start with two login names claiming one identity.
+     *
+     * <p>A caller's id is the token's subject and the subject is what every
+     * downstream identity is derived from (ADR 002), so the mapping from a
+     * caller id to a caller has to be a function. Two callers configured with
+     * the same {@code caller-id} both authenticate, both are issued a token
+     * carrying {@code sub=42}, and nothing after the login can tell the two
+     * apart: bob's token is alice's token, so a Customer's reservations, inbox
+     * and payments would belong to whoever happens to have that number.
+     *
+     * <p>Worse, it would not look like a bug. Both logins work, every route
+     * answers, and the symptom is data attributed to the wrong person — found
+     * later, by a Customer. The other half of the answer is that a duplicate
+     * cannot be resolved by picking a winner: the gateway has no way to know
+     * which of the two was meant, and choosing one would hand one login another
+     * caller's identity, which is the very thing being prevented here. So it
+     * refuses to start.
+     *
+     * <p>After the per-caller checks above, so a caller with no id of its own is
+     * reported as that rather than as two callers colliding on the placeholder
+     * 0 that {@code callerIdOrZero()} substitutes.
+     */
+    private void refuseToStartWithSharedCallerIds() {
+        Map<Long, List<String>> usernamesByCallerId = new TreeMap<>();
+        credentials.forEach((username, account) ->
+                usernamesByCallerId.computeIfAbsent(account.callerId(), id -> new ArrayList<>()).add(username));
+
+        usernamesByCallerId.forEach((callerId, usernames) -> {
+            if (usernames.size() > 1) {
+                // Sorted because the credentials map has no order of its own:
+                // the same configuration must produce the same message, or a
+                // flaky message becomes the next thing nobody trusts.
+                String callers = usernames.stream().sorted().collect(Collectors.joining("', '"));
+                throw new IllegalStateException(
+                        "Callers '" + callers + "' are all configured with caller-id " + callerId + ". The token's"
+                                + " subject is the caller's own id (ADR 002), so each of them would be issued a token"
+                                + " with sub=" + callerId + " and every service downstream would treat them as one"
+                                + " identity: a request made as one caller would act as the other. Every entry under"
+                                + " app.gateway.callers needs its own caller-id, and the gateway will not choose"
+                                + " between two callers for you.");
             }
         });
     }

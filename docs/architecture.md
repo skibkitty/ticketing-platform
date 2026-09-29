@@ -150,6 +150,16 @@ caller holding `CUSTOMER`: an organizer authenticates and is forwarded, but gets
 no Customer id, because the domain does not make it one. See
 `docs/adr/002-gateway-trust-boundary.md` for the tradeoff this creates.
 
+"Not reachable except through the gateway" is a property of the deployment, not
+of the code, so it is asserted where the deployment is: the default compose
+file publishes no port for reservation-service, payment-service or
+notification-service, the gateway reaches them by service name on the compose
+network, and `platform-tests` fails the build if a published port reappears —
+in the default file or on an interface wider than loopback in the debugging
+override. See `docs/adr/012-gateway-is-the-only-published-surface.md`. The
+gateway is the only place a role is enforced, so a way to skip it is a way to
+skip the authorization, which is why a loopback-bound port counts as one.
+
 ## What's intentionally out of scope
 
 - **A real payment gateway integration** — `payment-service` simulates an

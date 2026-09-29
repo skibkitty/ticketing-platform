@@ -49,7 +49,8 @@ _Avoid_: user, account
 Whatever authenticated to the platform and holds roles — a Customer, an
 Event's organizer, or the platform operator. A caller has an id of its own,
 which is the token subject; for a Customer that id is its `Customer.id`, and
-for anything else it is only ever its own.
+for anything else it is only ever its own. An id belongs to one caller and no
+other — two callers sharing one would be one identity wearing two logins.
 
 **Notification**:
 The message a Customer is told about a Reservation reaching a terminal

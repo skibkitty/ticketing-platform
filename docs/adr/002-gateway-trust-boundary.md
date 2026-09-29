@@ -66,6 +66,13 @@ is a Customer. Specifically:
 - The configuration key is `caller-id`, not `customer-id`, and that is not
   cosmetic: every caller needs an id because every token's subject is one, and
   naming the field after a role would assert that every caller is a Customer.
+- A `caller-id` belongs to **one** caller, and the gateway refuses to start if
+  two configured callers claim the same one. Sharing an id does not make a
+  caller unusable, it makes two of them interchangeable: both would be issued a
+  token with the same subject, every service downstream acts on that number, and
+  one Customer's data turns up under another. The gateway will not break the tie
+  by choosing, because it has no way to know which of the two was configured on
+  purpose.
 
 The same rule already applied to `X-User-Roles` and is what makes these
 headers safe: both are stripped first and set second, never appended to
@@ -90,15 +97,16 @@ answer from a role set each.
 
 The safety of trusting these headers still rests on network hygiene, not on
 protocol: nothing except our own services may reach an internal service. The
-default `docker-compose.yml` binds the internal services' host ports
-(8082-8084) to `127.0.0.1` rather than every interface, so host-side
-debugging still works while the rest of the network cannot reach them at
-all; a host-local process can still forge the headers, which is accepted at
-demo scale. A host port is a debugging convenience, never an access path: an
-internal service with no gateway route in front of it is not safe to expose,
-and one that reads a Customer's data by an id in the query string has nothing
-of its own to stop that. Remove the loopback bindings too once host-side
-debugging is done. If this ever runs on a shared or untrusted network, each
-service must validate the JWT itself instead of trusting the headers, and the
-`X-Customer-Id` derivation above stops being load-bearing for authorization
-only because each service would be deriving it from the token itself.
+default `docker-compose.yml` therefore publishes no port for
+reservation-service, payment-service or notification-service at all — they are
+reachable by service name on the compose network, and by nothing else, with
+`docker-compose.debug.yml` as the opt-in exception for host-side debugging. See
+ADR 012, which records that decision. A host port is a debugging convenience,
+never an access path: an internal service with no gateway route in front of it
+is not safe to expose, and one that reads a Customer's data by an id in the
+path has nothing of its own to stop that. A host-local process can still forge
+the headers, which is accepted at demo scale. If this ever runs on a shared or
+untrusted network, each service must validate the JWT itself instead of
+trusting the headers, and the `X-Customer-Id` derivation above stops being
+load-bearing for authorization only because each service would be deriving it
+from the token itself.

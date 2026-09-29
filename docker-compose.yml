@@ -55,6 +55,20 @@ services:
       retries: 5
       start_period: 20s
 
+  # The three services below are internal: reachable by service name from the
+  # compose network and published to no host interface at all. A `ports:` entry
+  # here — loopback-bound or not — is a way *around* the gateway, which is the
+  # only thing standing between a request and an unverified identity header
+  # (ADR 002): notification-service reads a Customer's Notifications from a path
+  # variable and checks no role of its own (ADR 011), so anything that can open
+  # a socket to it can read anyone's inbox without ever authenticating.
+  #
+  # For host-side debugging use the separate, opt-in override, which is the one
+  # place a port is published and says so:
+  #
+  #   docker compose -f docker-compose.yml -f docker-compose.debug.yml up --build
+  #
+  # See ADR 012.
   reservation-service:
     build:
       context: .
@@ -64,13 +78,6 @@ services:
       DB_USER: platform
       DB_PASSWORD: platform
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-    # Internal service: reachable only from this machine, never from the network.
-    # ADR 002 puts trust in the gateway's forwarded identity header on network hygiene --
-    # nothing but our own services may reach this port -- so the binding is to loopback,
-    # not to every interface. Host-side debugging (curl localhost:8082) still works; a
-    # colleague on the LAN forging that header does not.
-    ports:
-      - "127.0.0.1:8082:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -91,13 +98,6 @@ services:
       # payment, so the compensating (seat-release) path is easy to trigger
       # on purpose when demoing.
       PAYMENT_DECLINE_THRESHOLD_CENTS: 50000
-    # Internal service: reachable only from this machine, never from the network.
-    # ADR 002 puts trust in the gateway's forwarded identity header on network hygiene --
-    # nothing but our own services may reach this port -- so the binding is to loopback,
-    # not to every interface. Host-side debugging (curl localhost:8082) still works; a
-    # colleague on the LAN forging that header does not.
-    ports:
-      - "127.0.0.1:8083:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -113,19 +113,15 @@ services:
       DB_USER: platform
       DB_PASSWORD: platform
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-    # Internal service: reachable only from this machine, never from the network.
-    # ADR 002 puts trust in the gateway's forwarded identity header on network hygiene --
-    # nothing but our own services may reach this port -- so the binding is to loopback,
-    # not to every interface. Host-side debugging (curl localhost:8082) still works; a
-    # colleague on the LAN forging that header does not.
-    ports:
-      - "127.0.0.1:8084:8080"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
 
+  # The one published HTTP port in this file. Everything a client can reach goes
+  # through here, so the authentication and authorization decisions
+  # (RoleAuthorizer, JwtAuthenticationFilter) are the only ones there are.
   api-gateway:
     build:
       context: .

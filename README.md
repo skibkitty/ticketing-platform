@@ -45,10 +45,26 @@ key of at least 32 bytes or without a password for every configured caller —
 so forgetting one is a startup failure, not a deployment signing tokens with a
 key nobody chose. `.env` is gitignored; `.env.example` holds placeholders only.
 
-- Gateway: `http://localhost:8080`
+- Gateway: `http://localhost:8080` — the only published application port
 - Kafka UI: `http://localhost:8090`
-- Direct service access (debugging): reservation-service `:8082`,
-  payment-service `:8083`, notification-service `:8084`
+
+The services behind the gateway publish nothing to the host. The gateway is
+where a token is checked and a role is enforced, and the services behind it
+trust the identity headers it sets rather than checking anything themselves, so
+a published port would be a way around both (see
+[`docs/adr/012`](docs/adr/012-gateway-is-the-only-published-surface.md)). To
+debug one directly — `curl localhost:8084/actuator/health`, an IDE attached to
+the process, a request through a proxy — ask for it explicitly:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.debug.yml up --build
+```
+
+That publishes reservation-service `:8082`, payment-service `:8083` and
+notification-service `:8084` on `127.0.0.1` for as long as that stack is up.
+A port bound to loopback is reachable by any process on this machine, which
+includes anything that can skip the gateway's authentication, so it is for
+debugging and not for anything else.
 
 ## Example requests
 
@@ -123,5 +139,9 @@ curl localhost:8080/api/v1/notifications \
 - Testcontainers integration tests (Postgres + Kafka): the outbox -> Kafka
   -> consumer pipeline, and specifically the compensating-transaction path
   (a `PaymentFailed` event actually releases the held seats).
+- `platform-tests`: the deployment rather than any one service — chiefly that no
+  internal service publishes a port, which is what makes the gateway the trust
+  boundary. It reads the compose files and, where Docker is installed, asks
+  `docker compose config` for the model the containers would start from.
 
 Run everything: `mvn verify` from the repo root.

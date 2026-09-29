@@ -7,6 +7,13 @@ spring:
         # Strip the route prefix is deliberately not set: the services already
         # serve the paths the gateway is asked for, so a rewrite would mean two
         # places to change a URL.
+        #
+        # The localhost defaults below are for running every service on this
+        # machine (mvn spring-boot:run in each module), not for the compose
+        # stack: docker-compose.yml sets these to the service names, because the
+        # internal services publish no host port for the gateway to be reaching
+        # (ADR 012). A gateway on the host with a gateway-side default therefore
+        # needs docker-compose.debug.yml, which is what publishes 8082-8084.
         routes:
           - id: reservation-service
             uri: ${RESERVATION_SERVICE_URL:http://localhost:8082}

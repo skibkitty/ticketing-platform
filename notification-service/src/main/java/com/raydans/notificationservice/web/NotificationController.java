@@ -114,8 +114,10 @@ public class NotificationController {
      * <p>Nothing here decides who may call it. The gateway answers that, with
      * {@code ADMIN} as the only role that reaches {@code /api/v1/admin/**}, so this method
      * serves a Customer id it is handed and trusts the hop in front of it exactly as
-     * {@code ReservationController} does. Reached without that hop it is an open door,
-     * which is why the port stays off every interface but the compose network.
+     * {@code ReservationController} does. Reached without that hop it is an open door, which
+     * is why the port is published to no host interface at all rather than only to the
+     * ones a colleague is not on (ADR 012): loopback is still a socket any local process
+     * can open, and this route is the one that answers "what did that customer see?".
      */
     @GetMapping("/api/v1/admin/customers/{customerId}/notifications")
     NotificationPage listForAnotherCustomer(

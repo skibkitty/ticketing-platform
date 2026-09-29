@@ -36,7 +36,7 @@ Required-header has a second consequence worth stating: the route is
 unreachable by anything that did not come through the gateway. A host-local
 process debugging on the compose network can no longer read an inbox by
 guessing an id, which is the same reason ADR 002 keeps the internal ports off
-every interface.
+every interface and ADR 012 keeps them unpublished altogether.
 
 ## The operator may read any Customer's inbox, on a separate route
 
