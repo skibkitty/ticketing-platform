@@ -52,7 +52,7 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             throws ServletException, IOException {
         RoleAuthorizer.Access access = authorizer.decide(request.getMethod(), pathOf(request));
 
-        if (isPreflight(request)) {
+        if (isPreflight(request) && authorizer.isPreflightExempt(pathOf(request))) {
             chain.doFilter(request, response);
             return;
         }
@@ -122,6 +122,13 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
      * a 401 here reads to a client as a broken CORS setup, and it performs no
      * action. Keyed on the whole definition rather than the method so a plain
      * OPTIONS to a management endpoint is still answered by this filter.
+     *
+     * <p>Whether that exemption applies is the author's question rather than this
+     * filter's, because it is a question about the route: only the browser-facing
+     * surface has a handshake to exempt ({@link RoleAuthorizer#isPreflightExempt}).
+     * A preflight to {@code /actuator/**} is answered by the normal
+     * authorization path instead, so the management endpoints are ADMIN's on
+     * every method rather than on all of them but OPTIONS.
      */
     private static boolean isPreflight(HttpServletRequest request) {
         return HttpMethod.OPTIONS.matches(request.getMethod())

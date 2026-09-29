@@ -80,6 +80,24 @@ public class RoleAuthorizer {
             // not start life public.
             new Rule(new Access.AnyAuthenticated(), null, Set.of("/api/**")));
 
+    /**
+     * The routes a browser is expected to call, and so the only ones a CORS
+     * preflight is answered for without a token.
+     *
+     * <p>A preflight arrives before the browser has a token and never carries
+     * one, so a 401 to it reads to a client as a broken CORS setup rather than
+     * as a refusal. That is a real problem for the routes a browser calls and
+     * not a problem for the ones it does not: {@code /actuator} is the
+     * container's own surface, read by monitoring and by an operator with curl,
+     * and no browser application has any business preflighting it.
+     *
+     * <p>So the exemption is a property of the route and not of the HTTP method.
+     * Keyed on the method instead, the answer to "may this reach the management
+     * endpoints" would depend on the verb, and the ADMIN rule in the table above
+     * would be true of every method but one.
+     */
+    private static final Set<String> BROWSER_SURFACE = Set.of("/api/**", "/auth/**");
+
     private final PathPatternParser parser = new PathPatternParser();
 
     /** @return what the gateway requires of a caller for this request, never null */
@@ -91,6 +109,17 @@ public class RoleAuthorizer {
             }
         }
         return new Access.Public();
+    }
+
+    /**
+     * @return whether a CORS preflight to this path is answered without a token,
+     *     which is a question about the route rather than about the method — see
+     *     {@link #BROWSER_SURFACE}
+     */
+    public boolean isPreflightExempt(String path) {
+        PathContainer candidate = PathContainer.parsePath(path);
+        return BROWSER_SURFACE.stream()
+                .anyMatch(pattern -> parser.parse(pattern).matches(candidate));
     }
 
     /**

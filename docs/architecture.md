@@ -160,6 +160,13 @@ override. See `docs/adr/012-gateway-is-the-only-published-surface.md`. The
 gateway is the only place a role is enforced, so a way to skip it is a way to
 skip the authorization, which is why a loopback-bound port counts as one.
 
+The CORS preflight exemption follows the same rule from the other side. A
+browser's handshake arrives before it has a token, so it is answered without one
+— but only on `/api/**` and `/auth/**`, the routes a browser application calls.
+`/actuator/**` is not on that list, so the management endpoints are the
+operator's on every method rather than on all of them but `OPTIONS`, and a
+client cannot make the authorization answer depend on the verb it chose.
+
 ## What's intentionally out of scope
 
 - **A real payment gateway integration** — `payment-service` simulates an

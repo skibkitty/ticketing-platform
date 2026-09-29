@@ -79,6 +79,27 @@ headers safe: both are stripped first and set second, never appended to
 whatever arrived. A request that was not authenticated carries neither, and a
 request by a caller who is not a Customer carries roles but no customer id.
 
+**A CORS preflight is answered without a token only on the browser-facing
+surface.** A browser sends `OPTIONS` with `Origin` and
+`Access-Control-Request-Method` before it has a token, and never sends one with
+it, so refusing the handshake would read to a client as a broken CORS setup
+rather than as a refusal. That is why `/api/**` and `/auth/**` — the routes a
+browser application actually calls — are exempt.
+
+It is scoped to those routes rather than to the HTTP method, and the
+management endpoints are deliberately not on it. Keyed on the method, the
+exemption would make "/actuator/** is the operator's" true of every method but
+`OPTIONS`, so the answer to *may this reach the management endpoints* would
+depend on the verb rather than on the route — and a rule with a method-shaped
+exception is a rule that a later edit can quietly widen. A preflight to
+`/actuator/**` therefore takes the ordinary authorization path and is refused for
+want of a token. Nothing legitimate is put outside by that: no browser
+application calls the management endpoints, which are read by monitoring and by
+an operator directly. Both layers agree, which is what makes the invariant hold
+end to end — the filter declines to exempt the route, and the shared CORS mapping
+does not cover the actuator's handler mapping either, so Spring refuses the
+handshake even for a caller holding a valid ADMIN token.
+
 **Consequences:** One place to audit and rotate keys; downstream services
 carry no security dependency. A caller can no longer reserve seats in
 another Customer's name by setting a header, which is the whole of the

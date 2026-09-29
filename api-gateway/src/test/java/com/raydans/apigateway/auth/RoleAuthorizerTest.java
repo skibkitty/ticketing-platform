@@ -104,6 +104,41 @@ class RoleAuthorizerTest {
     }
 
     @Test
+    void theBrowserSurfaceIsWhereAPreflightIsAnsweredWithoutAToken() {
+        // The two halves of the preflight exemption, and they are the routes a
+        // browser application actually calls: it signs in over /auth and then
+        // talks to /api. Answering a preflight there without a token is not a
+        // hole, it is what makes CORS work — the browser has no token yet.
+        assertThat(authorizer.isPreflightExempt("/auth/login")).isTrue();
+        assertThat(authorizer.isPreflightExempt("/api/v1/events")).isTrue();
+        assertThat(authorizer.isPreflightExempt("/api/v1/admin/customers/42/notifications")).isTrue();
+    }
+
+    @Test
+    void theManagementEndpointsAreNotPartOfTheBrowserSurface() {
+        // The invariant this is here to hold: a preflight to /actuator/** goes
+        // through the ordinary authorization path, so "/actuator/** is ADMIN's"
+        // is a statement about the route rather than about the route for every
+        // verb but OPTIONS. No browser runs against the management endpoints, so
+        // nothing legitimate is put outside by refusing the handshake.
+        assertThat(authorizer.isPreflightExempt("/actuator/health")).isFalse();
+        assertThat(authorizer.isPreflightExempt("/actuator/env")).isFalse();
+        // "/actuator" alone would pass a startsWith check; the pattern must not.
+        assertThat(authorizer.isPreflightExempt("/actuator")).isFalse();
+    }
+
+    @Test
+    void aPreflightExemptionIsNotAPathPrefixMistake() {
+        // A path that merely starts with a browser-facing one is not on the
+        // browser surface: "/api-internal/..." is a different resource, and
+        // nothing has said a browser calls it. "/actuator" alone and a
+        // management subpath are both excluded for the same reason — a
+        // startsWith check would have included the first and missed the second.
+        assertThat(authorizer.isPreflightExempt("/api-internal/metrics")).isFalse();
+        assertThat(authorizer.isPreflightExempt("/authentic/health")).isFalse();
+    }
+
+    @Test
     void anActuatorSubpathIsStillGated() {
         // "/actuator" alone would pass a startsWith check; the pattern must not.
         assertThat(authorizer.decide("GET", "/actuator/env"))

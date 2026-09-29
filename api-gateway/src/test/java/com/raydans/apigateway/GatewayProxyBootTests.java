@@ -587,6 +587,73 @@ class GatewayProxyBootTests {
     }
 
     @Test
+    void aPreflightToAManagementEndpointIsNotAnswered() throws Exception {
+        // The pair that keeps the exemption honest on the other side. A preflight
+        // to /api is answered because a browser asks it; a preflight to
+        // /actuator goes through the ordinary ADMIN decision like any other
+        // request, so the management endpoints are the operator's on every method
+        // rather than on all of them but OPTIONS.
+        //
+        // 401 rather than 403 because a preflight cannot carry a token: the
+        // browser never sends one with it. The point is that it is not answered.
+        mvc.perform(options("/actuator/health").header(HttpHeaders.ORIGIN, ALLOWED_ORIGIN)
+                        .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "GET"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(header().doesNotExist(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN));
+
+        // And the exemption still works where it is meant to, from the same
+        // origin, in the same test: a browser is not put off the API by this.
+        mvc.perform(options("/api/v1/events").header(HttpHeaders.ORIGIN, ALLOWED_ORIGIN)
+                        .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "POST"))
+                .andExpect(status().is2xxSuccessful())
+                .andExpect(header().string(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, ALLOWED_ORIGIN));
+    }
+
+    @Test
+    void aManagementPreflightIsNotAnsweredEvenForAnAdmin() throws Exception {
+        // The pair that makes the refusal above about authorization rather than
+        // about preflights being refused in general: this one carries a usable
+        // ADMIN token, so the filter lets it past — and the request is still not
+        // answered, because the shared CORS mapping in `common` is registered
+        // against the request-mapping handler and the actuator endpoints are
+        // served by a different one that has no CORS configuration at all. So
+        // Spring refuses the handshake rather than granting it.
+        //
+        // Which is the answer that makes the invariant hold end to end: there is
+        // no configuration of this gateway in which a cross-origin client gets a
+        // management preflight answered, because the two layers that could answer
+        // it — the filter's exemption and the CORS mapping — both decline.
+        mvc.perform(options("/actuator/health")
+                        .header(HttpHeaders.ORIGIN, ALLOWED_ORIGIN)
+                        .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(ADMIN_ID, Role.ADMIN)))
+                .andExpect(header().doesNotExist(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void aManagementPreflightCarriesNoManagementInformation() throws Exception {
+        // What the reviewer asked to be proven rather than argued: that nothing
+        // about the gateway's internals is reachable through a preflight. Not
+        // merely "the health endpoint answers 401" — that the body is the
+        // gateway's own error shape with no actuator payload in it, so there is
+        // no oracle to read the management surface through.
+        String body = mvc.perform(options("/actuator/health").header(HttpHeaders.ORIGIN, ALLOWED_ORIGIN)
+                        .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "GET"))
+                .andExpect(status().isUnauthorized())
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+
+        assertThat(body).doesNotContain("\"UP\"").doesNotContain("components").doesNotContain("diskSpace");
+        // The same endpoint over GET with an ADMIN token does report status, so
+        // the absence above is a decision rather than a route that does not exist.
+        mvc.perform(get("/actuator/health").header(HttpHeaders.AUTHORIZATION, bearerFor(ADMIN_ID, Role.ADMIN)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("UP"));
+    }
+
+    @Test
     void aPreflightIsNotAskedToAuthenticateAndAnOrdinaryRequestStillIs() throws Exception {
         // The pair that keeps the exemption honest: the same origin, the same
         // path, and the preflight is answered while the real request is not. A

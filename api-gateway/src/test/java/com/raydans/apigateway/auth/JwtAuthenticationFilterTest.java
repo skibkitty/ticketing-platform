@@ -293,8 +293,39 @@ class JwtAuthenticationFilterTest {
     }
 
     @Test
-    void aCorsPreflightOnTheManagementEndpointsIsAlsoNotRefused() {
-        assertThat(preflightReachesTheRestOfTheChain("/actuator/health")).isTrue();
+    void aPreflightToTheLoginSurfaceIsNotRefusedEither() {
+        // The browser's first call is a login POST, and it is a cross-origin one,
+        // so the exemption has to cover the auth surface or no browser can sign
+        // in at all.
+        assertThat(preflightReachesTheRestOfTheChain("/auth/login")).isTrue();
+    }
+
+    @Test
+    void aCorsPreflightToTheManagementEndpointsIsRefused() {
+        // The exemption is for the browser's handshake, and nothing a browser
+        // runs calls the management endpoints. Answering it there would make
+        // "/actuator/** is ADMIN's" true of every method but OPTIONS, so the
+        // answer to "may this reach the operator's endpoints" would depend on the
+        // verb rather than on the route.
+        //
+        // A preflight cannot carry a token, so the honest answer for one is the
+        // same 401 an unauthenticated GET gets — not a pass.
+        assertThat(preflightReachesTheRestOfTheChain("/actuator/health")).isFalse();
+    }
+
+    @Test
+    void aManagementPreflightIsRefusedForWantOfATokenAndNotOtherwise() {
+        // The pair that makes the refusal above about authorization rather than
+        // about preflights being refused in general: the same preflight, carrying
+        // a usable ADMIN token, is authenticated and let past the filter. A
+        // blanket refusal of management preflights — one keyed on the method
+        // alone — would pass this test's neighbour and fail this one.
+        assertThat(preflightReachesTheRestOfTheChain("/actuator/health", bearerFor(tokens.issue(44L, Set.of(Role.ADMIN)))))
+                .isTrue();
+        // And a token without the role still does not get through, which is the
+        // rule actually being enforced.
+        assertThat(preflightReachesTheRestOfTheChain("/actuator/health", bearerFor(tokens.issue(43L, Set.of(Role.ORGANIZER)))))
+                .isFalse();
     }
 
     @Test
@@ -307,6 +338,15 @@ class JwtAuthenticationFilterTest {
 
     /** @return whether the filter passed the request on rather than answering it itself. */
     private boolean preflightReachesTheRestOfTheChain(String path) {
+        return preflightReachesTheRestOfTheChain(path, null);
+    }
+
+    /**
+     * @param bearer a token to send with the preflight, or null to send none —
+     *     a real preflight never carries one, and asking what happens when it
+     *     does is how the exemption is told apart from a blanket refusal
+     */
+    private boolean preflightReachesTheRestOfTheChain(String path, String bearer) {
         ObjectMapper objectMapper = JsonMapper.builder().addModule(new JavaTimeModule()).build();
         JwtAuthenticationFilter filter = new JwtAuthenticationFilter(
                 tokens, new RoleAuthorizer(), new ErrorResponseWriter(objectMapper));
@@ -314,6 +354,9 @@ class JwtAuthenticationFilterTest {
         MockHttpServletRequest request = new MockHttpServletRequest("OPTIONS", path);
         request.addHeader(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "POST");
         request.addHeader(HttpHeaders.ORIGIN, "http://localhost:3000");
+        if (bearer != null) {
+            request.addHeader(HttpHeaders.AUTHORIZATION, bearer);
+        }
         MockHttpServletResponse response = new MockHttpServletResponse();
         AtomicBoolean reachedTheChain = new AtomicBoolean();
         FilterChain chain = (req, res) -> reachedTheChain.set(true);
@@ -324,7 +367,11 @@ class JwtAuthenticationFilterTest {
             throw new AssertionError("The filter should pass a preflight straight through", ex);
         }
 
-        return reachedTheChain.get() && response.getStatus() != HttpStatus.UNAUTHORIZED.value();
+        // Not just "reached the chain": the filter answers a refusal itself and
+        // never calls the chain, but a 401 with the chain reached would still be
+        // a pass under reachability alone, and 401 is what an unauthenticated
+        // preflight must get.
+        return reachedTheChain.get() && response.getStatus() < HttpStatus.BAD_REQUEST.value();
     }
 
     // --- the header the gateway must not take from a client -------------------
