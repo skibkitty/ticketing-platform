@@ -13,6 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 import org.yaml.snakeyaml.Yaml;
 
 /**
@@ -43,6 +44,20 @@ final class ComposeStack {
      */
     static final List<String> INTERNAL_SERVICES =
             List.of("reservation-service", "payment-service", "notification-service");
+
+    /**
+     * The three services the platform stores and moves its data through. Same rule
+     * as {@link #INTERNAL_SERVICES}, and for a stronger reason: postgres holds all
+     * four schemas behind credentials that are in the compose file, and kafka-ui
+     * shows the whole event history while authenticating nobody. Neither has a
+     * gateway in front of it, so a published port is a wider read than any
+     * application port was (ADR 013).
+     */
+    static final List<String> INFRASTRUCTURE_SERVICES = List.of("postgres", "kafka", "kafka-ui");
+
+    /** Everything the default stack is expected to keep off the host. */
+    static final List<String> UNPUBLISHED_SERVICES =
+            Stream.concat(INTERNAL_SERVICES.stream(), INFRASTRUCTURE_SERVICES.stream()).toList();
 
     /**
      * Values for the four variables the gateway's compose entry refuses to

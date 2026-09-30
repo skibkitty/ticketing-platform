@@ -1,8 +1,11 @@
 # Ticketing Platform
 
 An event ticketing & reservation system: seat holds with optimistic
-concurrency control, a payment saga with automatic compensation on failure,
-and gateway-level rate limiting for flash-sale traffic.
+concurrency control, a payment saga with automatic compensation on failure, and
+a single authenticated gateway in front of it. Gateway resilience — rate
+limiting, a bulkhead and a circuit breaker for the flash-sale reservation route —
+is planned in [#13](https://github.com/skibkitty/ticketing-platform/issues/13)
+and not built yet.
 
 **Start here:**
 1. [`docs/architecture.md`](docs/architecture.md) — what this is and why
@@ -45,26 +48,65 @@ key of at least 32 bytes or without a password for every configured caller —
 so forgetting one is a startup failure, not a deployment signing tokens with a
 key nobody chose. `.env` is gitignored; `.env.example` holds placeholders only.
 
-- Gateway: `http://localhost:8080` — the only published application port
-- Kafka UI: `http://localhost:8090`
+- Gateway: `http://localhost:8080` — the only published port in the default
+  stack, on every interface
 
-The services behind the gateway publish nothing to the host. The gateway is
-where a token is checked and a role is enforced, and the services behind it
-trust the identity headers it sets rather than checking anything themselves, so
-a published port would be a way around both (see
-[`docs/adr/012`](docs/adr/012-gateway-is-the-only-published-surface.md)). To
-debug one directly — `curl localhost:8084/actuator/health`, an IDE attached to
-the process, a request through a proxy — ask for it explicitly:
+The services behind the gateway, and the infrastructure they run on, publish
+nothing to the host. The gateway is where a token is checked and a role is
+enforced, and the services behind it trust the identity headers it sets rather
+than checking anything themselves, so a published port would be a way around
+both (see [`docs/adr/012`](docs/adr/012-gateway-is-the-only-published-surface.md)).
+The database is the widest read of all — every service's schema is in it, behind
+credentials that are in the compose file — and the Kafka UI shows the whole event
+history while authenticating nobody, so they are held to the same rule
+([`docs/adr/013`](docs/adr/013-infrastructure-ports-follow-the-gateway-rule.md)).
+
+To debug a service directly — `curl localhost:8084/actuator/health`, an IDE
+attached to the process — or to reach the infrastructure — `psql`, a Kafka CLI,
+the Kafka UI at `http://localhost:8090` — ask for it explicitly:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.debug.yml up --build
 ```
 
-That publishes reservation-service `:8082`, payment-service `:8083` and
-notification-service `:8084` on `127.0.0.1` for as long as that stack is up.
-A port bound to loopback is reachable by any process on this machine, which
-includes anything that can skip the gateway's authentication, so it is for
+That publishes reservation-service `:8082`, payment-service `:8083`,
+notification-service `:8084`, postgres `:5432`, kafka `:29092` and the Kafka UI
+`:8090` on `127.0.0.1`, for as long as that stack is up. A port bound to
+loopback is reachable by any process on this machine, which includes anything
+that can skip the gateway's authentication and read the database, so it is for
 debugging and not for anything else.
+
+Note that a service run on the host with `mvn spring-boot:run` needs this
+override: every service's `application.yml` defaults to `localhost:5432` and
+`localhost:29092`, so against the default stack it will find nothing listening.
+Inside the compose stack nothing does — the services reach the database as
+`postgres:5432` and the broker as `kafka:9092`, over the compose network.
+
+## Authentication is a demo credential set
+
+The login surface is three configured callers — `customer`, `organizer` and
+`admin` — whose passwords come from `.env` and are compared against the values
+in `application.yml`. It is not an identity provider, and it is not
+production-grade password authentication. Specifically:
+
+- **No password store.** The configured value *is* the credential. There is no
+  password database, no hashing at rest, and no user-facing registration.
+- **A password change revokes nothing.** It changes what `/auth/login` accepts
+  from then on. A token issued before the change stays valid until it expires.
+- **A token is valid until its expiry** (`JWT_TTL`, one hour by default) and
+  there is no refresh token, so "logging out" means "stop sending it".
+- **No rate limit on `/auth/login`**, which is the one endpoint reachable
+  without a token. It does not reveal *which* credentials exist — an unknown
+  username and a wrong password are answered identically and compared in
+  constant time — but it does nothing about *how many* attempts. Tracked in
+  [#43](https://github.com/skibkitty/ticketing-platform/issues/43); the
+  flash-sale rate limiting in
+  [#13](https://github.com/skibkitty/ticketing-platform/issues/13) is a
+  different route and does not cover it.
+- **Roles are configuration**, not something a user holds or changes.
+
+[`docs/adr/002`](docs/adr/002-gateway-trust-boundary.md) records the trust
+boundary these credentials sit behind, and what it costs.
 
 ## Example requests
 
@@ -117,7 +159,8 @@ curl -X POST localhost:8080/api/v1/reservations \
 curl localhost:8080/api/v1/reservations/1 \
   -H "Authorization: Bearer <customer-token>"
 
-# 6. Check the payment record via the circuit-breaker-wrapped route
+# 6. Check the payment record. The circuit breaker on this route is planned
+#    in #13 and not built yet; today it is a plain proxied read
 curl localhost:8080/api/v1/payments/1 \
   -H "Authorization: Bearer <customer-token>"
 

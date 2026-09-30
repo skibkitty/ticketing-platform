@@ -79,18 +79,41 @@ nobody has considered yet, and the Customer rule says what is true — the inbox
 belongs to Customers, so it is Customers who have one.
 
 **One routing caveat, stated rather than hidden.** The gateway's route for this
-service claims the whole `/api/v1/admin/**` prefix, because a path pattern
-cannot put a variable segment in the middle. The service still decides which
-shapes exist, so an operator URL that is not served 404s there — but the prefix
-is currently routed to notification-service, and a future admin route for
-another service's data has to be added as a route *ahead* of this one rather
-than under it. Worth remembering before the second admin route exists.
+service names the operator path exactly —
+`/api/v1/admin/customers/{id}/notifications` — and not the `/api/v1/admin/**`
+prefix. It used to claim the whole prefix, on the stated grounds that a path
+pattern cannot hold a variable in the middle. That was wrong: `PathPattern`, which
+is what the gateway's `Path` predicate parses, holds a variable segment perfectly
+well, and the reason is worth recording because the wrong belief was what made
+the prefix seem necessary.
+
+A prefix-wide route is a statement about routes nobody has written. The next
+operator route will be for some other service's data — an admin view of an Event,
+of a Refund — and under `/api/v1/admin/**` it would be proxied to
+notification-service purely by virtue of sitting under the prefix, with whoever
+added it having no reason to know. The service decides which shapes exist, so
+today's answer would be a 404 from that service; the request would still have
+crossed the gateway with the caller's identity headers on it, and a route added
+later would silently belong to whichever service's route was listed first. Naming
+the path means an admin route for another service's data is an independent route
+with its own pattern, and the operator namespace is where the argument about it
+happens rather than where the ordering of a YAML list does.
+
+**The authorization rule stays wider than the route, deliberately.**
+`RoleAuthorizer` decides `/api/v1/admin/**` is `ADMIN`, so a path under the prefix
+that no service serves yet is refused to a Customer rather than falling through
+to the `/api/**` catch-all as merely authenticated. Narrowing that rule to match
+the narrowed route would be strictly worse: an unwritten operator path would
+become reachable by any token rather than reserved. Failing closed on the route
+and failing closed on the rule are separate decisions, and both are wanted —
+which is why the two are named in different places and the difference is
+commented in both.
 
 **Consequences:** Customer isolation is a property of the route rather than a
 check somebody has to remember to write, and it holds for a Customer who also
 holds ADMIN, since the self-service read never consults a role. Cross-Customer
 reads are possible, deliberately, and visible as a different URL. What this
-does *not* do is make the Notification rows non-sensitive: `/api/v1/admin/**`
+does *not* do is make the Notification rows non-sensitive: the operator read
 reaches this service, and like every route it inherits ADR 002's requirement
 that nothing but the gateway can reach the port. Widening operator access to
 other services' data is a new decision per route, and the prefix is where it

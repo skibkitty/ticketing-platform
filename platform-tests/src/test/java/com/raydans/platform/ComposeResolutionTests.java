@@ -1,7 +1,7 @@
 package com.raydans.platform;
 
 import static com.raydans.platform.ComposeStack.GATEWAY;
-import static com.raydans.platform.ComposeStack.INTERNAL_SERVICES;
+import static com.raydans.platform.ComposeStack.UNPUBLISHED_SERVICES;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -45,11 +45,33 @@ class ComposeResolutionTests {
     void theDefaultStackPublishesNoInternalPort() {
         ComposeStack resolved = ComposeStack.fromComposeCli(DEFAULT_STACK);
 
-        for (String service : INTERNAL_SERVICES) {
+        for (String service : UNPUBLISHED_SERVICES) {
             assertThat(resolved.publishedPorts(service))
                     .as("%s, as Compose resolves it", service)
                     .isEmpty();
         }
+    }
+
+    @Test
+    @DisplayName("as Compose resolves it, the default stack publishes 8080 and nothing else")
+    void theResolvedDefaultStackPublishesOnlyTheGatewayPort() {
+        // The number, asked of the model the containers actually start from. A
+        // file-only assertion could be satisfied by a compose file that resolves
+        // to something wider than it looks; this cannot.
+        ComposeStack resolved = ComposeStack.fromComposeCli(DEFAULT_STACK);
+
+        List<ComposeStack.PublishedPort> everythingPublished = resolved.serviceNames().stream()
+                .flatMap(service -> resolved.publishedPorts(service).stream())
+                .toList();
+
+        assertThat(everythingPublished)
+                .as("the host should be able to open one socket into this stack, and it should be the gateway's")
+                .singleElement()
+                .satisfies(port -> {
+                    assertThat(port.service()).isEqualTo(GATEWAY);
+                    assertThat(port.published()).isEqualTo(8080);
+                    assertThat(port.isOnEveryInterface()).isTrue();
+                });
     }
 
     @Test
@@ -70,7 +92,7 @@ class ComposeResolutionTests {
     void theDebugOverrideResolvesToLoopbackOnly() {
         ComposeStack resolved = ComposeStack.fromComposeCli(DEFAULT_STACK, DEBUG_OVERRIDE);
 
-        for (String service : INTERNAL_SERVICES) {
+        for (String service : UNPUBLISHED_SERVICES) {
             List<ComposeStack.PublishedPort> ports = resolved.publishedPorts(service);
             assertThat(ports)
                     .as("%s, as Compose resolves the override", service)
@@ -80,5 +102,21 @@ class ComposeResolutionTests {
                         assertThat(port.isOnEveryInterface()).isFalse();
                     });
         }
+    }
+
+    @Test
+    @DisplayName("the resolved override still publishes the gateway on every interface")
+    void theDebugOverrideDoesNotNarrowTheGateway() {
+        // The override adds debugging convenience; it does not turn the platform's
+        // one public surface into a loopback-only one, which would break every
+        // remote caller to debug a colleague's machine.
+        ComposeStack resolved = ComposeStack.fromComposeCli(DEFAULT_STACK, DEBUG_OVERRIDE);
+
+        assertThat(resolved.publishedPorts(GATEWAY))
+                .singleElement()
+                .satisfies(port -> {
+                    assertThat(port.published()).isEqualTo(8080);
+                    assertThat(port.isOnEveryInterface()).isTrue();
+                });
     }
 }

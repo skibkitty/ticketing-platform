@@ -57,13 +57,36 @@ class ReservationServiceBootTests {
 
     @Test
     void echoesCorrelationIdWhenProvided() {
+        // In the form the platform propagates — a canonical UUID. A caller
+        // supplying anything else is answered with a generated id rather than
+        // refused, because the id is a debugging affordance and refusing the
+        // request over it would turn a diagnostic into an outage.
         HttpHeaders headers = new HttpHeaders();
-        headers.set(CORRELATION_HEADER, "incoming-id");
+        headers.set(CORRELATION_HEADER, "3f8b1c2e-9d4a-4f6e-8b7c-1a2d3e4f5a6b");
         HttpEntity<Void> entity = new HttpEntity<>(headers);
 
         ResponseEntity<String> response = rest.exchange("/actuator/health", HttpMethod.GET, entity, String.class);
 
-        assertThat(response.getHeaders().getFirst(CORRELATION_HEADER)).isEqualTo("incoming-id");
+        assertThat(response.getHeaders().getFirst(CORRELATION_HEADER))
+                .isEqualTo("3f8b1c2e-9d4a-4f6e-8b7c-1a2d3e4f5a6b");
+    }
+
+    @Test
+    void replacesACorrelationIdItWillNotPropagate() {
+        // The service-side half of the same rule, and the reason it is asserted
+        // here as well as in the filter's own test: a host-local caller skipping
+        // the gateway can send this header directly, so the rule cannot be a
+        // gateway-only one. Without it, this value would be in the MDC of every
+        // log line this service writes about the request.
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(CORRELATION_HEADER, "an-id-of-my-own\nINFO somebody did something");
+        HttpEntity<Void> entity = new HttpEntity<>(headers);
+
+        ResponseEntity<String> response = rest.exchange("/actuator/health", HttpMethod.GET, entity, String.class);
+
+        String returned = response.getHeaders().getFirst(CORRELATION_HEADER);
+        assertThat(returned).doesNotContain("\n");
+        assertThat(UUID.fromString(returned).toString()).isEqualTo(returned);
     }
 
     @Test

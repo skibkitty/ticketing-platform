@@ -32,11 +32,11 @@ Loopback was better than `0.0.0.0` and was described as such. It keeps a
 colleague on the LAN out, and it does not keep anything else out.
 
 **Decision:** No internal service publishes a port. The default stack publishes
-one application port — the gateway's, on every interface — and postgres, kafka
-and kafka-ui, which are infrastructure rather than anything in the request path.
-The internal services are reachable by Docker service name over the compose
-network (`http://notification-service:8080`), which is how the gateway reaches
-them, and from nowhere else.
+one application port — the gateway's, on every interface. The internal services
+are reachable by Docker service name over the compose network
+(`http://notification-service:8080`), which is how the gateway reaches them, and
+from nowhere else. The infrastructure ports, which this ADR left published and
+recorded as a separate decision, are unpublished too: see ADR 013.
 
 Host-side debugging is a separate, opt-in file:
 
@@ -73,5 +73,6 @@ has to remember the flag. What is not acceptable is trading that away for a
 boundary nobody is enforcing, so the port stays off by default.
 
 This does not change what a host-local process can do to the *database*, which
-is still published on every interface for the same debugging reasons and is
-worth a separate decision.
+is still published on every interface for the same debugging reasons. That is a
+separate decision, and ADR 013 makes it: the infrastructure ports are unpublished
+in the default file too, and move to the same debug override.

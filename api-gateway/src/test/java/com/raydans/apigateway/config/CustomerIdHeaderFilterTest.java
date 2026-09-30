@@ -144,12 +144,12 @@ class CustomerIdHeaderFilterTest {
         // This filter's job is the caller's id and nothing else. A filter that
         // rebuilt the whole header set would quietly drop content negotiation
         // and tracing headers on their way downstream.
-        HttpHeaders inbound = inbound("Accept", "application/json", "X-Correlation-Id", "abc-123");
+        HttpHeaders inbound = inbound("Accept", "application/json", "X-Correlation-Id", "3f8b1c2e-9d4a-4f6e-8b7c-1a2d3e4f5a6b");
 
         HttpHeaders forwarded = apply(inbound, requestAuthenticatedAs(42L, Role.CUSTOMER));
 
         assertThat(forwarded.getFirst("Accept")).isEqualTo("application/json");
-        assertThat(forwarded.getFirst("X-Correlation-Id")).isEqualTo("abc-123");
+        assertThat(forwarded.getFirst("X-Correlation-Id")).isEqualTo("3f8b1c2e-9d4a-4f6e-8b7c-1a2d3e4f5a6b");
     }
 
     private HttpHeaders apply(HttpHeaders inbound, HttpServletRequest servletRequest) {

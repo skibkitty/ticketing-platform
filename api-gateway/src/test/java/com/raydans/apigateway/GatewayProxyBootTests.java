@@ -28,9 +28,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.IntStream;
 import javax.crypto.SecretKey;
+import org.hamcrest.Matchers;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -77,6 +79,11 @@ class GatewayProxyBootTests {
 
     /** Stated by this test rather than inherited from {@code application.yml}'s default. */
     private static final String ALLOWED_ORIGIN = "http://localhost:3000";
+
+    /** The two correlation-id forms the platform propagates rather than replaces. */
+    private static final String A_CALLERS_CORRELATION_ID = "3f8b1c2e-9d4a-4f6e-8b7c-1a2d3e4f5a6b";
+
+    private static final String A_CALLERS_TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
 
     @Autowired
     MockMvc mvc;
@@ -194,6 +201,23 @@ class GatewayProxyBootTests {
                         .header("X-User-Roles", "ADMIN"))
                 .andExpect(status().isOk());
 
+        assertThat(received.get(0).header("X-User-Roles")).isEqualTo("CUSTOMER");
+    }
+
+    @Test
+    void aRoleHeaderSentTwiceByTheClientReachesTheServiceOnce() throws Exception {
+        // The same bypass in the shape two curl -H flags produce, which is a
+        // single header with two values rather than one comma-joined value. The
+        // gateway's own request reader would collapse these to "ADMIN, CUSTOMER"
+        // before the filter saw them, so the value that matters is the one the
+        // service is handed.
+        mvc.perform(get("/api/v1/events")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                        .header("X-User-Roles", "ADMIN", "ORGANIZER"))
+                .andExpect(status().isOk());
+
+        // header() joins repeated values with "|", so a second one surviving is a
+        // failure here rather than a value a reader has to notice is wrong.
         assertThat(received.get(0).header("X-User-Roles")).isEqualTo("CUSTOMER");
     }
 
@@ -362,6 +386,70 @@ class GatewayProxyBootTests {
     }
 
     @Test
+    void anAdminPathNoServiceServesIsNotProxiedToTheNotificationService() throws Exception {
+        // The regression for a route that claims the whole /api/v1/admin/** prefix.
+        // This caller is authorized for everything under it, so the request is not
+        // refused — it simply has no route, and the answer is the gateway's own 404.
+        // Under the prefix-wide route it would have been forwarded to
+        // notification-service instead, so a future /api/v1/admin/events would have
+        // been proxied to whichever service's route happened to be listed first
+        // rather than to the one that owns the data.
+        //
+        // Both halves are asserted, because they fail differently: the status is
+        // what the caller sees, and the empty `received` is what actually proves the
+        // request was not handed to a service with no authentication of its own
+        // (ADR 011). A 404 asserted alone would also be satisfied by a route that
+        // proxied to a service which then 404'd, having already leaked the path.
+        mvc.perform(get("/api/v1/admin/something-else")
+                .header(HttpHeaders.AUTHORIZATION, bearerFor(ADMIN_ID, Role.ADMIN)))
+                .andExpect(status().isNotFound());
+
+        assertThat(received)
+                .as("an unrouted admin path must not reach notification-service on its way to a 404")
+                .isEmpty();
+    }
+
+    @Test
+    void anAdminPathIsNotProxiedToTheNotificationServiceWhateverItsShape() throws Exception {
+        // The other half of the narrowing, and the reason it is worth a test of its
+        // own: a path that is under the prefix but off the shape is not this
+        // service's route either, so it 404s at the gateway too. Under
+        // /api/v1/admin/** these would have been forwarded and left to the service's
+        // own 404 — after the request had already arrived, and with the caller's
+        // identity headers on it.
+        for (String path : List.of(
+                "/api/v1/admin",
+                "/api/v1/admin/",
+                "/api/v1/admin/customers",
+                "/api/v1/admin/customers/42",
+                "/api/v1/admin/customers/42/notifications/extra",
+                "/api/v1/admin/customers/42/events")) {
+            mvc.perform(get(path).header(HttpHeaders.AUTHORIZATION, bearerFor(ADMIN_ID, Role.ADMIN)))
+                    .andExpect(status().isNotFound());
+
+            // The path is named on the assertion rather than the status: the status
+            // is 404 for all six, so a failure has to say which one was forwarded.
+            assertThat(received).as("GET %s", path).isEmpty();
+        }
+    }
+
+    @Test
+    void theNotificationRouteStillServesBothItsOwnAndItsOperatorPath() throws Exception {
+        // The narrowing is only safe if it keeps working what it was for, so the
+        // two shapes the service actually implements are asserted in one place
+        // rather than relying on the other inbox tests to have noticed.
+        mvc.perform(get("/api/v1/notifications")
+                .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/v1/admin/customers/" + CUSTOMER_ID + "/notifications")
+                .header(HttpHeaders.AUTHORIZATION, bearerFor(ADMIN_ID, Role.ADMIN)))
+                .andExpect(status().isOk());
+
+        assertThat(received).extracting(RecordedRequest::path)
+                .containsExactly("/api/v1/notifications", "/api/v1/admin/customers/42/notifications");
+    }
+
+    @Test
     void aCustomerIdForgedByTheClientIsReplacedByTheOnesInTheToken() throws Exception {
         // The bypass, end to end. A valid token for customer 42 plus a header
         // naming 999 is a request to book someone else's seats, and the service
@@ -438,11 +526,76 @@ class GatewayProxyBootTests {
     void aCorrelationIdTheCallerSuppliesIsForwardedRatherThanReplaced() throws Exception {
         mvc.perform(get("/api/v1/events")
                         .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
-                        .header("X-Correlation-Id", "trace-me-123"))
+                        .header("X-Correlation-Id", A_CALLERS_CORRELATION_ID))
                 .andExpect(status().isOk())
-                .andExpect(header().string("X-Correlation-Id", "trace-me-123"));
+                .andExpect(header().string("X-Correlation-Id", A_CALLERS_CORRELATION_ID));
 
-        assertThat(received.get(0).header("X-Correlation-Id")).isEqualTo("trace-me-123");
+        assertThat(received.get(0).header("X-Correlation-Id")).isEqualTo(A_CALLERS_CORRELATION_ID);
+    }
+
+    @Test
+    void aTraceIdTheCallerSuppliesIsForwardedToo() throws Exception {
+        // The other id shape the platform propagates: a 32-character hexadecimal
+        // trace id, which is what a caller holding a W3C traceparent or an
+        // OpenTelemetry span already has. Refusing it would mean an integration
+        // that worked had to change, for no security gain over accepting it.
+        mvc.perform(get("/api/v1/events")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                        .header("X-Correlation-Id", A_CALLERS_TRACE_ID))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-Correlation-Id", A_CALLERS_TRACE_ID));
+
+        assertThat(received.get(0).header("X-Correlation-Id")).isEqualTo(A_CALLERS_TRACE_ID);
+    }
+
+    @Test
+    void aCorrelationIdThePlatformWillNotPropagateIsReplacedEndToEnd() throws Exception {
+        // The bypass this closes, end to end. The caller's value reaches the MDC
+        // of every service the request touches and is written on the response, so
+        // an unvalidated one is a caller-supplied field in the platform's logs and
+        // in its own response — a newline in it is a forged log line.
+        //
+        // The gateway's header filter copies the MDC, so the value the service saw
+        // and the value the caller was told are the same generated UUID. That is
+        // the property that matters: a caller quoting one and a log line recording
+        // the other would not be talking about the same request.
+        for (String rejected : List.of(
+                "trace-me-123",
+                "abc\nINFO admin authenticated",
+                "x".repeat(5_000))) {
+            received.clear();
+
+            MvcResult result = mvc.perform(get("/api/v1/events")
+                            .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                            .header("X-Correlation-Id", rejected))
+                    .andExpect(status().isOk())
+                    .andReturn();
+
+            String downstream = received.get(0).header("X-Correlation-Id");
+            String onTheResponse = result.getResponse().getHeader("X-Correlation-Id");
+            String described = rejected.length() > 40 ? "an oversized value" : rejected;
+
+            assertThat(downstream).as("%s must not reach a service", described).isNotEqualTo(rejected).isNotBlank();
+            // Parses, and is in the canonical form, so this is an id the platform
+            // minted rather than another near-miss that happened to survive.
+            assertThat(UUID.fromString(downstream).toString())
+                    .as("%s downstream", described)
+                    .isEqualTo(downstream);
+            assertThat(onTheResponse).as("%s on the response", described).isNotEqualTo(rejected).isNotBlank();
+        }
+    }
+
+    @Test
+    void aBlankCorrelationIdBecomesAGeneratedOne() throws Exception {
+        mvc.perform(get("/api/v1/events")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                        .header("X-Correlation-Id", "   "))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-Correlation-Id", Matchers.matchesPattern(
+                        "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")));
+
+        String downstream = received.get(0).header("X-Correlation-Id");
+        assertThat(UUID.fromString(downstream).toString()).isEqualTo(downstream);
     }
 
     @Test

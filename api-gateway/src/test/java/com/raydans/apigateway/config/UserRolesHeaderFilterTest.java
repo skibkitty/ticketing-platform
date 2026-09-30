@@ -27,6 +27,15 @@ class UserRolesHeaderFilterTest {
 
     private final UserRolesHeaderFilter filter = new UserRolesHeaderFilter();
 
+    /**
+     * A correlation id in the form the platform propagates. Spelled here rather
+     * than reused from {@code CorrelationIdFilterTest} because this filter has no
+     * opinion about it — the point of the test that uses it is that a header this
+     * filter does not own is passed on untouched, and using a value the gateway
+     * would itself have replaced would make that ambiguous.
+     */
+    private static final String A_CALLERS_CORRELATION_ID = "3f8b1c2e-9d4a-4f6e-8b7c-1a2d3e4f5a6b";
+
     @Test
     void anAuthenticatedCallersRolesAreForwarded() {
         HttpHeaders forwarded = apply(inbound(), requestAuthenticatedAs(42L, Role.CUSTOMER));
@@ -100,17 +109,35 @@ class UserRolesHeaderFilterTest {
     }
 
     @Test
+    void aHeaderSentTwiceIsCollapsedToTheCallersOwnRoles() throws Exception {
+        // Two values on one header is a shape a client can produce that a
+        // single-valued one cannot: `curl -H "X-User-Roles: ADMIN" -H
+        // "X-User-Roles: CUSTOMER"` arrives as two lines of one header, and a
+        // downstream reading only the first — which is what a naive
+        // implementation downstream would do — reads whichever the client put
+        // there. The remove() below clears every value, not just the first, and
+        // this is the test that says so.
+        HttpHeaders inbound = new HttpHeaders();
+        inbound.add(UserRolesHeaderFilter.HEADER_NAME, "ADMIN");
+        inbound.add(UserRolesHeaderFilter.HEADER_NAME, "CUSTOMER,ORGANIZER");
+
+        HttpHeaders forwarded = apply(inbound, requestAuthenticatedAs(42L, Role.CUSTOMER));
+
+        assertThat(forwarded.get(UserRolesHeaderFilter.HEADER_NAME)).containsExactly("CUSTOMER");
+    }
+
+    @Test
     void theOtherInboundHeadersAreLeftAlone() {
         // This filter's job is the caller's roles and nothing else — the
         // Customer id is CustomerIdHeaderFilter's. A filter that rebuilt the
         // whole header set would quietly drop content negotiation and tracing
         // headers on their way downstream.
-        HttpHeaders inbound = inbound("Accept", "application/json", "X-Correlation-Id", "abc-123");
+        HttpHeaders inbound = inbound("Accept", "application/json", "X-Correlation-Id", A_CALLERS_CORRELATION_ID);
 
         HttpHeaders forwarded = apply(inbound, requestAuthenticatedAs(42L, Role.CUSTOMER));
 
         assertThat(forwarded.getFirst("Accept")).isEqualTo("application/json");
-        assertThat(forwarded.getFirst("X-Correlation-Id")).isEqualTo("abc-123");
+        assertThat(forwarded.getFirst("X-Correlation-Id")).isEqualTo(A_CALLERS_CORRELATION_ID);
     }
 
     private HttpHeaders apply(HttpHeaders inbound, HttpServletRequest servletRequest) {

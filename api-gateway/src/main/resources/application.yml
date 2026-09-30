@@ -26,13 +26,28 @@ spring:
           - id: notification-service
             uri: ${NOTIFICATION_SERVICE_URL:http://localhost:8084}
             predicates:
-              # The admin prefix too: /api/v1/admin/customers/{id}/notifications
-              # reads this service's rows, and the ADMIN rule in RoleAuthorizer is
-              # what makes it an operator route rather than a customer's (ADR 011).
-              # The prefix is claimed whole because a path pattern cannot hold a
-              # variable in the middle; an admin route for another service's data
-              # goes in a route ahead of this one. See ADR 011's closing caveat.
-              - Path=/api/v1/notifications/**,/api/v1/admin/**
+              # The operator route is named as precisely as the gateway can name
+              # it: /api/v1/admin/customers/{id}/notifications reads this service's
+              # rows, and the ADMIN rule in RoleAuthorizer is what makes it an
+              # operator route rather than a customer's (ADR 011).
+              #
+              # Claiming the whole /api/v1/admin/** prefix instead would be a
+              # statement about routes nobody has written: a future
+              # /api/v1/admin/events would be proxied to this service purely by
+              # virtue of sitting under the prefix, and the person adding it would
+              # have no reason to know. A path pattern holds a variable in the
+              # middle, so there is no reason to claim more than the one path this
+              # service serves. An admin route for another service's data is now an
+              # independent route with its own pattern, not one that has to be
+              # inserted ahead of this.
+              #
+              # The authorization rule stays deliberately wider than this route —
+              # /api/v1/admin/** is ADMIN's prefix in RoleAuthorizer, so a path under
+              # it that no service serves yet is still refused to a Customer rather
+              # than falling through to the /api/** catch-all. Failing closed on
+              # the route and on the rule are separate decisions and both are
+              # wanted. See ADR 011.
+              - Path=/api/v1/notifications/**,/api/v1/admin/customers/{id}/notifications
 
 app:
   cors:

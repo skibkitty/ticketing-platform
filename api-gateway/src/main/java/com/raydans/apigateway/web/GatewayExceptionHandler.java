@@ -12,6 +12,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
  * Maps the login surface's failures to the shared {@code ApiErrorResponse}
@@ -66,6 +67,32 @@ public class GatewayExceptionHandler {
                 .map(error -> error.getField() + " " + error.getDefaultMessage())
                 .toList();
         return respond(HttpStatus.BAD_REQUEST, "Request body is not valid", request, details);
+    }
+
+    /**
+     * A path no route matched. Spring MVC's resource handler raises this when the
+     * gateway's routing declines a request, and answers it as a 404 by default —
+     * but only when nothing else handles it first, and the catch-all below
+     * catches everything. So without this, every unrouted path is reported as an
+     * unexpected server error: a wrong URL answers 500 with an ERROR log line and
+     * tells a caller the gateway is broken when it is only being asked for
+     * something it does not have.
+     *
+     * <p>This is how the gateway answers an operator path that belongs to no
+     * service, which is the point of the narrow notification route (ADR 011): the
+     * path does not exist here, rather than existing on a service that would
+     * 404 it. A route that matched the caller's ADMIN role but no data would be a
+     * different answer, and one that arrives with the caller's identity headers on
+     * it — which is the reason this is 404 here and not a proxy to a service's own
+     * 404.
+     */
+    @ExceptionHandler(NoResourceFoundException.class)
+    ResponseEntity<ApiErrorResponse> noRouteMatches(
+            NoResourceFoundException ex, HttpServletRequest request) {
+        // Deliberately not logged: an unrouted path is a client's question, not the
+        // gateway's malfunction, and logging it at error level per request would be
+        // noise an operator learns to ignore.
+        return respond(HttpStatus.NOT_FOUND, "No such route", request, List.of());
     }
 
     @ExceptionHandler(Exception.class)

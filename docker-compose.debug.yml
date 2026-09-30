@@ -1,10 +1,12 @@
 # Development-only override: publish the internal services to the host so they
-# can be debugged with curl, an IDE, or a tool that speaks HTTP directly.
+# can be debugged with curl, an IDE, or a tool that speaks HTTP directly — and
+# the infrastructure services, so `psql`, the Kafka CLI and the Kafka UI work
+# against the stack.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.debug.yml up --build
 #
-# This is a deliberate exception to ADR 012, and the exception is the whole
-# point of keeping it in its own file: `docker compose up` reads only
+# This is a deliberate exception to ADR 012 and ADR 013, and the exception is
+# the whole point of keeping it in its own file: `docker compose up` reads only
 # docker-compose.yml, so the normal path cannot publish an internal port even by
 # accident. Read this before using it.
 #
@@ -12,10 +14,13 @@
 # that checks a signature and a role (ADR 002), and notification-service trusts
 # the identity it is handed and checks no role of its own (ADR 011), so
 # `curl localhost:8084/api/v1/admin/customers/42/notifications` reads a
-# Customer's Notifications with no token at all. Loopback is the best that can be
-# done for a debugging convenience — it keeps a colleague on the LAN out — and
-# it is not a control. Any process on this machine, including anything running
-# as this user, can still make that call.
+# Customer's Notifications with no token at all. postgres and kafka-ui are
+# broader still: the first holds every schema in the platform behind
+# credentials that are in docker-compose.yml, and the second shows every
+# Customer's reservation and payment history while authenticating nobody.
+# Loopback is the best that can be done for a debugging convenience — it keeps
+# a colleague on the LAN out — and it is not a control. Any process on this
+# machine, including anything running as this user, can still make that call.
 #
 # So: bound to loopback, never to 0.0.0.0, and take it back down when the
 # debugging is done (`docker compose ... down`, which drops the published ports
@@ -33,3 +38,24 @@ services:
   notification-service:
     ports:
       - "127.0.0.1:8084:8080"
+
+  # For a host-side `psql`, a migration, or a seed script. Compose still
+  # publishes nothing by default, so a developer running one of the services
+  # with `mvn spring-boot:run` — every service's application.yml defaults to
+  # localhost:5432 — needs this file (ADR 013).
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  # For a host-side Kafka client. Service-to-service traffic is unaffected
+  # either way: it speaks PLAINTEXT on kafka:9092 over the compose network and
+  # never touches this binding.
+  kafka:
+    ports:
+      - "127.0.0.1:29092:29092"
+
+  # http://localhost:8090 — the whole event history of the platform, readable
+  # without a credential. It is also the reason this is loopback-only.
+  kafka-ui:
+    ports:
+      - "127.0.0.1:8090:8080"

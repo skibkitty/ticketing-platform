@@ -470,16 +470,20 @@ class ReservationFlowBootTests {
                 "UPDATE reservation.seats SET hold_expires_at = now() - interval '1 minute' WHERE id = ?",
                 seatId);
 
-        String correlationId = "corr-read-path-" + reservationId;
-        HttpHeaders headers = new HttpHeaders();
-        headers.set(CORRELATION_HEADER, correlationId);
         ResponseEntity<Map> response = rest.exchange(
                 "/api/v1/reservations/" + reservationId,
                 HttpMethod.GET,
-                new HttpEntity<>(headers),
+                new HttpEntity<>(new HttpHeaders()),
                 Map.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody().get("status")).isEqualTo("EXPIRED");
+
+        // The id this request travelled under, read back off the response rather
+        // than dictated by the test. The filter only propagates a caller's value
+        // when it is a shape the platform recognises, so supplying one here would
+        // be asserting about a header the test does not get to choose.
+        String correlationId = response.getHeaders().getFirst(CORRELATION_HEADER);
+        assertThat(correlationId).isNotBlank();
 
         assertThat(jdbc.queryForObject(
                 "SELECT status FROM reservation.seats WHERE id = ?", String.class, seatId))

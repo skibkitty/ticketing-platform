@@ -117,8 +117,9 @@ guarantee (sub-second precision) this use case doesn't need.
 
 ## Why rate limiting + a bulkhead specifically on `POST /api/v1/reservations`, and nowhere else
 
-This is the flash-sale endpoint — the one place a popular event's on-sale
-moment produces a traffic spike orders of magnitude above normal load, often
+*Planned in [#13](https://github.com/skibkitty/ticketing-platform/issues/13), not
+built yet.* This is the flash-sale endpoint — the one place a popular event's
+on-sale moment produces a traffic spike orders of magnitude above normal load, often
 from bots. A `RateLimiter` caps the request rate the gateway will forward
 for that route; a `Bulkhead` caps how many of those requests can be
 *in flight* at once, so a slow downstream response can't let concurrent
@@ -127,15 +128,41 @@ applied to, say, `GET /api/v1/events` — browsing traffic doesn't have the
 same spike profile or the same cost-per-request (a seat hold does real
 write work; a browse is a cheap read).
 
+Worth keeping distinct from login brute-force protection, which is a separate
+follow-up: this is about load on one endpoint, and the other is about an
+unauthenticated endpoint being guessable. A rate limit scoped to the
+reservation route would not cover `/auth/login` at all.
+
 ## Why a circuit breaker + fallback on the payment-status query route, specifically
 
-`GET /api/v1/payments/{reservationId}` is the one gateway route that's a
+*Planned in [#13](https://github.com/skibkitty/ticketing-platform/issues/13), not
+built yet.* `GET /api/v1/payments/{reservationId}` is the one gateway route that's a
 synchronous proxy call to a service (`payment-service`) that could be
 briefly overloaded by its own consumer workload. Wrapping it in a circuit
 breaker means a struggling payment-service degrades this one
 non-critical status-lookup route to a fast, clear "temporarily unavailable"
 response instead of a hanging request — it doesn't block the reservation
 flow itself, since that's fully async via Kafka.
+
+## Why the login surface is a configured credential set rather than an identity
+
+*As built, and deliberately not more.* `POST /auth/login` authenticates against
+callers the gateway is configured with — the demo passwords arrive from the
+environment, so nothing usable is in the repository — and issues a stateless
+JWT. That is a real trust boundary for everything past it, and it is not
+password authentication in the sense a production system means: the configured
+value *is* the credential, there is no password store, changing one revokes
+nothing already issued, and a token is good until it expires with no refresh and
+no revocation list. `docs/adr/002-gateway-trust-boundary.md` states the
+limitations in full.
+
+The reason it can stay this small is the shape of the rest of the system: the
+gateway is already the single place a token is verified and the single place a
+role is enforced, so a real credential store, rotation and revocation land
+behind that one interface rather than across every service. Login brute-force
+protection is a separate follow-up from the reservation rate limiting above,
+because the route is the one reachable without a token
+([#43](https://github.com/skibkitty/ticketing-platform/issues/43)).
 
 ## Why JWT validation and CORS live only at the gateway
 
@@ -153,10 +180,14 @@ no Customer id, because the domain does not make it one. See
 "Not reachable except through the gateway" is a property of the deployment, not
 of the code, so it is asserted where the deployment is: the default compose
 file publishes no port for reservation-service, payment-service or
-notification-service, the gateway reaches them by service name on the compose
-network, and `platform-tests` fails the build if a published port reappears —
-in the default file or on an interface wider than loopback in the debugging
-override. See `docs/adr/012-gateway-is-the-only-published-surface.md`. The
+notification-service — and none for postgres, kafka or kafka-ui either — the
+gateway reaches them by service name on the compose network, and `platform-tests`
+fails the build if a published port reappears, on the default file or on an
+interface wider than loopback in the debugging override. The default stack
+publishes exactly one port, the gateway's, and that is the invariant the
+allowlist in those tests encodes. See
+`docs/adr/012-gateway-is-the-only-published-surface.md` and
+`docs/adr/013-infrastructure-ports-follow-the-gateway-rule.md`. The
 gateway is the only place a role is enforced, so a way to skip it is a way to
 skip the authorization, which is why a loopback-bound port counts as one.
 

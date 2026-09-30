@@ -2,6 +2,8 @@ package com.raydans.platform;
 
 import static com.raydans.platform.ComposeStack.GATEWAY;
 import static com.raydans.platform.ComposeStack.INTERNAL_SERVICES;
+import static com.raydans.platform.ComposeStack.INFRASTRUCTURE_SERVICES;
+import static com.raydans.platform.ComposeStack.UNPUBLISHED_SERVICES;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.LinkedHashSet;
@@ -13,8 +15,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * The published HTTP surface of the default stack, which is the whole of the
- * authentication and authorization boundary (ADR 002, ADR 012).
+ * The published host surface of the default stack, which is the whole of the
+ * authentication and authorization boundary (ADR 002, ADR 012, ADR 013).
  *
  * <p>The gateway checks a signature and a role. The services behind it do not,
  * by decision: they trust the identity headers the gateway sets and hold no
@@ -30,6 +32,11 @@ import org.junit.jupiter.api.Test;
  * Notifications, because {@code GET /api/v1/admin/customers/42/notifications}
  * is guarded by ADMIN at the gateway and by nothing at all in the service
  * (ADR 011).
+ *
+ * <p>And the same rule reaches the infrastructure, which is not an exemption but
+ * a worse case: postgres holds every schema in the platform behind credentials
+ * that are in the compose file, and kafka-ui shows the whole event history while
+ * authenticating nobody (ADR 013).
  */
 class InternalServiceExposureTests {
 
@@ -39,12 +46,15 @@ class InternalServiceExposureTests {
     /**
      * Every port the default stack publishes, by service. An allowlist rather
      * than a rule about "the internal services", because the interesting failure
-     * is the next service somebody adds: a rule naming the three services today
-     * would be satisfied by a fourth publishing its port tomorrow, and this list
-     * makes that a deliberate edit.
+     * is the next service somebody adds: a rule naming the services that are
+     * unpublished today would be satisfied by a fifth publishing its port
+     * tomorrow, and this list makes that a deliberate edit.
+     *
+     * <p>One entry, and it is the gateway. A widening of the list has to say
+     * which thing is now reachable from the host, which is the question the
+     * list exists to force.
      */
-    private static final Map<String, List<Integer>> PUBLISHED_ON_THE_HOST =
-            Map.of(GATEWAY, List.of(8080), "postgres", List.of(5432), "kafka", List.of(29092), "kafka-ui", List.of(8090));
+    private static final Map<String, List<Integer>> PUBLISHED_ON_THE_HOST = Map.of(GATEWAY, List.of(8080));
 
     private final ComposeStack stack = ComposeStack.fromFiles(DEFAULT_STACK);
 
@@ -60,7 +70,19 @@ class InternalServiceExposureTests {
     }
 
     @Test
-    @DisplayName("the published host ports are the gateway and the infrastructure, and nothing else")
+    @DisplayName("no infrastructure service publishes a port either")
+    void noInfrastructureServiceIsPublishedToTheHost() {
+        for (String service : INFRASTRUCTURE_SERVICES) {
+            assertThat(stack.publishedPorts(service))
+                    .as("%s holds the platform's data and authenticates nothing, so a published port is a read of"
+                            + " that data with no token: postgres has every schema behind credentials that are in this"
+                            + " file, and kafka-ui shows every event without a credential (ADR 013)", service)
+                    .isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("the published host ports are the gateway, and nothing else")
     void theOnlyPublishedPortsAreTheOnesThatWereDecidedOn() {
         Set<String> actuallyPublished = stack.serviceNames().stream()
                 .filter(service -> !stack.publishedPorts(service).isEmpty())
@@ -69,6 +91,25 @@ class InternalServiceExposureTests {
         assertThat(actuallyPublished)
                 .as("a new published port is a new way around the gateway, so adding one means deciding it here")
                 .isEqualTo(PUBLISHED_ON_THE_HOST.keySet());
+    }
+
+    @Test
+    @DisplayName("the default stack publishes exactly one port, and it is 8080")
+    void theDefaultStackPublishesOnlyTheGatewayPort() {
+        // The same fact as the allowlist above, stated as the number rather than
+        // as a set of names, because "8080 and nothing else" is the invariant a
+        // reader of the compose file is meant to be able to check at a glance.
+        List<ComposeStack.PublishedPort> everythingPublished = stack.serviceNames().stream()
+                .flatMap(service -> stack.publishedPorts(service).stream())
+                .toList();
+
+        assertThat(everythingPublished)
+                .as("the host should be able to open one socket into this stack, and it should be the gateway's")
+                .singleElement()
+                .satisfies(port -> {
+                    assertThat(port.service()).isEqualTo(GATEWAY);
+                    assertThat(port.published()).isEqualTo(8080);
+                });
     }
 
     @Test
@@ -82,6 +123,27 @@ class InternalServiceExposureTests {
             assertThat(port.isOnEveryInterface())
                     .as("the gateway is the entry point, so it has to be reachable from off this machine")
                     .isTrue();
+        });
+    }
+
+    @Test
+    @DisplayName("each service reaches the infrastructure by name, so nothing depends on a host port")
+    void servicesReachTheInfrastructureOverTheComposeNetwork() {
+        // The other half of removing the infrastructure ports: a service-to-service
+        // hop that went via the host would break, and would break silently as a
+        // connection refused that a developer would read as a database problem.
+        // Spelled out rather than derived, so renaming a service without the
+        // matching URL is a failure here rather than a stack that cannot start.
+        Map<String, String> expectedDatabase = Map.of(
+                "reservation-service", "jdbc:postgresql://postgres:5432/platform?currentSchema=reservation",
+                "payment-service", "jdbc:postgresql://postgres:5432/platform?currentSchema=payment",
+                "notification-service", "jdbc:postgresql://postgres:5432/platform?currentSchema=notification");
+
+        INTERNAL_SERVICES.forEach(service -> {
+            assertThat(stack.environment(service))
+                    .as("%s reaches postgres", service)
+                    .containsEntry("DB_URL", expectedDatabase.get(service))
+                    .containsEntry("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092");
         });
     }
 
@@ -127,10 +189,13 @@ class InternalServiceExposureTests {
         // The escape hatch is a separate file, so the normal path cannot take
         // it. What it may not do is bind wide: 0.0.0.0:8084:8080 would be the
         // bypass with a step added, and it would still pass every other test
-        // here.
+        // here. The infrastructure is held to the same line, which is where a
+        // debug override is most likely to be written loosely: a developer adding
+        // `- "5432:5432"` for a psql session is editing the file that says not
+        // to (ADR 013).
         ComposeStack debug = ComposeStack.fromFiles(DEBUG_OVERRIDE);
 
-        for (String service : INTERNAL_SERVICES) {
+        for (String service : UNPUBLISHED_SERVICES) {
             assertThat(debug.publishedPorts(service)).singleElement().satisfies(port -> {
                 assertThat(port.isOnLoopbackOnly())
                         .as("%s is published for debugging only, and a debugging convenience is not a control", service)
@@ -147,7 +212,7 @@ class InternalServiceExposureTests {
 
         assertThat(debug.serviceNames()).isEqualTo(stack.serviceNames());
         assertThat(debug.publishedPorts(GATEWAY)).isEqualTo(stack.publishedPorts(GATEWAY));
-        INTERNAL_SERVICES.forEach(service ->
+        UNPUBLISHED_SERVICES.forEach(service ->
                 assertThat(debug.environment(service)).isEqualTo(stack.environment(service)));
     }
 }

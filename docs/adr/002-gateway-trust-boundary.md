@@ -112,6 +112,45 @@ another Customer's name by setting a header, which is the whole of the
 authorization decision for a request like `POST /api/v1/reservations` — a
 service that trusted the inbound header would have no authorization at all.
 
+**The authentication here is a configured demo credential set, not an identity
+provider.** Worth stating plainly, because the rest of this ADR describes a real
+trust boundary and it would be easy to read the whole document as a claim that
+the login surface is production-grade password authentication. It is not:
+
+- **The passwords are configuration, not stored credentials.** They come from
+  the environment and are compared against a configured value per caller
+  (`app.gateway.callers.*.password`). There is no password database, no hashing
+  at rest and no identity provider, because there is nothing to authenticate
+  against — the value in configuration *is* the credential.
+- **Changing a password does not revoke anything.** It changes what the login
+  surface will accept from then on. A token issued before the change remains
+  valid until it expires, and a token issued before a caller was deleted stays
+  valid too. There is no revocation list, no `jti` to deny, and no session to
+  invalidate — the JWT is the whole of the session.
+- **A token is valid until its expiry** and nothing shorter. `JWT_TTL` defaults
+  to an hour and there is no refresh token, so the honest description of
+  "logging out" is "stop sending it".
+- **Nobody is rate-limited at the login surface.** `/auth/login` is the one
+  endpoint reachable with no token, and it has no attempt limit, so it is
+  guessable at whatever rate the network allows. Constant-time comparison and an
+  identical response for an unknown username and a wrong password mean the
+  endpoint does not leak *which* credentials exist; it does nothing about
+  *how many* tries. Login brute-force protection is its own follow-up,
+  [#43](https://github.com/skibkitty/ticketing-platform/issues/43), and is
+  deliberately separate from the flash-sale rate limiting in
+  [#13](https://github.com/skibkitty/ticketing-platform/issues/13), which is
+  scoped to `POST /api/v1/reservations` and would not cover it.
+- **Roles come from configuration too.** A caller's roles are whatever
+  `app.gateway.callers.*.roles` says, so the role table is an operator's
+  configuration decision rather than something a user can hold or change.
+
+Production identity management — a credential store, hashing, rotation that
+revokes, refresh and revocation, and a rate limit on the login endpoint — is a
+follow-up, and it is the part of this boundary that has to change before the
+platform carries real users. Nothing else in this ADR has to change with it: the
+gateway is already the single place a token is verified, so replacing what
+verifies it is a change behind one interface.
+
 Making reservations Customer-only is a change in behaviour, and the one this
 decision is most likely to be second-guessed on: an organizer or an admin can no
 longer buy a seat with its own token. That is the correct answer given the
@@ -128,12 +167,38 @@ default `docker-compose.yml` therefore publishes no port for
 reservation-service, payment-service or notification-service at all — they are
 reachable by service name on the compose network, and by nothing else, with
 `docker-compose.debug.yml` as the opt-in exception for host-side debugging. See
-ADR 012, which records that decision. A host port is a debugging convenience,
-never an access path: an internal service with no gateway route in front of it
-is not safe to expose, and one that reads a Customer's data by an id in the
-path has nothing of its own to stop that. A host-local process can still forge
-the headers, which is accepted at demo scale. If this ever runs on a shared or
-untrusted network, each service must validate the JWT itself instead of
-trusting the headers, and the `X-Customer-Id` derivation above stops being
-load-bearing for authorization only because each service would be deriving it
-from the token itself.
+ADR 012, which records that decision, and ADR 013, which extends it to postgres,
+kafka and kafka-ui, so the default file publishes one port in total: the
+gateway's. A host port is a debugging convenience, never an access path: an
+internal service with no gateway route in front of it is not safe to expose, and
+one that reads a Customer's data by an id in the path has nothing of its own to
+stop that. A host-local process can still forge the headers, which is accepted at
+demo scale. If this ever runs on a shared or untrusted network, each service must
+validate the JWT itself instead of trusting the headers, and the `X-Customer-Id`
+derivation above stops being load-bearing for authorization only because each
+service would be deriving it from the token itself.
+
+**What holds the boundary, and where that is asserted.** The invariant is not
+"the filters strip the headers" on its own — a strip that a later edit moved
+inside a conditional would be a bypass that reads correctly. So the properties
+are each a test, and a change to one of these has to break one of them:
+
+- A client-supplied `X-User-Roles` or `X-Customer-Id` never reaches a service,
+  on an authenticated request, on an unauthenticated one, and for a caller the
+  gateway gives no such header at all — including an organizer forging a
+  Customer id, which is stripped rather than left to pass (`UserRolesHeaderFilterTest`,
+  `CustomerIdHeaderFilterTest`, and both halves end to end in
+  `GatewayProxyBootTests`).
+- The header is **overwritten, never appended**, so a value repeated by the
+  client — one `X-User-Roles` sent twice by two `curl -H` flags, or
+  `X-Customer-Id` as two values — cannot leave a second value behind for a
+  downstream reading only the first.
+- A request that was not authenticated propagates no identity headers at all.
+- The value that does arrive is derived from the verified token, never from the
+  username: `aTokenFromTheLoginRouteSpeaksForTheCustomersIdAndNotTheUsername`.
+- A route for another service's data is not routed to this one, so "a service
+  trusts `X-User-Roles`" never becomes "a service trusts `X-User-Roles` for a
+  request that was never meant for it" (ADR 011).
+- And the deployment, which is the other half: `platform-tests` fails the build
+  if a published port reappears, on the default file or on an interface wider
+  than loopback in the debugging override (ADR 012, ADR 013).
