@@ -562,6 +562,7 @@ class GatewayProxyBootTests {
         for (String rejected : List.of(
                 "trace-me-123",
                 "abc\nINFO admin authenticated",
+                "0".repeat(32),
                 "x".repeat(5_000))) {
             received.clear();
 

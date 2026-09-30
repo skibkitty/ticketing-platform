@@ -54,8 +54,8 @@ class CorrelationIdFilterTest {
 
     @Test
     void echoesAThirtyTwoCharacterTraceId() throws Exception {
-        // The other id a caller can already be holding: a W3C traceparent or an
-        // OpenTelemetry trace id with the dashes stripped. Accepting it is what
+        // The other id a caller can already be holding: a W3C traceparent or
+        // an OpenTelemetry trace id with the dashes stripped. Accepting it is what
         // keeps this from being a change an existing integration has to notice.
         String traceId = "4bf92f3577b34da6a3ce929d0e0e4736";
         MockHttpServletRequest traced = new MockHttpServletRequest();
@@ -66,6 +66,53 @@ class CorrelationIdFilterTest {
 
         assertThat(tracedResponse.getHeader(CorrelationIdFilter.HEADER_NAME)).isEqualTo(traceId);
     }
+
+    @Test
+    void replacesTheAllZeroTraceId() throws Exception {
+        // 32 hex characters, so the trace-id rule matches it — and W3C Trace
+        // Context reserves exactly this value to mean "no valid trace id". It is
+        // the one value in this shape a caller cannot be holding, because a span
+        // outside a trace reports it rather than inventing a real one.
+        //
+        // Propagating it would be worse than propagating a hostile value: that one
+        // is visibly wrong, while this one is indistinguishable from a real id and
+        // is the same for every caller, so every request in the platform would be
+        // reported under one id and none of them could be told apart.
+        String allZero = "0".repeat(32);
+        MockHttpServletRequest zeroed = new MockHttpServletRequest();
+        MockHttpServletResponse zeroedResponse = new MockHttpServletResponse();
+        zeroed.addHeader(CorrelationIdFilter.HEADER_NAME, allZero);
+
+        filter.doFilter(zeroed, zeroedResponse, new MockFilterChain());
+
+        assertItIsAGeneratedUuid(zeroedResponse.getHeader(CorrelationIdFilter.HEADER_NAME));
+        assertThat(zeroedResponse.getHeader(CorrelationIdFilter.HEADER_NAME)).isNotEqualTo(allZero);
+    }
+
+    @Test
+    void aTraceIdThatIsNearlyAllZerosIsStillPropagated() throws Exception {
+        // The other side of that rule, and the reason it is written as one value
+        // excluded by name rather than as a pattern over the hex digits: a real
+        // trace id can begin with a long run of zeros, and rejecting anything that
+        // looks like them would refuse an id a caller genuinely holds — which is
+        // the cost the two accepted id shapes are chosen to avoid. Both of these
+        // differ from the all-zero id in the last character alone, and both are
+        // propagated.
+        for (String nearlyAllZero : List.of(
+                "0".repeat(31) + "1",
+                "0".repeat(31) + "a")) {
+            MockHttpServletRequest nearly = new MockHttpServletRequest();
+            MockHttpServletResponse nearlyResponse = new MockHttpServletResponse();
+            nearly.addHeader(CorrelationIdFilter.HEADER_NAME, nearlyAllZero);
+
+            filter.doFilter(nearly, nearlyResponse, new MockFilterChain());
+
+            assertThat(nearlyResponse.getHeader(CorrelationIdFilter.HEADER_NAME))
+                    .as("%s is a trace id, not the reserved all-zero one", nearlyAllZero)
+                    .isEqualTo(nearlyAllZero);
+        }
+    }
+
 
     @Test
     void generatesUuidWhenAbsent() throws Exception {

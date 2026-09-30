@@ -72,6 +72,18 @@ public class CorrelationIdFilter extends OncePerRequestFilter {
      */
     private static final Pattern TRACE_ID = Pattern.compile("[0-9a-fA-F]{32}");
 
+    /**
+     * The one 32-hex value that is not a trace id. W3C Trace Context reserves it
+     * to mean <em>no valid trace id</em> — a span that is not part of a trace
+     * reports it rather than inventing a real one — so a caller cannot be
+     * holding it as its own id, and propagating it would be the worst outcome
+     * of all: not a forged value, but a legitimate-looking one that is the same
+     * for every caller, which collapses the whole point of correlating a
+     * request through the services it touched. {@code [0-9a-fA-F]{32}} matches
+     * it, so it is excluded by name rather than left to the pattern.
+     */
+    private static final String ALL_ZERO_TRACE_ID = "0".repeat(32);
+
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
             throws ServletException, IOException {
@@ -106,7 +118,21 @@ public class CorrelationIdFilter extends OncePerRequestFilter {
         if (value.length() == UUID_STRING_LENGTH) {
             return isCanonicalUuid(value);
         }
-        return TRACE_ID.matcher(value).matches();
+        return isRealTraceId(value);
+    }
+
+    /**
+     * Whether the value is a trace id rather than merely 32 hex characters. The
+     * all-zero id is excluded here rather than in the pattern, so the rule is
+     * readable as the one value it is about instead of as a negative lookahead.
+     *
+     * <p>Only the trace id shape is narrowed this way. The nil UUID is a value
+     * RFC 4122 defines and {@link #isCanonicalUuid} accepts, and W3C says
+     * nothing about UUIDs, so changing that would be a different decision about
+     * a different id format rather than a consequence of this one.
+     */
+    private static boolean isRealTraceId(String value) {
+        return TRACE_ID.matcher(value).matches() && !ALL_ZERO_TRACE_ID.equals(value);
     }
 
     /** Whether the value is exactly what {@link UUID#toString()} would have produced. */
