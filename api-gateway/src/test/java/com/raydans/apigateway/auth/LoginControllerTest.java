@@ -67,7 +67,16 @@ class LoginControllerTest {
     }
 
     private MockMvc mvcLoggingInAs(CallerDirectoryProperties callers) {
-        return MockMvcBuilders.standaloneSetup(new LoginController(new MapCallerDirectory(callers), tokens))
+        // The limiter is the real one, with the limits application.yml ships. A
+        // separate test class pins its own behaviour; what matters here is that
+        // every test below runs against the same wiring the deployment uses — a
+        // controller built without it would answer a login that no deployment
+        // answers. Fresh per MockMvc so each test starts with a whole budget.
+        LoginThrottle throttle = new LoginThrottle(
+                new LoginThrottleProperties(5, 20, Duration.ofMinutes(5)), Clock.fixed(NOW, ZoneOffset.UTC));
+
+        return MockMvcBuilders.standaloneSetup(
+                        new LoginController(new MapCallerDirectory(callers), tokens, throttle))
                 .setMessageConverters(new MappingJackson2HttpMessageConverter(objectMapper))
                 .setControllerAdvice(new GatewayExceptionHandler(new ErrorResponseWriter(objectMapper)))
                 .build();

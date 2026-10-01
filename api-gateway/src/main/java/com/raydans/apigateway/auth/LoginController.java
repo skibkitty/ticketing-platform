@@ -1,5 +1,6 @@
 package com.raydans.apigateway.auth;
 
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -12,6 +13,14 @@ import org.springframework.web.bind.annotation.RestController;
  * The one route on the gateway that is deliberately unauthenticated: how a
  * caller becomes authenticated in the first place. Hands out a token and nothing
  * else — no session, no state, no downstream call.
+ *
+ * <p>The limit on guessing lives here rather than in a filter or in the gateway
+ * proxy config, and the reason is that only this method can tell a failed guess
+ * from a successful one. A filter sees requests and counts them, which answers
+ * "how many attempts arrived" and not "how many were wrong" — so it would spend a
+ * real caller's budget on their sign-in, and it would have no way to know that a
+ * login which succeeded should hand the account its budget back. Being the
+ * controller is what makes the counter mean something (ADR 015).
  */
 @RestController
 @RequestMapping("/auth")
@@ -19,18 +28,42 @@ public class LoginController {
 
     private final MapCallerDirectory directory;
     private final JwtService tokens;
+    private final LoginThrottle throttle;
 
-    public LoginController(MapCallerDirectory directory, JwtService tokens) {
+    public LoginController(MapCallerDirectory directory, JwtService tokens, LoginThrottle throttle) {
         this.directory = directory;
         this.tokens = tokens;
+        this.throttle = throttle;
     }
 
     @PostMapping("/login")
-    LoginResponse login(@Valid @RequestBody LoginRequest request) {
+    LoginResponse login(HttpServletRequest request, @Valid @RequestBody LoginRequest credentials) {
+        // The remote address is read here and nowhere else, and no forwarded
+        // header is consulted (ADR 015): this platform has one hop and trusts
+        // nothing, so a forwarded header is the caller's own.
+        String remoteAddress = request.getRemoteAddr();
+
+        // Asked first, before the password is read at all: a caller over the limit
+        // learns nothing from being refused, which a correct password must not
+        // change or the limit becomes a password oracle with a rate limit on it.
+        throttle.refuseWhenThrottled(remoteAddress, credentials.username());
+
         CallerCredentials account = directory
-                .findByUsername(request.username())
-                .filter(candidate -> secretsMatch(candidate.password(), request.password()))
-                .orElseThrow(InvalidCredentialsException::new);
+                .findByUsername(credentials.username())
+                .filter(candidate -> secretsMatch(candidate.password(), credentials.password()))
+                .orElse(null);
+
+        if (account == null) {
+            // Counted and then refused or not, inside the throttle: an unknown
+            // username is counted exactly as a wrong password is, which is what
+            // stops the counter itself from disclosing which login names exist.
+            throttle.recordFailure(remoteAddress, credentials.username());
+            throw new InvalidCredentialsException();
+        }
+
+        // The account's own budget back, and only the account's — see
+        // LoginThrottle#recordSuccess.
+        throttle.recordSuccess(credentials.username());
 
         // The subject is the identity this login name belongs to, not the login
         // name: everything the gateway tells a downstream service about the
