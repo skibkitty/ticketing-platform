@@ -60,6 +60,14 @@ import org.springframework.test.web.servlet.MockMvc;
  * <p>The downstream is the JDK's own {@code HttpServer} rather than a mock
  * because the claim is about bytes on a socket: a mock configured to agree with
  * the gateway's intentions agrees precisely when they were wrong.
+ *
+ * <p>That server refuses keep-alive, so no request here runs its downstream hop
+ * over a connection an earlier request left behind. The JDK 21 client can fail
+ * that hop with a {@code NullPointerException} in
+ * {@code Http1Exchange.requestMoreBody} — it dereferences the body's subscriber
+ * before {@code sendBodyAsync} has installed one — which surfaces to the caller
+ * as a 500 and is intermittent, so it cannot be provoked on demand. A race the
+ * test cannot control would make every other claim in this class provisional.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -965,12 +973,52 @@ class GatewayProxyBootTests {
         assertThat(received).isEmpty();
     }
 
+    @Test
+    void consecutiveProxiedRequestsDoNotShareAConnection() throws Exception {
+        // The stand-in refuses keep-alive, so each proxied hop has to arrive on a
+        // connection of its own. Asserted through the client's ephemeral port
+        // because the server cannot say which connection it is speaking on:
+        // getRemoteAddress builds a fresh InetSocketAddress on every call, and the
+        // connection object behind it is not reachable from outside
+        // sun.net.httpserver.
+        //
+        // Two live connections cannot share a 4-tuple, so differing ports
+        // soundly imply two connections. Identical ports are strong evidence of
+        // reuse rather than proof of it, since the OS may re-assign a port it has
+        // just released — which means this test can in principle flake on the
+        // passing side, and a failure here names the stand-in's Connection: close
+        // header rather than the gateway.
+        //
+        // A raw ServerSocket accept loop would identify connections exactly, and
+        // was rejected: it means hand-writing HTTP in the test, against the reason
+        // this class uses the JDK's own server at all.
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/v1/events").header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)))
+                .andExpect(status().isOk());
+
+        assertThat(received).extracting(RecordedRequest::remotePort)
+                .as("consecutive proxied hops must not reuse the connection the first one left behind")
+                .doesNotHaveDuplicates();
+    }
+
     // --- the stand-in service -------------------------------------------------
 
     private static void recordAndReply(HttpExchange exchange) throws IOException {
         record(exchange);
         byte[] body = "{\"eventId\": 1, \"name\": \"probed by the gateway\"}".getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().add("Content-Type", "application/json");
+        // Refuse keep-alive, so no two requests here share a connection. The JDK
+        // 21 client can fail the downstream hop with an NPE in
+        // Http1Exchange.requestMoreBody when it writes a body over a reused
+        // connection, and a race this test cannot provoke on demand has no place
+        // in a class whose claim is about what the gateway wires together. The
+        // JDK reads this header inside sendResponseHeaders, so it has to be set
+        // before the call below; the socket is then closed rather than parked as
+        // idle, and the client will not pool it. A test asserting the hop
+        // arrives on a fresh connection each time is what names the layer if
+        // that ever stops being true.
+        exchange.getResponseHeaders().set("Connection", "close");
         exchange.sendResponseHeaders(200, body.length);
         try (OutputStream out = exchange.getResponseBody()) {
             out.write(body);
@@ -985,11 +1033,13 @@ class GatewayProxyBootTests {
                 exchange.getRequestMethod(),
                 exchange.getRequestURI().getPath(),
                 headers,
-                new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+                new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8),
+                exchange.getRemoteAddress().getPort()));
     }
 
     /** What the stand-in service saw, so a test can assert on what actually arrived. */
-    private record RecordedRequest(String method, String path, Map<String, List<String>> headers, String body) {
+    private record RecordedRequest(String method, String path, Map<String, List<String>> headers, String body,
+                                   int remotePort) {
 
         String header(String name) {
             List<String> values = headers.get(name);
