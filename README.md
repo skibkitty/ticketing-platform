@@ -132,6 +132,15 @@ either redundant or refused. An operator reads someone else's inbox on a separat
 `GET /api/v1/admin/customers/<id>/notifications`. See
 `docs/adr/011-notification-read-ownership.md`.
 
+Reservations are read the same way, by the same rule. `GET
+/api/v1/reservations/<id>` and `GET /api/v1/reservations` are scoped by that same
+verified header and by nothing else: the path or query picks *which* reservation,
+and the header says *whose*. Someone else's reservation is a 404 — the same answer
+as an id that was never issued, so the response does not confirm it exists — and a
+`?customerId=` naming somebody else is refused with 400. Both reads need the
+gateway's header, so neither is reachable without it. See
+`docs/adr/014-reservation-read-ownership.md`.
+
 ```bash
 # 1. Log in
 curl -X POST localhost:8080/auth/login \
@@ -155,8 +164,16 @@ curl -X POST localhost:8080/api/v1/reservations \
   -H "Content-Type: application/json" \
   -d '{"eventId":1,"seatIds":[1,2]}'
 
-# 5. Watch it get confirmed a few seconds later
+# 5. Watch it get confirmed a few seconds later. This read is scoped by
+#    the customer id the gateway derived from the token, so a Customer
+#    gets 404 for anyone's reservation but their own. No header is
+#    needed — the gateway supplies it — and asking for someone else's
+#    with ?customerId= is refused with 400.
 curl localhost:8080/api/v1/reservations/1 \
+  -H "Authorization: Bearer <customer-token>"
+
+# 5b. List the caller's own reservations
+curl localhost:8080/api/v1/reservations \
   -H "Authorization: Bearer <customer-token>"
 
 # 6. Check the payment record. The circuit breaker on this route is planned

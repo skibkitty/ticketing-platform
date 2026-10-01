@@ -3,6 +3,7 @@ package com.raydans.reservationservice.reservation;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -171,9 +172,9 @@ class JpaReservationServiceTest {
 
     @Test
     void getReturnsMappedReservation() {
-        when(reservations.findById(42L)).thenReturn(Optional.of(reservationEntity(42L)));
+        when(reservations.findByIdAndCustomerId(42L, 99L)).thenReturn(Optional.of(reservationEntity(42L)));
 
-        ReservationResponse response = service.get(42L);
+        ReservationResponse response = service.get(42L, 99L);
 
         assertThat(response.id()).isEqualTo(42L);
         assertThat(response.customerId()).isEqualTo(99L);
@@ -186,15 +187,43 @@ class JpaReservationServiceTest {
     }
 
     @Test
+    void getScopesTheLookupByIdAndCustomerTogetherAndNeverByIdAlone() {
+        // The invariant, stated as a call shape: ownership is part of the query,
+        // so there is no overload of this service that returns a reservation
+        // without saying whose. A findById here would load any Customer's row and
+        // leave the check to whoever remembered to make it.
+        when(reservations.findByIdAndCustomerId(42L, 99L)).thenReturn(Optional.of(reservationEntity(42L)));
+
+        service.get(42L, 99L);
+
+        verify(reservations).findByIdAndCustomerId(42L, 99L);
+        verify(reservations, never()).findById(anyLong());
+    }
+
+    @Test
+    void getOfAnotherCustomersReservationIsNotFoundAndTouchesNothing() {
+        // Not a 403 and not a filtered result: the row is absent from the query,
+        // so this caller cannot learn that 42 exists, and cannot expire it,
+        // release its seats or stage an outbox event on it either (ADR 014).
+        when(reservations.findByIdAndCustomerId(42L, 7L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.get(42L, 7L)).isInstanceOf(ResourceNotFoundException.class);
+
+        verify(reservations, never()).save(any());
+        verify(seats, never()).saveAll(any());
+        verify(outbox, never()).save(any(OutboxEventEntity.class));
+    }
+
+    @Test
     void getOfOverduePendingReservationExpiresItReleasesLapsedSeatsAndStagesTheEvent() {
         SeatEntity seat = heldSeat(10L, Instant.now().minusSeconds(1));
         ReservationEntity overdue = reservationEntity(42L);
         overdue.getSeats().clear();
         overdue.getSeats().add(seat);
         ReflectionTestUtils.setField(overdue, "expiresAt", Instant.now().minusSeconds(1));
-        when(reservations.findById(42L)).thenReturn(Optional.of(overdue));
+        when(reservations.findByIdAndCustomerId(42L, 99L)).thenReturn(Optional.of(overdue));
 
-        ReservationResponse response = service.get(42L);
+        ReservationResponse response = service.get(42L, 99L);
 
         assertThat(response.status()).isEqualTo(ReservationStatus.EXPIRED);
         assertThat(seat.getStatus()).isEqualTo(SeatStatus.AVAILABLE);
@@ -227,9 +256,9 @@ class JpaReservationServiceTest {
         overdue.getSeats().clear();
         overdue.getSeats().add(seat);
         ReflectionTestUtils.setField(overdue, "expiresAt", Instant.now().minusSeconds(1));
-        when(reservations.findById(42L)).thenReturn(Optional.of(overdue));
+        when(reservations.findByIdAndCustomerId(42L, 99L)).thenReturn(Optional.of(overdue));
 
-        ReservationResponse response = service.get(42L);
+        ReservationResponse response = service.get(42L, 99L);
 
         assertThat(response.status()).isEqualTo(ReservationStatus.EXPIRED);
         assertThat(seat.getStatus()).isEqualTo(SeatStatus.HELD);
@@ -269,9 +298,9 @@ class JpaReservationServiceTest {
 
     @Test
     void getForUnknownReservationThrowsNotFound() {
-        when(reservations.findById(404L)).thenReturn(Optional.empty());
+        when(reservations.findByIdAndCustomerId(404L, 99L)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> service.get(404L)).isInstanceOf(ResourceNotFoundException.class);
+        assertThatThrownBy(() -> service.get(404L, 99L)).isInstanceOf(ResourceNotFoundException.class);
     }
 
     @Test

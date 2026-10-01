@@ -74,6 +74,18 @@ is a Customer. Specifically:
   by choosing, because it has no way to know which of the two was configured on
   purpose.
 
+**The header is what a read is scoped by, not only what a write is booked
+against.** It was originally the write path's concern: `POST
+/api/v1/reservations` acts on the id, so a forged one would have reserved seats
+in someone else's name. It is now also the read path's, and the reason is the
+same. `GET /api/v1/reservations/{id}` and `GET /api/v1/reservations` are scoped
+by the gateway-derived `X-Customer-Id` and by nothing else, so "which
+reservations may this caller see" has exactly one answer: their own (ADR 014, on
+ADR 011's reasoning for notifications). A read that took a `customerId` from the
+query string, or took no Customer at all, would be scoped by a value the caller
+chose — which is the bypass this header exists to prevent, arriving one layer
+down instead of at the gateway.
+
 The same rule already applied to `X-User-Roles` and is what makes these
 headers safe: both are stripped first and set second, never appended to
 whatever arrived. A request that was not authenticated carries neither, and a

@@ -29,6 +29,7 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -130,15 +131,20 @@ class ReservationFlowBootTests {
         assertThat(held).isEqualTo(2);
         awaitOutboxPublished(1);
 
-        ResponseEntity<Map> byId = rest.getForEntity("/api/v1/reservations/" + reservationId, Map.class);
+        ResponseEntity<Map> byId = getReservation(reservationId.longValue(), 99L);
         assertThat(byId.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(byId.getBody()).containsEntry("status", "PENDING_PAYMENT");
         assertThat(byId.getBody()).containsEntry("amountCents", 27000);
 
-        ResponseEntity<List> byCustomer =
-                rest.getForEntity("/api/v1/reservations?customerId=99", List.class);
+        // Scoped to this test's Customer (99), who holds exactly one reservation
+        // among the ones this test created — the id in the path still chooses
+        // which, and the header still says whose (ADR 014).
+        ResponseEntity<List> byCustomer = listReservations(99L, "?customerId=99");
         assertThat(byCustomer.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(byCustomer.getBody()).hasSize(1);
+        @SuppressWarnings("unchecked")
+        List<Map> mineOnly = (List<Map>) byCustomer.getBody();
+        assertThat(mineOnly).extracting(row -> row.get("customerId")).containsOnly(99);
     }
 
     @Test
@@ -171,9 +177,153 @@ class ReservationFlowBootTests {
 
     @Test
     void getReservationForUnknownIdReturns404() {
-        ResponseEntity<Map> response = rest.getForEntity("/api/v1/reservations/422", Map.class);
+        ResponseEntity<Map> response = getReservation(422L, 99L);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(response.getBody()).containsEntry("status", 404);
+    }
+
+    // --- a Customer's reservations are read by identity (ADR 014) ----------------
+    //
+    // The complete path from the gateway's header onward: a real controller, a real
+    // service and a real database, with the customer id arriving exactly as the
+    // gateway derives it from a verified token (ADR 002). The gateway's own half —
+    // that it derives and unforgeably rewrites that header — is asserted in
+    // GatewayProxyBootTests, and Customer A cannot read Customer B's data at either
+    // seam.
+
+    @Test
+    void aCustomerCanReadTheirOwnReservationById() {
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Orchestra", "row", "A", "seatNumber", 1, "priceCents", 15000)));
+        ResponseEntity<Map> created_ = postReservation(created.eventId(), created.seatIds(), 501L);
+        long reservationId = ((Number) created_.getBody().get("id")).longValue();
+
+        ResponseEntity<Map> mine = getReservation(reservationId, 501L);
+
+        assertThat(mine.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(mine.getBody()).containsEntry("id", (int) reservationId);
+        assertThat(mine.getBody()).containsEntry("customerId", 501);
+    }
+
+    @Test
+    void aCustomerCannotReadAnotherCustomersReservationById() {
+        // The bypass this closes, end to end. Customer 7 holds a valid
+        // X-Customer-Id and knows 99's reservation id; the answer is the same 404
+        // as for an id nobody was ever issued, so the response does not even
+        // confirm the reservation exists.
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Balcony", "row", "B", "seatNumber", 2, "priceCents", 9000)));
+        ResponseEntity<Map> owned = postReservation(created.eventId(), created.seatIds(), 502L);
+        long reservationId = ((Number) owned.getBody().get("id")).longValue();
+
+        ResponseEntity<Map> theirs = getReservation(reservationId, 503L);
+
+        assertThat(theirs.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(theirs.getBody()).containsEntry("status", 404);
+        // The 404 is an error body, not a reservation, and it carries none of the
+        // reservation's fields — so a caller learns neither that 42 exists nor what
+        // it holds. ("status" is the shared ApiErrorResponse's own HTTP status, not
+        // the reservation's lifecycle state.)
+        assertThat(theirs.getBody())
+                .containsEntry("error", "Not Found")
+                .doesNotContainKeys("id", "customerId", "eventId", "amountCents", "seats", "expiresAt");
+    }
+
+    @Test
+    void readingAnotherCustomersReservationDoesNotDisturbIt() {
+        // A refused read must leave the owner's row exactly as it was. This is the
+        // side effect that scoping the query in the database removes: the
+        // non-owner's request never loads the entity, so it cannot expire the
+        // hold, release the seats, or stage an outbox event on it.
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Mezzanine", "row", "C", "seatNumber", 3, "priceCents", 4000)));
+        ResponseEntity<Map> owned = postReservation(created.eventId(), created.seatIds(), 504L);
+        long reservationId = ((Number) owned.getBody().get("id")).longValue();
+
+        assertThat(getReservation(reservationId, 505L).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+
+        assertThat(getReservation(reservationId, 504L).getBody())
+                .containsEntry("status", "PENDING_PAYMENT");
+        assertThat(jdbc.queryForObject(
+                "SELECT status FROM reservation.seats WHERE id = ?", String.class,
+                created.seatIds().get(0)))
+                .isEqualTo("HELD");
+        assertThat(outboxExpiredCount(reservationId)).isZero();
+    }
+
+    @Test
+    void aCustomerCanListOnlyTheirOwnReservations() {
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Stalls", "row", "A", "seatNumber", 1, "priceCents", 5000),
+                Map.of("section", "Stalls", "row", "A", "seatNumber", 2, "priceCents", 6000)));
+        postReservation(created.eventId(), created.seatIds(), 506L);
+        postReservation(created.eventId(), List.of(created.seatIds().get(0)), 507L);
+
+        ResponseEntity<List> mine = listReservations(506L, "");
+
+        assertThat(mine.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(mine.getBody()).hasSize(1);
+        @SuppressWarnings("unchecked")
+        List<Map> rows = (List<Map>) mine.getBody();
+        assertThat(rows).extracting(row -> row.get("customerId")).containsExactly(506);
+    }
+
+    @Test
+    void aCustomerCannotListAnotherCustomersReservationsByAskingForThem() {
+        // The list half of the same bypass. The query parameter is refused rather
+        // than honoured, so 7 does not receive 99's reservations and does not
+        // receive a silent empty list that a client might report as "I have none".
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Gallery", "row", "D", "seatNumber", 4, "priceCents", 7000)));
+        postReservation(created.eventId(), created.seatIds(), 508L);
+
+        ResponseEntity<String> theirs = listReservationsAsText(509L, "?customerId=508");
+
+        assertThat(theirs.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(theirs.getBody())
+                .contains("\"status\":400")
+                .doesNotContain("PENDING_PAYMENT");
+    }
+
+    @Test
+    void aReservationReadWithNoCustomerHeaderIsRefused() {
+        // Nothing reaches this service without the gateway having derived that
+        // header, so its absence means the request did not come through the
+        // gateway — and this route refuses to be a way in for anything else.
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Upper Circle", "row", "E", "seatNumber", 5, "priceCents", 3000)));
+        ResponseEntity<Map> owned = postReservation(created.eventId(), created.seatIds(), 510L);
+        long reservationId = ((Number) owned.getBody().get("id")).longValue();
+
+        assertThat(getReservationWithoutCustomerHeader(reservationId).getStatusCode())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        ResponseEntity<String> listRefused =
+                rest.exchange(
+                        "/api/v1/reservations?customerId=99",
+                        HttpMethod.GET,
+                        new HttpEntity<>(new HttpHeaders()),
+                        String.class);
+        assertThat(listRefused.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(listRefused.getBody()).contains("X-Customer-Id");
+    }
+
+    @Test
+    void reservationCreationStillWorksForACustomer() {
+        // The write path is unchanged by ADR 014, and asserted here so the
+        // ownership fix cannot have quietly cost the platform its ability to sell a
+        // seat: booking is still scoped by the same header.
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Orchestra", "row", "F", "seatNumber", 6, "priceCents", 15000)));
+
+        ResponseEntity<Map> created_ = postReservation(created.eventId(), created.seatIds(), 511L);
+
+        assertThat(created_.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(created_.getBody()).containsEntry("status", "PENDING_PAYMENT");
+        assertThat(created_.getBody()).containsEntry("customerId", 511);
+        assertThat(jdbc.queryForObject(
+                "SELECT status FROM reservation.seats WHERE id = ?", String.class,
+                created.seatIds().get(0)))
+                .isEqualTo("HELD");
     }
 
     @Test
@@ -235,7 +385,7 @@ class ReservationFlowBootTests {
 
         // A later read must not re-publish: the sweep already committed the EXPIRED transition, so
         // the read path's expireIfOverdue no-ops and the count stays at exactly one.
-        ResponseEntity<Map> reread = rest.getForEntity("/api/v1/reservations/" + reservationId, Map.class);
+        ResponseEntity<Map> reread = getReservation(reservationId, 21L);
         assertThat(reread.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(reread.getBody().get("status")).isEqualTo("EXPIRED");
         assertThat(outboxExpiredCount(reservationId))
@@ -470,11 +620,7 @@ class ReservationFlowBootTests {
                 "UPDATE reservation.seats SET hold_expires_at = now() - interval '1 minute' WHERE id = ?",
                 seatId);
 
-        ResponseEntity<Map> response = rest.exchange(
-                "/api/v1/reservations/" + reservationId,
-                HttpMethod.GET,
-                new HttpEntity<>(new HttpHeaders()),
-                Map.class);
+        ResponseEntity<Map> response = getReservation(reservationId, 23L);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody().get("status")).isEqualTo("EXPIRED");
 
@@ -551,7 +697,7 @@ class ReservationFlowBootTests {
         List<Throwable> failures = new ArrayList<>();
         try {
             Future<Void> read = executor.submit(() -> {
-                reservations.get(reservationId);
+                reservations.get(reservationId, 44L);
                 return null;
             });
             Future<Void> sweep = executor.submit(() -> {
@@ -617,6 +763,92 @@ class ReservationFlowBootTests {
         List<Number> seatIds = (List<Number>) response.getBody().get("seatIds");
         return new CreatedEvent(((Number) response.getBody().get("eventId")).longValue(),
                 seatIds.stream().map(Number::longValue).toList());
+    }
+
+    /**
+     * A reservation read as {@code customerId} — the identity the gateway would
+     * have derived from the token, and the only thing a read is scoped by
+     * (ADR 014). Reads go through here rather than through
+     * {@code rest.getForEntity} so that no test in this file can accidentally
+     * assert against an unscoped route.
+     */
+    private ResponseEntity<Map> getReservation(long reservationId, long customerId) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(CUSTOMER_HEADER, String.valueOf(customerId));
+        return rest.exchange(
+                "/api/v1/reservations/" + reservationId, HttpMethod.GET, new HttpEntity<>(headers), Map.class);
+    }
+
+    private ResponseEntity<List> listReservations(long customerId, String query) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(CUSTOMER_HEADER, String.valueOf(customerId));
+        return rest.exchange(
+                "/api/v1/reservations" + query, HttpMethod.GET, new HttpEntity<>(headers), List.class);
+    }
+
+    /** The same read with no identity header at all, as if the gateway were not in front of it. */
+    /**
+     * The Customer ids the ownership tests book against, so they can be cleaned up
+     * afterwards.
+     *
+     * <p>These tests share one database with every other test in this class, and
+     * several of those assert on global counts — {@code count(*) FROM seats WHERE
+     * status = 'HELD'} among them. A test that leaves a hold behind therefore
+     * breaks a test that has nothing to do with ownership, so the reservations
+     * these tests create are removed on the way out rather than left for whoever
+     * runs next. The ids are deliberately ones no other test uses, which is what
+     * makes the cleanup able to identify them.
+     */
+    private static final List<Long> OWNERSHIP_TEST_CUSTOMERS =
+            List.of(501L, 502L, 503L, 504L, 505L, 506L, 507L, 508L, 509L, 510L, 511L);
+
+    @AfterEach
+    void releaseTheHoldsTheOwnershipTestsTook() {
+        for (long customerId : OWNERSHIP_TEST_CUSTOMERS) {
+            // Seats first: the join rows still reference the reservation, and a
+            // seat left HELD is what the global count assertions would trip on.
+            jdbc.update(
+                    """
+                    UPDATE reservation.seats SET status = 'AVAILABLE', hold_expires_at = NULL
+                    WHERE id IN (
+                        SELECT seat_id FROM reservation.reservation_seats
+                        WHERE reservation_id IN (
+                            SELECT id FROM reservation.reservations WHERE customer_id = ?))
+                    """,
+                    customerId);
+            jdbc.update("DELETE FROM reservation.reservation_seats WHERE reservation_id IN "
+                    + "(SELECT id FROM reservation.reservations WHERE customer_id = ?)", customerId);
+            jdbc.update("DELETE FROM reservation.outbox_events WHERE aggregate_id IN "
+                    + "(SELECT id FROM reservation.reservations WHERE customer_id = ?)", customerId);
+            jdbc.update("DELETE FROM reservation.reservations WHERE customer_id = ?", customerId);
+        }
+    }
+
+    private ResponseEntity<Map> getReservationWithoutCustomerHeader(long reservationId) {
+        return rest.exchange(
+                "/api/v1/reservations/" + reservationId,
+                HttpMethod.GET,
+                new HttpEntity<>(new HttpHeaders()),
+                Map.class);
+    }
+
+    private ResponseEntity<List> listReservationsWithoutCustomerHeader(String query) {
+        return rest.exchange(
+                "/api/v1/reservations" + query,
+                HttpMethod.GET,
+                new HttpEntity<>(new HttpHeaders()),
+                List.class);
+    }
+
+    /**
+     * A list read whose response is kept as raw text, because the interesting
+     * cases here are refusals and an error body is an object rather than a list.
+     */
+    private ResponseEntity<String> listReservationsAsText(long customerId, String query) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(CUSTOMER_HEADER, String.valueOf(customerId));
+        return rest.exchange(
+                "/api/v1/reservations" + query, HttpMethod.GET, new HttpEntity<>(headers), String.class);
     }
 
     private ResponseEntity<Map> postReservation(long eventId, List<Long> seatIds, long customerId) {

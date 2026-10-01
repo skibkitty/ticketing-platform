@@ -301,6 +301,119 @@ class GatewayProxyBootTests {
         assertThat(received).isEmpty();
     }
 
+    // --- a Customer's reservations are read by identity (ADR 014) ---------------
+    //
+    // The gateway's half of that invariant, and it is the half that cannot be
+    // tested anywhere else: that the id on a read is the one the token speaks for.
+    // The service's half — that a reservation is only returned to its owner — is
+    // asserted in ReservationFlowBootTests against a real database. Between them
+    // they cover the path from a JWT to Customer A being unable to read Customer
+    // B's data, and neither half is sufficient alone: a gateway that published no
+    // identity would leave the service nothing to scope by, and a service that
+    // trusted a parameter would not care what the gateway published.
+
+    @Test
+    void aReservationReadIsForwardedWithTheCustomersVerifiedIdAndNothingElse() throws Exception {
+        mvc.perform(get("/api/v1/reservations/7")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)))
+                .andExpect(status().isOk());
+
+        // The same treatment the write gets. A read is scoped by this id, so
+        // leaving it off a GET would be the bypass; publishing the caller's own
+        // choice of id on a GET would be the same bypass again.
+        assertThat(received.get(0).header("X-Customer-Id")).isEqualTo("42");
+        assertThat(received.get(0).method()).isEqualTo("GET");
+        assertThat(received.get(0).path()).isEqualTo("/api/v1/reservations/7");
+    }
+
+    @Test
+    void aCustomerIdForgedOnAReservationReadIsReplacedByTheOnesInTheToken() throws Exception {
+        // The bypass this closes, at the boundary it would have to cross. The
+        // inbound header is removed unconditionally and replaced from the
+        // verified subject, so the service is never handed 999 to act on.
+        mvc.perform(get("/api/v1/reservations/7")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                        .header("X-Customer-Id", "999"))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(0).header("X-Customer-Id")).isEqualTo("42");
+    }
+
+    @Test
+    void aCustomerIdForgedTwiceOnAReservationReadDoesNotReachTheServiceTwice() throws Exception {
+        // The two-curl shape, which is one header with two values rather than one
+        // comma-joined value — a downstream reading only the first would believe
+        // the forgery.
+        mvc.perform(get("/api/v1/reservations/7")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                        .header("X-Customer-Id", "999", "1"))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(0).header("X-Customer-Id")).isEqualTo("42");
+    }
+
+    @Test
+    void aCustomerIdQueryParameterOnAReservationListCannotDisplaceTheVerifiedHeader() throws Exception {
+        // The list half. The parameter is not the gateway's to remove — it reaches
+        // the service, which refuses it when it disagrees (ADR 014) — but what
+        // matters here is that it travels alongside the header and not instead of
+        // it: a Customer's own id is on the request whatever they asked for.
+        mvc.perform(get("/api/v1/reservations")
+                        .param("customerId", "999")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER)))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(0).header("X-Customer-Id")).isEqualTo("42");
+        assertThat(received.get(0).path()).isEqualTo("/api/v1/reservations");
+    }
+
+    @Test
+    void aCustomerIdForgedOnAReservationListAlongsideAQueryParameterStillBecomesTheTokens() throws Exception {
+        // Both bypasses attempted at once, which is what a probing client would
+        // send. Neither survives: the header is 42, and 999 is on the query for
+        // the service to refuse.
+        mvc.perform(get("/api/v1/reservations")
+                        .param("customerId", "999")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                        .header("X-Customer-Id", "999"))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(0).header("X-Customer-Id")).isEqualTo("42");
+    }
+
+    @Test
+    void anOrganizerCanReadNobodyCustomersReservations() throws Exception {
+        // An organizer holds no CUSTOMER role, so there is no id to publish and
+        // the reservation surface refuses it here rather than forwarding a request
+        // that would arrive with no identity to scope by.
+        mvc.perform(get("/api/v1/reservations")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(ORGANIZER_ID, Role.ORGANIZER))
+                        .header("X-Customer-Id", "42"))
+                .andExpect(status().isForbidden());
+
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void anAdminCanReadNobodyCustomersReservationsEither() throws Exception {
+        mvc.perform(get("/api/v1/reservations/7")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(ADMIN_ID, Role.ADMIN))
+                        .header("X-Customer-Id", "42"))
+                .andExpect(status().isForbidden());
+
+        assertThat(received).isEmpty();
+    }
+
+    @Test
+    void anUnauthenticatedReservationReadForwardsNothing() throws Exception {
+        // No token, no read: the header must not be the one thing a reservation
+        // request gets through without one.
+        mvc.perform(get("/api/v1/reservations/7").header("X-Customer-Id", "42"))
+                .andExpect(status().isUnauthorized());
+
+        assertThat(received).isEmpty();
+    }
+
     // --- whose notifications, and who may read whose (ADR 011) -------------------
 
     @Test

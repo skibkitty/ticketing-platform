@@ -65,8 +65,11 @@ class JpaReservationService implements ReservationService {
 
     @Override
     @Transactional
-    public ReservationResponse get(long reservationId) {
-        ReservationEntity reservation = reservations.findById(reservationId)
+    public ReservationResponse get(long reservationId, long customerId) {
+        // Scoped in the query, so a Reservation belonging to another Customer is
+        // absent rather than filtered out here: it is never loaded, and the
+        // expiry below therefore cannot act on someone else's hold (ADR 014).
+        ReservationEntity reservation = reservations.findByIdAndCustomerId(reservationId, customerId)
                 .orElseThrow(() -> new ResourceNotFoundException("Reservation " + reservationId + " was not found"));
         expireIfOverdue(reservation);
         return toResponse(reservation);
