@@ -285,6 +285,19 @@ class JwtAuthenticationFilterTest {
     }
 
     @Test
+    void anUnroutedPathAsksForATokenAndStillAnswers404ToOneThatHasIt() throws Exception {
+        // The cost of failing closed, asserted as both halves so neither can be
+        // traded for the other. A caller with no token gets 401 whether or not this
+        // gateway serves the URL, which means a typo and an unauthenticated request
+        // are answered the same way; a caller holding a token gets the 404, so the
+        // routes the gateway genuinely lacks are still reported as missing rather
+        // than hidden behind a demand for credentials they already have.
+        mvc.perform(get("/nothing/here")).andExpect(status().isUnauthorized());
+        mvc.perform(get("/nothing/here").header(HttpHeaders.AUTHORIZATION, bearerFor(tokens.issue(42L, Set.of(Role.CUSTOMER)))))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
     void aCorsPreflightIsNotRefused() {
         // Asked of the filter directly: a preflight is handled by the
         // DispatcherServlet's own CORS machinery, which has no handler adapter in

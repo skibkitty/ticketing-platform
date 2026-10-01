@@ -37,6 +37,22 @@ public class GatewayWebConfig {
         return registration;
     }
 
+    /**
+     * The authorization table, as a bean rather than a {@code new} inside the
+     * filter registration below.
+ *
+     * <p>So that there is one instance of it and something else can ask it
+     * questions: {@code GatewayProxyBootTests} autowires this to walk the real
+     * route table and check every served path has a row, which is the wiring claim
+     * no test of the table in isolation can make. A table constructed inline would
+     * be a second copy as far as anything asking is concerned — and the point of
+     * the check is to ask the same one the filter enforces.
+     */
+    @Bean
+    public RoleAuthorizer roleAuthorizer() {
+        return new RoleAuthorizer();
+    }
+
     @Bean
     public ErrorResponseWriter errorResponseWriter(ObjectMapper objectMapper) {
         return new ErrorResponseWriter(objectMapper);
@@ -49,9 +65,9 @@ public class GatewayWebConfig {
      */
     @Bean
     public FilterRegistrationBean<JwtAuthenticationFilter> jwtAuthenticationFilter(
-            JwtService tokens, ErrorResponseWriter errors) {
+            JwtService tokens, RoleAuthorizer authorizer, ErrorResponseWriter errors) {
         FilterRegistrationBean<JwtAuthenticationFilter> registration =
-                new FilterRegistrationBean<>(new JwtAuthenticationFilter(tokens, new RoleAuthorizer(), errors));
+                new FilterRegistrationBean<>(new JwtAuthenticationFilter(tokens, authorizer, errors));
         registration.setOrder(Ordered.HIGHEST_PRECEDENCE + 10);
         return registration;
     }

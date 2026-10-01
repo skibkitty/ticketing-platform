@@ -17,12 +17,21 @@ import org.springframework.web.util.pattern.PathPatternParser;
  * it stays open to any authenticated caller — so the order is asserted in
  * {@code RoleAuthorizerTest} rather than left to whoever edits it next.
  *
- * <p>An unmatched path is {@link Access#Public}, which is safe only because the
- * table closes every prefix the gateway serves: {@code /api/**} and
- * {@code /auth/**} both end the list, so a new route cannot be reachable
- * without a token just by not being written down yet. What is left over is a
- * path this gateway does not serve, where the answer is a 404 — and a 401 on a
- * URL nobody serves would only turn a typo into a misleading error.
+ * <p>An unmatched path is {@link Access#AnyAuthenticated}, so a path nobody
+ * wrote down here is refused rather than open: {@link Access#Public} is
+ * reachable only through a row that says so, which today is {@code POST
+ * /auth/login} and nothing else. Being reachable is a thing somebody decides,
+ * not a thing a route acquires by not having been written down — the difference
+ * being that the safe answer is also the one that needs no argument for why the
+ * table happens to cover every prefix.
+ *
+ * <p>The cost is that a caller who misspells a URL is answered 401 rather than
+ * 404. That is the smaller mistake: it is the answer for a request that cannot
+ * be served without saying who the caller would have to be, it tells a caller
+ * with a token nothing they did not already know, and it only ever over-refuses.
+ * {@code GatewayProxyBootTests} walks the deployment's real route table and
+ * fails the build if a route is served without a row here, so the paths a
+ * genuine 404 is for are the ones this gateway does not have.
  *
  * <p>Two questions are asked of this table — what a request requires
  * ({@link #decide}), and whether a CORS preflight is answered without a token
@@ -34,12 +43,12 @@ public class RoleAuthorizer {
     /** The rules, most specific first. See the class comment for why the order matters. */
     private static final List<Rule> RULES = List.of(
             // The login surface authenticates callers rather than authorizing
-            // them, so it alone is open. The rule is the endpoint, not the
+            // them, so it alone is open — and open because this row says so, not
+            // because it matched nothing. The rule is the endpoint, not the
             // prefix: "/auth/**" would make every future route added under
-            // /auth public by default, and the next one added there would be a
-            // session-refresh or a password-reset endpoint that nobody decided
-            // to expose. Unmatched paths are public anyway, so this is not what
-            // stops those — the rule below is.
+            // /auth public without anyone deciding so, and the next one added
+            // there would be a session-refresh or a password-reset endpoint that
+            // nobody decided to expose. The rule below is what stops those.
             Rule.of(new Access.Public(), HttpMethod.POST, Set.of("/auth/login"), true),
             // Everything else under /auth, which is where anything added later
             // lands. A token of any role: a future /auth route that ought to be
@@ -85,7 +94,10 @@ public class RoleAuthorizer {
             // and only a caller holding both roles gets both (ADR 011).
             Rule.of(new Access.AnyOfRoles(Set.of(Role.ADMIN)), null, Set.of("/api/v1/admin/**"), true),
             // Everything else under /api, so a path added before its version does
-            // not start life public.
+            // not start life public. Still a row rather than a note on the
+            // fallback, because the fallback refuses a preflight and this answers
+            // it: dropping the row would not only narrow authorization, it would
+            // quietly break every browser (ADR 002).
             Rule.of(new Access.AnyAuthenticated(), null, Set.of("/api/**"), true));
 
     /**
@@ -97,9 +109,28 @@ public class RoleAuthorizer {
         return RULES;
     }
 
-    /** @return what the gateway requires of a caller for this request, never null */
+    /**
+     * @return what the gateway requires of a caller for this request, never null.
+     *     A path no row claims gets {@link Access#AnyAuthenticated}: the refusal is
+     *     the default so that forgetting to write a row down opens nothing.
+     */
     public Access decide(String method, String path) {
-        return ruleFor(method, path).map(Rule::access).orElseGet(Access.Public::new);
+        return ruleFor(method, path).map(Rule::access).orElseGet(Access.AnyAuthenticated::new);
+    }
+
+    /**
+     * Whether a row claims this request at all, as opposed to {@link #decide}
+     * falling back to what it answers for a path nobody has classified.
+     *
+     * <p>That distinction is invisible through {@code decide} alone — both a row
+     * saying "any token will do" and no row at all answer the same way — and it is
+     * the question only a deployment can answer: whether the routes
+     * {@code application.yml} actually serves are written down here. Without this,
+     * the table's own tests pass on a table that has quietly stopped covering a
+     * route somebody added.
+     */
+    public boolean isClassified(String method, String path) {
+        return ruleFor(method, path).isPresent();
     }
 
     /**
@@ -159,7 +190,10 @@ public class RoleAuthorizer {
      */
     public sealed interface Access permits Access.Public, Access.AnyAuthenticated, Access.AnyOfRoles {
 
-        /** No token needed. The login surface, and paths this gateway does not serve. */
+        /**
+         * No token needed. Reachable only through a row that says so: the login
+         * surface, and nothing else.
+         */
         record Public() implements Access {}
 
         /** A valid token, of any role. */

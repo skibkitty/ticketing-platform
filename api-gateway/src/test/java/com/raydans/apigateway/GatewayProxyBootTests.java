@@ -13,6 +13,8 @@ import org.springframework.test.web.servlet.MvcResult;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.raydans.apigateway.auth.JwtService;
 import com.raydans.apigateway.auth.Role;
+import com.raydans.apigateway.auth.RoleAuthorizer;
+import com.raydans.apigateway.auth.RoleAuthorizer.Access;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.jsonwebtoken.Jwts;
@@ -23,7 +25,9 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -40,6 +44,9 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.cloud.gateway.server.mvc.config.GatewayMvcProperties;
+import org.springframework.cloud.gateway.server.mvc.config.PredicateProperties;
+import org.springframework.cloud.gateway.server.mvc.config.RouteProperties;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -93,12 +100,23 @@ class GatewayProxyBootTests {
 
     private static final String A_CALLERS_TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
 
+    /** The predicate name application.yml names its paths with. */
+    private static final String PREDICATE_PATH = "Path";
+
     @Autowired
     MockMvc mvc;
 
     /** The real bean, so the tokens here are the ones a caller would actually get. */
     @Autowired
     JwtService tokens;
+
+    /** The routes this deployment really serves, bound from {@code application.yml}. */
+    @Autowired
+    GatewayMvcProperties gatewayProperties;
+
+    /** The real table, rather than the one a test would write if it wanted one to pass. */
+    @Autowired
+    RoleAuthorizer authorizer;
 
     private static HttpServer reservationService;
     private static String reservationServiceUrl;
@@ -1000,6 +1018,93 @@ class GatewayProxyBootTests {
         assertThat(received).extracting(RecordedRequest::remotePort)
                 .as("consecutive proxied hops must not reuse the connection the first one left behind")
                 .doesNotHaveDuplicates();
+    }
+
+    // --- every served route is classified (the fail-closed wiring) -------------
+    //
+    // The claim no unit test of the authorization table can make: that the routes
+    // this deployment actually serves are the ones the table has rows for. Both
+    // lists are real here — the table from RoleAuthorizer and the routes from the
+    // gateway's own application.yml, bound by Boot — so a route added to one and
+    // not the other fails the build instead of being discovered in production.
+
+    @Test
+    void everyRouteTheDeploymentServesIsClassifiedByTheAuthorizationTable() {
+        Map<String, List<String>> served = routesThisDeploymentServes();
+
+        // The anti-vacuity guard. A rename of the predicate, or routes that stopped
+        // naming their paths, would leave the walk below finding nothing and this
+        // test passing for having checked no route at all.
+        assertThat(served).as("routes and the paths they serve").isNotEmpty();
+        served.forEach((route, paths) -> assertThat(paths)
+                .as("route '%s' states which paths it serves", route)
+                .isNotEmpty());
+
+        served.forEach((route, paths) -> paths.forEach(pattern -> {
+            String probe = aRequestPathMatching(pattern);
+
+            assertThat(authorizer.isClassified("GET", probe))
+                    .as("route '%s' serves %s, which no RoleAuthorizer row claims — a path nothing "
+                            + "classifies is refused rather than open, so the row has to be written",
+                            route, pattern)
+                    .isTrue();
+        }));
+    }
+
+    @Test
+    void noRouteTheDeploymentServesIsReachableWithoutAToken() {
+        // The other claim the same walk makes, and the one that would matter if a
+        // Public row were ever widened: the gateway is the platform's only
+        // published surface (ADR 012), so anything it proxies is something the
+        // internet can reach, and every one of those needs a token. The login
+        // surface is not in this table — it is answered by the gateway rather than
+        // proxied — and it is the only route allowed through without one.
+        routesThisDeploymentServes().forEach((route, paths) -> paths.forEach(pattern -> {
+            String probe = aRequestPathMatching(pattern);
+
+            assertThat(authorizer.decide("GET", probe))
+                    .as("route '%s' serves %s, which must not be reachable with no token",
+                            route, pattern)
+                    .isNotInstanceOf(Access.Public.class);
+        }));
+    }
+
+    /**
+     * The paths each configured route claims to serve, read from the real
+     * {@code application.yml} rather than restated here: a copy in this file
+     * would be checked against the table and prove only that the copy agrees with
+     * itself.
+     */
+    private Map<String, List<String>> routesThisDeploymentServes() {
+        Map<String, List<String>> served = new LinkedHashMap<>();
+        for (RouteProperties route : gatewayProperties.getRoutes()) {
+            // The arg values, not one arg by name: application.yml uses the
+            // shorthand ("Path=/a/**,/b/**"), which Boot binds positionally under
+            // generated keys (_genkey_0, _genkey_1) rather than to a named
+            // property. Asking for a key by name finds nothing and the walk below
+            // would pass without having checked a single route.
+            List<String> patterns = route.getPredicates().stream()
+                    .filter(predicate -> PREDICATE_PATH.equals(predicate.getName()))
+                    .flatMap(predicate -> predicate.getArgs().values().stream())
+                    .flatMap(argument -> Arrays.stream(argument.split(",")))
+                    .map(String::trim)
+                    .filter(pattern -> !pattern.isEmpty())
+                    .toList();
+            served.put(route.getId(), patterns);
+        }
+        return served;
+    }
+
+    /**
+     * A request the pattern would actually match, so the row is asked about a real
+     * path rather than about its own notation. The variable is filled in and a
+     * {@code /**} tail given a segment, because a rule for {@code
+     * /api/v1/admin/**} says nothing about whether the gateway's more precise
+     * {@code /api/v1/admin/customers/{id}/notifications} path is claimed too — and
+     * it is that route, not the prefix, that is in the yml.
+     */
+    private static String aRequestPathMatching(String pattern) {
+        return pattern.replaceAll("\\{[^}]*}", "42").replace("/**", "/probe");
     }
 
     // --- the stand-in service -------------------------------------------------

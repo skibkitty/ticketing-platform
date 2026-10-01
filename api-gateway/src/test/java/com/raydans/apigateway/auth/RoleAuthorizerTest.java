@@ -68,10 +68,47 @@ class RoleAuthorizerTest {
     }
 
     @Test
-    void anUnknownPathIsNotProtected() {
-        // Not a hole: the gateway serves no such path, so the answer is a 404.
-        // Protecting it would only turn a typo in a URL into a misleading 401.
-        assertThat(authorizer.decide("GET", "/nothing/here")).isInstanceOf(Access.Public.class);
+    void anUnclassifiedPathNeedsATokenRatherThanBeingPublic() {
+        // The fail-closed half. A path no row claims used to answer Public, which
+        // was safe only while the table happened to cover every prefix the gateway
+        // served — a property of the list rather than of the rule that mattered. Now
+        // a path nobody has classified is refused like an unlisted route, so adding
+        // one to application.yml without adding it here fails the build
+        // (GatewayProxyBootTests walks the real route table) rather than quietly
+        // publishing it.
+        assertThat(authorizer.decide("GET", "/nothing/here")).isInstanceOf(Access.AnyAuthenticated.class);
+        assertThat(authorizer.decide("POST", "/nothing/here")).isInstanceOf(Access.AnyAuthenticated.class);
+        // And a path that is neither the api nor auth nor the management surface is
+        // not answered by a typo either: "/nothing/here" and a misspelt api URL are
+        // the same shape of mistake.
+        assertThat(authorizer.decide("GET", "/api/v1/eventz")).isInstanceOf(Access.AnyAuthenticated.class);
+    }
+
+    @Test
+    void anUnclassifiedPathIsRefusedButPublicIsStillReachableWhenARuleSaysSo() {
+        // The pair, because the first alone would also be satisfied by a table with
+        // no Public row at all: refusing everything would pass it. The login surface
+        // is still the one thing a caller can reach with no token, and it is reachable
+        // because a row claims it rather than because nothing did.
+        assertThat(authorizer.isClassified("POST", "/auth/login")).isTrue();
+        assertThat(authorizer.isClassified("GET", "/nothing/here")).isFalse();
+        assertThat(authorizer.decide("POST", "/auth/login")).isInstanceOf(Access.Public.class);
+    }
+
+    @Test
+    void loginIsTheOnlyRowThatGrantsAccessWithoutAToken() {
+        // Read off the table rather than off the public API, because the public API
+        // cannot answer it: a Public answer and no answer at all are the same claim
+        // made about a path, and only the rows can say which of them a path got. If
+        // somebody adds a second Public row, a second surface is being published and
+        // this is where it should have to be said out loud.
+        List<String> grantedWithoutAToken = RoleAuthorizer.rules().stream()
+                .filter(rule -> rule.access() instanceof Access.Public)
+                .flatMap(rule -> rule.paths().stream())
+                .map(pattern -> pattern.getPatternString())
+                .toList();
+
+        assertThat(grantedWithoutAToken).containsExactly("/auth/login");
     }
 
     @Test
