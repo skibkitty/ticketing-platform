@@ -1,0 +1,135 @@
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      mvc:
+        # Strip the route prefix is deliberately not set: the services already
+        # serve the paths the gateway is asked for, so a rewrite would mean two
+        # places to change a URL.
+        #
+        # The localhost defaults below are for running every service on this
+        # machine (mvn spring-boot:run in each module), not for the compose
+        # stack: docker-compose.yml sets these to the service names, because the
+        # internal services publish no host port for the gateway to be reaching
+        # (ADR 012). A gateway on the host with a gateway-side default therefore
+        # needs docker-compose.debug.yml, which is what publishes 8082-8084.
+        routes:
+          - id: reservation-service
+            uri: ${RESERVATION_SERVICE_URL:http://localhost:8082}
+            predicates:
+              - Path=/api/v1/events/**,/api/v1/reservations/**
+          - id: payment-service
+            uri: ${PAYMENT_SERVICE_URL:http://localhost:8083}
+            predicates:
+              - Path=/api/v1/payments/**
+          - id: notification-service
+            uri: ${NOTIFICATION_SERVICE_URL:http://localhost:8084}
+            predicates:
+              # The operator route is named as precisely as the gateway can name
+              # it: /api/v1/admin/customers/{id}/notifications reads this service's
+              # rows, and the ADMIN rule in RoleAuthorizer is what makes it an
+              # operator route rather than a customer's (ADR 011).
+              #
+              # Claiming the whole /api/v1/admin/** prefix instead would be a
+              # statement about routes nobody has written: a future
+              # /api/v1/admin/events would be proxied to this service purely by
+              # virtue of sitting under the prefix, and the person adding it would
+              # have no reason to know. A path pattern holds a variable in the
+              # middle, so there is no reason to claim more than the one path this
+              # service serves. An admin route for another service's data is now an
+              # independent route with its own pattern, not one that has to be
+              # inserted ahead of this.
+              #
+              # The authorization rule stays deliberately wider than this route —
+              # /api/v1/admin/** is ADMIN's prefix in RoleAuthorizer, so a path under
+              # it that no service serves yet is still refused to a Customer rather
+              # than falling through to the /api/** catch-all. Failing closed on
+              # the route and on the rule are separate decisions and both are
+              # wanted. See ADR 011.
+              - Path=/api/v1/notifications/**,/api/v1/admin/customers/{id}/notifications
+
+app:
+  cors:
+    # Read by the CORS configuration in common, which every service shares; this
+    # is where a deployment states who its browsers are (ADR 002).
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000}
+  gateway:
+    jwt:
+      # No default on purpose. A fallback here would be a signing key in the
+      # repository that passes the length check in JwtProperties and signs every
+      # token in a deployment that forgot to set one, so the gateway refuses to
+      # start instead. Generate one with: openssl rand -base64 48
+      secret: ${JWT_SECRET}
+      ttl: ${JWT_TTL:PT1H}
+    login-throttle:
+      # How many login guesses this gateway answers before it stops (ADR 015).
+      # POST /auth/login is the only route reachable without a token, so it is the
+      # only thing on the platform an unauthenticated caller can guess at.
+      #
+      # Two budgets, because there are two attacks. Per-address stops one host
+      # trying everything; per-account stops one account being guessed from many
+      # hosts, which per-address limiting cannot see at all. Neither is escapable
+      # on its own: changing the username only starts a counter for a different
+      # account while the address counter keeps counting the same attempts.
+      #
+      # Failures are counted whether or not the login name exists, so the counter
+      # cannot be read as a list of which usernames are real.
+      #
+      # No fallback and no default in code: a value that fails to bind is zero, and
+      # zero would refuse every login forever, so the properties refuse to bind
+      # rather than letting a typo quietly produce an unusable gateway. These are
+      # the numbers a deployment states; a deployment that needs the limit to mean
+      # one number across several gateways needs a shared store, which this is not.
+      max-failures-per-account: 5
+      max-failures-per-address: 20
+      window: PT5M
+    callers:
+      # The demo caller set, in configuration so the passwords are not in version
+      # control. A real deployment replaces this whole map with an identity
+      # provider (explicitly out of scope); nothing else here would change.
+      #
+      # No password below has a value, and none is given one here: a fallback in
+      # this file would be a working credential in the repository, committed to
+      # every clone and every fork. Each is read from the environment, and a
+      # gateway started without one refuses to start rather than quietly
+      # rejecting every login. See .env.example for a local setup.
+      #
+      # The caller-id is the other half, and it is here for the same reason: the
+      # token's subject is the caller's own id (ADR 002), so which login name
+      # belongs to which identity is data the gateway is configured with — never
+      # something parsed out of the username, and never a table in source.
+      #
+      # It is called caller-id and not customer-id because not every caller is a
+      # Customer. Only the first entry below holds CUSTOMER, so only its id is a
+      # Customer.id; the other two are the organizers' and the admin's own ids
+      # and are never forwarded as X-Customer-Id (CONTEXT.md).
+      customer:
+        caller-id: 42
+        password: ${DEMO_CUSTOMER_PASSWORD}
+        roles: [CUSTOMER]
+      organizer:
+        caller-id: 43
+        password: ${DEMO_ORGANIZER_PASSWORD}
+        roles: [ORGANIZER]
+      admin:
+        caller-id: 44
+        password: ${DEMO_ADMIN_PASSWORD}
+        roles: [ADMIN]
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Deliberately short: health and info, and nothing that would report on
+        # the gateway's internals. Every endpoint listed here is reachable only
+        # with an ADMIN token, so the list is the blast radius, not the
+        # authentication.
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+logging:
+  level:
+    com.raydans.apigateway: INFO

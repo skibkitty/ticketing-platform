@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.raydans</groupId>
+        <artifactId>ticketing-platform</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>platform-tests</artifactId>
+    <packaging>jar</packaging>
+    <name>platform-tests</name>
+    <description>
+        Tests about the platform as a deployment rather than about any one
+        module: the published HTTP surface, which is what makes the API Gateway
+        the authentication and authorization trust boundary (ADR 002, ADR 012).
+        Holds no code; the tests read docker-compose.yml and the gateway's
+        service URLs.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- The compose files are read as the configuration they are, not
+                 as text: a `ports:` list is a list of port bindings, and the
+                 question being asked here is which interfaces they bind. -->
+            <groupId>org.yaml</groupId>
+            <artifactId>snakeyaml</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- For `docker compose config` in JSON form, which reports the
+                 merged, fully-resolved model in the same long form. -->
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

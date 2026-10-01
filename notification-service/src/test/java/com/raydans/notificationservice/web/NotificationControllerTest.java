@@ -56,7 +56,7 @@ class NotificationControllerTest {
         when(notifications.listForCustomer(99L, DEFAULT_PAGE_SIZE, null))
                 .thenReturn(page(null, expired(), confirmed()));
 
-        mvc.perform(get("/api/v1/notifications").param("customerId", "99"))
+        mvc.perform(get("/api/v1/notifications").header(NotificationController.CUSTOMER_HEADER, "99"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.items[0].reservationId").value(202))
                 .andExpect(jsonPath("$.items[0].recipientCustomerId").value(99))
@@ -80,7 +80,7 @@ class NotificationControllerTest {
                 .thenReturn(page("next-page-position-from-the-service", expired(), confirmed()));
 
         mvc.perform(get("/api/v1/notifications")
-                        .param("customerId", "99")
+                        .header(NotificationController.CUSTOMER_HEADER, "99")
                         .param("limit", "2"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.items.length()").value(2))
@@ -92,7 +92,7 @@ class NotificationControllerTest {
         when(notifications.listForCustomer(99L, 2, "Y3Vyc29y")).thenReturn(page(null, confirmed()));
 
         mvc.perform(get("/api/v1/notifications")
-                        .param("customerId", "99")
+                        .header(NotificationController.CUSTOMER_HEADER, "99")
                         .param("limit", "2")
                         .param("cursor", "Y3Vyc29y"))
                 .andExpect(status().isOk())
@@ -104,36 +104,40 @@ class NotificationControllerTest {
     void aPageWithNoNotificationsIsEmptyAndOffersNoCursor() throws Exception {
         when(notifications.listForCustomer(404L, DEFAULT_PAGE_SIZE, null)).thenReturn(page(null));
 
-        mvc.perform(get("/api/v1/notifications").param("customerId", "404"))
+        mvc.perform(get("/api/v1/notifications").header(NotificationController.CUSTOMER_HEADER, "404"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.items").isEmpty())
                 .andExpect(jsonPath("$.nextCursor").value(nullValue()));
     }
 
     @Test
-    void missingCustomerIdIs400() throws Exception {
+    void aRequestWithNoCustomerHeaderIs400() throws Exception {
+        // The whole point of binding to the header: with nothing proven about who is
+        // asking there is no inbox to read, so this cannot fall back to a parameter
+        // or a default. Also the reason the route is closed to anything that did not
+        // come through the gateway (ADR 011).
         mvc.perform(get("/api/v1/notifications"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.status").value(400))
                 .andExpect(jsonPath("$.error").value("Bad Request"))
-                .andExpect(jsonPath("$.message").value(Matchers.containsString("customerId")))
+                .andExpect(jsonPath("$.message").value(Matchers.containsString(NotificationController.CUSTOMER_HEADER)))
                 .andExpect(jsonPath("$.path").value("/api/v1/notifications"));
     }
 
     @Test
-    void nonNumericCustomerIdIs400() throws Exception {
-        mvc.perform(get("/api/v1/notifications").param("customerId", "abc"))
+    void aNonNumericCustomerHeaderIs400() throws Exception {
+        mvc.perform(get("/api/v1/notifications").header(NotificationController.CUSTOMER_HEADER, "abc"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.status").value(400))
-                .andExpect(jsonPath("$.message").value(Matchers.containsString("customerId")));
+                .andExpect(jsonPath("$.message").value(Matchers.containsString(NotificationController.CUSTOMER_HEADER)));
     }
 
     @Test
-    void nonPositiveCustomerIdIs400() throws Exception {
+    void aNonPositiveCustomerHeaderIs400() throws Exception {
         when(notifications.listForCustomer(0L, DEFAULT_PAGE_SIZE, null))
                 .thenThrow(new IllegalArgumentException("customerId must be a positive id: 0"));
 
-        mvc.perform(get("/api/v1/notifications").param("customerId", "0"))
+        mvc.perform(get("/api/v1/notifications").header(NotificationController.CUSTOMER_HEADER, "0"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.status").value(400))
                 .andExpect(jsonPath("$.error").value("Bad Request"))
@@ -149,7 +153,7 @@ class NotificationControllerTest {
     void withoutALimitTheConfiguredDefaultPageSizeIsUsed() throws Exception {
         when(notifications.listForCustomer(99L, DEFAULT_PAGE_SIZE, null)).thenReturn(page(null));
 
-        mvc.perform(get("/api/v1/notifications").param("customerId", "99"))
+        mvc.perform(get("/api/v1/notifications").header(NotificationController.CUSTOMER_HEADER, "99"))
                 .andExpect(status().isOk());
 
         Mockito.verify(notifications).listForCustomer(99L, DEFAULT_PAGE_SIZE, null);
@@ -160,7 +164,7 @@ class NotificationControllerTest {
         when(notifications.listForCustomer(99L, 5, "Y3Vyc29y")).thenReturn(page(null));
 
         mvc.perform(get("/api/v1/notifications")
-                        .param("customerId", "99")
+                        .header(NotificationController.CUSTOMER_HEADER, "99")
                         .param("limit", "5")
                         .param("cursor", "Y3Vyc29y"))
                 .andExpect(status().isOk());
@@ -177,7 +181,7 @@ class NotificationControllerTest {
                 .thenThrow(new IllegalArgumentException("cursor is not a valid page position: not-a-cursor"));
 
         mvc.perform(get("/api/v1/notifications")
-                        .param("customerId", "99")
+                        .header(NotificationController.CUSTOMER_HEADER, "99")
                         .param("cursor", "not-a-cursor"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.message").value(Matchers.containsString("cursor")));
@@ -186,10 +190,103 @@ class NotificationControllerTest {
     @Test
     void nonNumericLimitIs400() throws Exception {
         mvc.perform(get("/api/v1/notifications")
-                        .param("customerId", "99")
+                        .header(NotificationController.CUSTOMER_HEADER, "99")
                         .param("limit", "lots"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.message").value(Matchers.containsString("limit")));
+    }
+
+    // --- whose inbox this is ----------------------------------------------------
+
+    @Test
+    void aCustomersInboxIsScopedByTheHeaderRatherThanByTheParameter() throws Exception {
+        when(notifications.listForCustomer(42L, DEFAULT_PAGE_SIZE, null)).thenReturn(page(null, confirmed()));
+
+        mvc.perform(get("/api/v1/notifications").header(NotificationController.CUSTOMER_HEADER, "42"))
+                .andExpect(status().isOk());
+
+        // The gateway's verified id is the scope. Nothing here reads a parameter, so
+        // there is no value a client can change to reach a different row (ADR 011).
+        Mockito.verify(notifications).listForCustomer(42L, DEFAULT_PAGE_SIZE, null);
+    }
+
+    @Test
+    void askingForAnotherCustomersInboxIs400() throws Exception {
+        // The bypass this route used to have. Customer 42 asks for 43 by parameter; the
+        // answer is that the request contradicts the identity the gateway proved, and
+        // the service is never asked for 43's rows at all.
+        mvc.perform(get("/api/v1/notifications")
+                        .header(NotificationController.CUSTOMER_HEADER, "42")
+                        .param("customerId", "43"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value(Matchers.containsString("43")))
+                .andExpect(jsonPath("$.message").value(Matchers.containsString("42")));
+
+        Mockito.verifyNoInteractions(notifications);
+    }
+
+    @Test
+    void aParameterAgreeingWithTheHeaderIsHarmless() throws Exception {
+        // The parameter is redundant, not a capability, so a client still sending the id
+        // it already proved keeps working. Refusing that too would break callers for no
+        // security gain and make the migration a flag day.
+        when(notifications.listForCustomer(42L, DEFAULT_PAGE_SIZE, null)).thenReturn(page(null, confirmed()));
+
+        mvc.perform(get("/api/v1/notifications")
+                        .header(NotificationController.CUSTOMER_HEADER, "42")
+                        .param("customerId", "42"))
+                .andExpect(status().isOk());
+
+        Mockito.verify(notifications).listForCustomer(42L, DEFAULT_PAGE_SIZE, null);
+    }
+
+    @Test
+    void aCustomersOwnIdAsAParameterCannotBeUsedToSkipTheHeader() throws Exception {
+        // Naming yourself in the parameter is not a way to arrive without the header:
+        // with no proven identity there is nothing to compare against, so the required
+        // header still answers.
+        mvc.perform(get("/api/v1/notifications").param("customerId", "42"))
+                .andExpect(status().isBadRequest());
+
+        Mockito.verifyNoInteractions(notifications);
+    }
+
+    // --- the operator's route ----------------------------------------------------
+
+    @Test
+    void theOperatorRouteReadsWhicheverCustomerItNames() throws Exception {
+        when(notifications.listForCustomer(43L, DEFAULT_PAGE_SIZE, null)).thenReturn(page(null, expired()));
+
+        // No header involved: this route's whole job is to read a Customer the caller
+        // is not. The gateway is what admits an ADMIN to it, and this method asks no
+        // question about roles (ADR 011).
+        mvc.perform(get("/api/v1/admin/customers/43/notifications"))
+                .andExpect(status().isOk());
+
+        Mockito.verify(notifications).listForCustomer(43L, DEFAULT_PAGE_SIZE, null);
+    }
+
+    @Test
+    void theOperatorRouteStillPagesAndClampsLikeTheSelfServiceOne() throws Exception {
+        when(notifications.listForCustomer(43L, 5, "Y3Vyc29y")).thenReturn(page(null, expired()));
+
+        mvc.perform(get("/api/v1/admin/customers/43/notifications")
+                        .param("limit", "5")
+                        .param("cursor", "Y3Vyc29y"))
+                .andExpect(status().isOk());
+
+        Mockito.verify(notifications).listForCustomer(43L, 5, "Y3Vyc29y");
+    }
+
+    @Test
+    void theSelfServiceMappingDoesNotAnswerForACustomerIdInThePath() throws Exception {
+        // The two routes must not shadow each other. What matters here is not the status
+        // an unmapped path produces but that nothing was read on its behalf: a sub-path
+        // that reached the self-service method would be a Customer id smuggled in as a
+        // path segment, which is the thing this change exists to stop.
+        mvc.perform(get("/api/v1/notifications/43"));
+
+        Mockito.verifyNoInteractions(notifications);
     }
 
     /** The service's answer for a page, so these tests are about the transport, not paging. */

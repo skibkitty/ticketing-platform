@@ -44,6 +44,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -134,13 +135,13 @@ class ReservationConfirmationBootTests {
                 Map.of("section", "Orchestra", "row", "A", "seatNumber", 1, "priceCents", 15000),
                 Map.of("section", "Orchestra", "row", "B", "seatNumber", 2, "priceCents", 12000)));
         long reservationId = postReservation(created.eventId(), created.seatIds(), 99L);
-        assertThat(reservationStatus(reservationId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(reservationStatus(reservationId, 99L)).isEqualTo("PENDING_PAYMENT");
 
         UUID outcomeEventId = UUID.randomUUID();
         String correlationId = "corr-confirm-" + reservationId;
         producePaymentSucceeded(outcomeEventId, reservationId, correlationId);
 
-        awaitReservationStatus(reservationId, "CONFIRMED");
+        awaitReservationStatus(reservationId, 99L, "CONFIRMED");
         for (long seatId : created.seatIds()) {
             assertThat(seatStatus(seatId)).isEqualTo("SOLD");
         }
@@ -182,7 +183,7 @@ class ReservationConfirmationBootTests {
         producePaymentSucceeded(outcomeEventId, reservationId, "corr-guard-7");
 
         awaitProcessed(outcomeEventId);
-        assertThat(reservationStatus(reservationId)).isEqualTo("EXPIRED");
+        assertThat(reservationStatus(reservationId, 7L)).isEqualTo("EXPIRED");
         assertThat(seatStatus(seatId)).isEqualTo("HELD");
         Integer outboxRows = jdbc.queryForObject(
                 "SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationConfirmed'",
@@ -200,7 +201,7 @@ class ReservationConfirmationBootTests {
         producePaymentSucceeded(outcomeEventId, reservationId, "corr-dupe-21");
         producePaymentSucceeded(outcomeEventId, reservationId, "corr-dupe-21");
 
-        awaitReservationStatus(reservationId, "CONFIRMED");
+        awaitReservationStatus(reservationId, 21L, "CONFIRMED");
         awaitProcessed(outcomeEventId);
         outboxPublisher.poll();
 
@@ -228,7 +229,7 @@ class ReservationConfirmationBootTests {
         producePaymentSucceeded(eventA, reservationId, "corr-two-a-" + reservationId);
         producePaymentSucceeded(eventB, reservationId, "corr-two-b-" + reservationId);
 
-        awaitReservationStatus(reservationId, "CONFIRMED");
+        awaitReservationStatus(reservationId, 77L, "CONFIRMED");
         awaitProcessed(eventA);
         awaitProcessed(eventB);
         outboxPublisher.poll();
@@ -263,7 +264,7 @@ class ReservationConfirmationBootTests {
                 () -> confirmation.process(envB, "corr-race-b"),
                 () -> confirmation.process(envB, "corr-race-b")));
 
-        awaitReservationStatus(reservationId, "CONFIRMED");
+        awaitReservationStatus(reservationId, 33L, "CONFIRMED");
 
         // A loser rolled back its idempotency claim with the business transaction. Kafka
         // at-least-once then redelivers: each eventId must now be a clean duplicate-guard
@@ -311,7 +312,7 @@ class ReservationConfirmationBootTests {
                         + " after the configured retry count")
                 .isNotNull();
 
-        assertThat(reservationStatus(reservationId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(reservationStatus(reservationId, 55L)).isEqualTo("PENDING_PAYMENT");
         assertThat(seatStatus(created.seatIds().get(0))).isEqualTo("HELD");
         assertThat(processedCount(poisonEventId)).isZero();
         assertThat(outboxConfirmedCount(reservationId)).isZero();
@@ -320,7 +321,7 @@ class ReservationConfirmationBootTests {
         reset(seats);
         UUID validEventId = UUID.randomUUID();
         producePaymentSucceeded(validEventId, reservationId, "corr-after-dlt-55");
-        awaitReservationStatus(reservationId, "CONFIRMED");
+        awaitReservationStatus(reservationId, 55L, "CONFIRMED");
         awaitProcessed(validEventId);
     }
 
@@ -356,12 +357,12 @@ class ReservationConfirmationBootTests {
 
         // Immediately after that failing attempt the whole transaction is rolled back.
         assertThat(processedCount(eventId)).as("idempotency claim rollback").isZero();
-        assertThat(reservationStatus(reservationId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(reservationStatus(reservationId, 66L)).isEqualTo("PENDING_PAYMENT");
         assertThat(seatStatus(seatId)).isEqualTo("HELD");
 
         // Kafka redelivers the same event (DefaultErrorHandler): once the write works the
         // event confirms and is then claimed exactly once.
-        awaitReservationStatus(reservationId, "CONFIRMED");
+        awaitReservationStatus(reservationId, 66L, "CONFIRMED");
         awaitProcessed(eventId);
         assertThat(outboxConfirmedCount(reservationId)).isEqualTo(1);
         assertThat(seatStatus(seatId)).isEqualTo("SOLD");
@@ -385,14 +386,14 @@ class ReservationConfirmationBootTests {
                 .as("an unrecognized event type must be rejected and dead-lettered, not silently acked")
                 .isNotNull();
 
-        assertThat(reservationStatus(reservationId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(reservationStatus(reservationId, 88L)).isEqualTo("PENDING_PAYMENT");
         assertThat(seatStatus(created.seatIds().get(0))).isEqualTo("HELD");
         assertThat(processedCount(weirdEventId)).isZero();
         assertThat(outboxConfirmedCount(reservationId)).isZero();
 
         UUID validEventId = UUID.randomUUID();
         producePaymentSucceeded(validEventId, reservationId, "corr-after-weird-88");
-        awaitReservationStatus(reservationId, "CONFIRMED");
+        awaitReservationStatus(reservationId, 88L, "CONFIRMED");
         awaitProcessed(validEventId);
     }
 
@@ -458,8 +459,18 @@ class ReservationConfirmationBootTests {
         return ((Number) response.getBody().get("id")).longValue();
     }
 
-    private String reservationStatus(long reservationId) {
-        ResponseEntity<Map> response = rest.getForEntity("/api/v1/reservations/" + reservationId, Map.class);
+    /**
+     * The reservation's status as its owning Customer sees it.
+     *
+     * <p>The customer id is the gateway's header, not a detail of the test: a
+     * read is scoped by it, so an assertion that left it off would be asserting
+     * against a route that answers nothing (ADR 014).
+     */
+    private String reservationStatus(long reservationId, long customerId) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(CUSTOMER_HEADER, String.valueOf(customerId));
+        ResponseEntity<Map> response = rest.exchange(
+                "/api/v1/reservations/" + reservationId, HttpMethod.GET, new HttpEntity<>(headers), Map.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         return (String) response.getBody().get("status");
     }
@@ -469,11 +480,11 @@ class ReservationConfirmationBootTests {
                 "SELECT status FROM reservation.seats WHERE id = ?", String.class, seatId);
     }
 
-    private void awaitReservationStatus(long reservationId, String status) {
+    private void awaitReservationStatus(long reservationId, long customerId, String status) {
         String last = "";
         Instant deadline = Instant.now().plusSeconds(30);
         while (Instant.now().isBefore(deadline)) {
-            last = reservationStatus(reservationId);
+            last = reservationStatus(reservationId, customerId);
             if (status.equals(last)) {
                 return;
             }

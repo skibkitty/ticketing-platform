@@ -1,3 +1,15 @@
+# The gateway is the only service here that publishes a port. Everything else in
+# this file — the three application services and the three infrastructure
+# services — is reachable by service name over the compose network and from no
+# host interface at all, and each one's `ports:` entry is its own comment.
+#
+# For host-side access to any of them, including `psql` against postgres and the
+# Kafka UI, use the separate, opt-in override, which is the one place a port is
+# published and says what a published port is worth:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.debug.yml up --build
+#
+# See ADR 012 for the application services and ADR 013 for the infrastructure.
 services:
   postgres:
     image: postgres:16-alpine
@@ -8,8 +20,12 @@ services:
     volumes:
       - ./infra/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       - platform-db-data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    # Unpublished, and this one holds everything. All four schemas are in this
+    # database, the credentials are in this file, and a published 5432 is a
+    # socket that reads every Customer's reservation, payment and notification
+    # rows without ever reaching the gateway — a wider read than the published
+    # application ports ever were. Reachable as `postgres:5432` from the compose
+    # network, which is how the services below reach it (ADR 013).
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U platform"]
       interval: 5s
@@ -29,8 +45,11 @@ services:
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-    ports:
-      - "29092:29092"
+    # Unpublished to the host. `PLAINTEXT_HOST` is still declared above because
+    # the debug override publishes 29092 for a host-side client; it is the
+    # advertised listener for that override, not a published port by itself.
+    # Service-to-service traffic never leaves the compose network and speaks
+    # PLAINTEXT on kafka:9092 (ADR 013).
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
       interval: 10s
@@ -43,8 +62,10 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
-    ports:
-      - "8090:8080"
+    # Unpublished to the host. This one shows the whole platform's event topics
+    # — every Customer's reservation and payment history — to anything that can
+    # open a socket, and it authenticates nobody, so a published 8090 was a read
+    # of the entire saga with no credential at all (ADR 013).
     depends_on:
       kafka:
         condition: service_healthy
@@ -55,6 +76,22 @@ services:
       retries: 5
       start_period: 20s
 
+  # The three services below are internal: reachable by service name from the
+  # compose network and published to no host interface at all. A `ports:` entry
+  # here — loopback-bound or not — is a way *around* the gateway, which is the
+  # only thing standing between a request and an unverified identity header
+  # (ADR 002): notification-service reads a Customer's Notifications from a path
+  # variable and checks no role of its own (ADR 011), so anything that can open
+  # a socket to it can read anyone's inbox without ever authenticating.
+  #
+  # Same rule, same file, as the infrastructure services above (ADR 013).
+  #
+  # For host-side debugging use the separate, opt-in override, which is the one
+  # place a port is published and says so:
+  #
+  #   docker compose -f docker-compose.yml -f docker-compose.debug.yml up --build
+  #
+  # See ADR 012.
   reservation-service:
     build:
       context: .
@@ -64,13 +101,6 @@ services:
       DB_USER: platform
       DB_PASSWORD: platform
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-    # Internal service: reachable only from this machine, never from the network.
-    # ADR 002 puts trust in the gateway's forwarded identity header on network hygiene --
-    # nothing but our own services may reach this port -- so the binding is to loopback,
-    # not to every interface. Host-side debugging (curl localhost:8082) still works; a
-    # colleague on the LAN forging that header does not.
-    ports:
-      - "127.0.0.1:8082:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -91,13 +121,6 @@ services:
       # payment, so the compensating (seat-release) path is easy to trigger
       # on purpose when demoing.
       PAYMENT_DECLINE_THRESHOLD_CENTS: 50000
-    # Internal service: reachable only from this machine, never from the network.
-    # ADR 002 puts trust in the gateway's forwarded identity header on network hygiene --
-    # nothing but our own services may reach this port -- so the binding is to loopback,
-    # not to every interface. Host-side debugging (curl localhost:8082) still works; a
-    # colleague on the LAN forging that header does not.
-    ports:
-      - "127.0.0.1:8083:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -113,19 +136,15 @@ services:
       DB_USER: platform
       DB_PASSWORD: platform
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-    # Internal service: reachable only from this machine, never from the network.
-    # ADR 002 puts trust in the gateway's forwarded identity header on network hygiene --
-    # nothing but our own services may reach this port -- so the binding is to loopback,
-    # not to every interface. Host-side debugging (curl localhost:8082) still works; a
-    # colleague on the LAN forging that header does not.
-    ports:
-      - "127.0.0.1:8084:8080"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
 
+  # The one published HTTP port in this file. Everything a client can reach goes
+  # through here, so the authentication and authorization decisions
+  # (RoleAuthorizer, JwtAuthenticationFilter) are the only ones there are.
   api-gateway:
     build:
       context: .
@@ -135,7 +154,20 @@ services:
       PAYMENT_SERVICE_URL: http://payment-service:8080
       NOTIFICATION_SERVICE_URL: http://notification-service:8080
       CORS_ALLOWED_ORIGINS: http://localhost:3000
-      JWT_SECRET: change-me-in-a-real-deployment-this-is-a-demo-secret
+      # No signing key and no demo passwords are committed. A default here would
+      # be a credential in version control that passes the gateway's own
+      # length check and signs every token in a deployment that never chose one
+      # (ADR 002). `:?` makes Compose stop with the variable's name rather than
+      # substituting an empty string and leaving the gateway to fail later.
+      #
+      #   cp .env.example .env    # then fill in the four values
+      #
+      # The gateway still enforces its own minimum length on JWT_SECRET, so a
+      # too-short value fails at startup with a message that says why.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is not set - copy .env.example to .env and generate one with 'openssl rand -base64 48'}
+      DEMO_CUSTOMER_PASSWORD: ${DEMO_CUSTOMER_PASSWORD:?DEMO_CUSTOMER_PASSWORD is not set - copy .env.example to .env and fill it in}
+      DEMO_ORGANIZER_PASSWORD: ${DEMO_ORGANIZER_PASSWORD:?DEMO_ORGANIZER_PASSWORD is not set - copy .env.example to .env and fill it in}
+      DEMO_ADMIN_PASSWORD: ${DEMO_ADMIN_PASSWORD:?DEMO_ADMIN_PASSWORD is not set - copy .env.example to .env and fill it in}
     ports:
       - "8080:8080"
     depends_on:

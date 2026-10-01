@@ -44,6 +44,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -136,13 +137,13 @@ class ReservationCompensationBootTests {
                 Map.of("section", "Orchestra", "row", "A", "seatNumber", 1, "priceCents", 15000),
                 Map.of("section", "Orchestra", "row", "B", "seatNumber", 2, "priceCents", 12000)));
         long reservationId = postReservation(created.eventId(), created.seatIds(), 99L);
-        assertThat(reservationStatus(reservationId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(reservationStatus(reservationId, 99L)).isEqualTo("PENDING_PAYMENT");
 
         UUID outcomeEventId = UUID.randomUUID();
         String correlationId = "corr-compensate-" + reservationId;
         producePaymentFailed(outcomeEventId, reservationId, correlationId);
 
-        awaitReservationStatus(reservationId, "CANCELLED");
+        awaitReservationStatus(reservationId, 99L, "CANCELLED");
         for (long seatId : created.seatIds()) {
             assertThat(seatStatus(seatId)).isEqualTo("AVAILABLE");
             assertThat(seatHoldExpiresAt(seatId)).as("hold expiry cleared for seat %s", seatId).isNull();
@@ -179,12 +180,12 @@ class ReservationCompensationBootTests {
         long seatId = created.seatIds().get(0);
 
         producePaymentFailed(UUID.randomUUID(), reservationId, "corr-release-7");
-        awaitReservationStatus(reservationId, "CANCELLED");
+        awaitReservationStatus(reservationId, 7L, "CANCELLED");
         assertThat(seatStatus(seatId)).isEqualTo("AVAILABLE");
 
         long secondReservationId = postReservation(created.eventId(), created.seatIds(), 8L);
         assertThat(secondReservationId).isNotEqualTo(reservationId);
-        assertThat(reservationStatus(secondReservationId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(reservationStatus(secondReservationId, 8L)).isEqualTo("PENDING_PAYMENT");
         assertThat(seatStatus(seatId)).isEqualTo("HELD");
     }
 
@@ -202,7 +203,7 @@ class ReservationCompensationBootTests {
         producePaymentFailed(outcomeEventId, reservationId, "corr-guard-21");
 
         awaitProcessed(outcomeEventId);
-        assertThat(reservationStatus(reservationId)).isEqualTo("EXPIRED");
+        assertThat(reservationStatus(reservationId, 21L)).isEqualTo("EXPIRED");
         assertThat(seatStatus(seatId)).isEqualTo("HELD");
         Integer outboxRows = jdbc.queryForObject(
                 "SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationCancelled'",
@@ -221,7 +222,7 @@ class ReservationCompensationBootTests {
         producePaymentFailed(outcomeEventId, reservationId, "corr-dupe-77");
         producePaymentFailed(outcomeEventId, reservationId, "corr-dupe-77");
 
-        awaitReservationStatus(reservationId, "CANCELLED");
+        awaitReservationStatus(reservationId, 77L, "CANCELLED");
         awaitProcessed(outcomeEventId);
         outboxPublisher.poll();
 
@@ -248,7 +249,7 @@ class ReservationCompensationBootTests {
         // The compensating action lands AND the record never reaches the dead-letter topic:
         // PaymentFailed is a known, well-formed type that is handled, not quarantined
         // (ADR 008) and not silently swallowed.
-        awaitReservationStatus(reservationId, "CANCELLED");
+        awaitReservationStatus(reservationId, 55L, "CANCELLED");
         assertThat(awaitOnTopic(PAYMENT_EVENTS_DLT, record -> record.value().contains(outcomeEventId.toString())))
                 .as("PaymentFailed must be compensated end to end, never dead-lettered")
                 .isNull();
@@ -305,7 +306,7 @@ class ReservationCompensationBootTests {
         // The failed transaction rolled back in full: a mid-compensation crash does not strand the
         // reservation as partially cancelled nor leak a claim / cancelled outbox row.
         assertThat(processedCount(outcomeEventId)).as("idempotency claim must roll back").isZero();
-        assertThat(reservationStatus(reservationId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(reservationStatus(reservationId, 66L)).isEqualTo("PENDING_PAYMENT");
         assertThat(seatStatus(seatId)).isEqualTo("HELD");
         Integer cancelledRows = jdbc.queryForObject(
                 "SELECT count(*) FROM reservation.outbox_events WHERE aggregate_id = ? AND event_type = 'reservation.ReservationCancelled'",
@@ -313,7 +314,7 @@ class ReservationCompensationBootTests {
         assertThat(cancelledRows).isZero();
 
         // Kafka redelivers; once the seat write works the compensation lands exactly once.
-        awaitReservationStatus(reservationId, "CANCELLED");
+        awaitReservationStatus(reservationId, 66L, "CANCELLED");
         awaitProcessed(outcomeEventId);
         assertThat(seatStatus(seatId)).isEqualTo("AVAILABLE");
         assertThat(outboxCancelledCount(reservationId)).isEqualTo(1);
@@ -353,7 +354,7 @@ class ReservationCompensationBootTests {
                             .isInstanceOf(ObjectOptimisticLockingFailureException.class);
                 });
 
-        String terminalStatus = awaitTerminalStatus(reservationId);
+        String terminalStatus = awaitTerminalStatus(reservationId, 33L);
         boolean confirmed = "CONFIRMED".equals(terminalStatus);
         assertThat(confirmed || "CANCELLED".equals(terminalStatus))
                 .as("reservation must reach exactly one terminal state, was " + terminalStatus)
@@ -441,7 +442,7 @@ class ReservationCompensationBootTests {
                             .isInstanceOf(ObjectOptimisticLockingFailureException.class);
                 });
 
-        String terminalStatus = awaitTerminalStatus(reservationId);
+        String terminalStatus = awaitTerminalStatus(reservationId, 61L);
         boolean cancelled = "CANCELLED".equals(terminalStatus);
         assertThat(cancelled || "EXPIRED".equals(terminalStatus))
                 .as("the expiry race must resolve to exactly one terminal outcome, was " + terminalStatus)
@@ -478,7 +479,7 @@ class ReservationCompensationBootTests {
         producePaymentFailed(outcomeEventId, reservationId, "corr-guard-confirmed-11");
 
         awaitProcessed(outcomeEventId);
-        assertThat(reservationStatus(reservationId)).isEqualTo("CONFIRMED");
+        assertThat(reservationStatus(reservationId, 11L)).isEqualTo("CONFIRMED");
         assertThat(seatStatus(seatId)).isEqualTo("SOLD");
         assertThat(outboxCancelledCount(reservationId)).isZero();
     }
@@ -497,7 +498,7 @@ class ReservationCompensationBootTests {
         String correlationId = "corr-amount-truth-" + reservationId;
         producePaymentFailed(outcomeEventId, reservationId, 27_000, correlationId);
 
-        awaitReservationStatus(reservationId, "CANCELLED");
+        awaitReservationStatus(reservationId, 5L, "CANCELLED");
         assertThat(seatStatus(seatId)).isEqualTo("AVAILABLE");
         awaitProcessed(outcomeEventId);
 
@@ -588,10 +589,10 @@ class ReservationCompensationBootTests {
         return failures;
     }
 
-    private String awaitTerminalStatus(long reservationId) {
+    private String awaitTerminalStatus(long reservationId, long customerId) {
         Instant deadline = Instant.now().plusSeconds(30);
         while (Instant.now().isBefore(deadline)) {
-            String status = reservationStatus(reservationId);
+            String status = reservationStatus(reservationId, customerId);
             if ("CONFIRMED".equals(status)
                     || "CANCELLED".equals(status)
                     || "EXPIRED".equals(status)) {
@@ -601,7 +602,7 @@ class ReservationCompensationBootTests {
         }
         throw new AssertionError(
                 "Timed out waiting for reservation " + reservationId + " to reach a terminal state (last seen: "
-                        + reservationStatus(reservationId) + ")");
+                        + reservationStatus(reservationId, customerId) + ")");
     }
 
     private int processedCount(UUID eventId) {
@@ -644,8 +645,18 @@ class ReservationCompensationBootTests {
         return ((Number) response.getBody().get("id")).longValue();
     }
 
-    private String reservationStatus(long reservationId) {
-        ResponseEntity<Map> response = rest.getForEntity("/api/v1/reservations/" + reservationId, Map.class);
+    /**
+     * The reservation's status as its owning Customer sees it.
+     *
+     * <p>The customer id is the gateway's header, not a detail of the test: a
+     * read is scoped by it, so an assertion that left it off would be asserting
+     * against a route that answers nothing (ADR 014).
+     */
+    private String reservationStatus(long reservationId, long customerId) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(CUSTOMER_HEADER, String.valueOf(customerId));
+        ResponseEntity<Map> response = rest.exchange(
+                "/api/v1/reservations/" + reservationId, HttpMethod.GET, new HttpEntity<>(headers), Map.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         return (String) response.getBody().get("status");
     }
@@ -660,11 +671,11 @@ class ReservationCompensationBootTests {
                 "SELECT hold_expires_at FROM reservation.seats WHERE id = ?", java.sql.Timestamp.class, seatId);
     }
 
-    private void awaitReservationStatus(long reservationId, String status) {
+    private void awaitReservationStatus(long reservationId, long customerId, String status) {
         String last = "";
         Instant deadline = Instant.now().plusSeconds(30);
         while (Instant.now().isBefore(deadline)) {
-            last = reservationStatus(reservationId);
+            last = reservationStatus(reservationId, customerId);
             if (status.equals(last)) {
                 return;
             }

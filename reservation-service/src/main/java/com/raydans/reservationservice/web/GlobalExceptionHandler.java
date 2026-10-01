@@ -83,6 +83,24 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(status).body(error(status, status.getReasonPhrase(), message, request, List.of()));
     }
 
+    /**
+     * A request that contradicts itself — today, a {@code customerId} parameter
+     * disagreeing with the caller the gateway authenticated (ADR 014).
+     *
+     * <p>Its own branch rather than the {@link Exception} fallback, because that
+     * fallback would answer 500: the caller did nothing wrong that a server error
+     * describes, and the response would tell a client that its read failed rather
+     * than that it asked a question this route does not answer. Same treatment as
+     * {@code notification-service}'s equivalent, so the two identity-scoped reads
+     * report a conflicting customer id identically.
+     */
+    @ExceptionHandler(IllegalArgumentException.class)
+    ResponseEntity<ApiErrorResponse> contradictoryRequest(
+            IllegalArgumentException ex, HttpServletRequest request) {
+        HttpStatus status = HttpStatus.BAD_REQUEST;
+        return ResponseEntity.status(status).body(error(status, ex, request));
+    }
+
     @ExceptionHandler(Exception.class)
     ResponseEntity<ApiErrorResponse> fallback(Exception ex, HttpServletRequest request) {
         log.error("Unhandled exception on {} {}", request.getMethod(), request.getRequestURI(), ex);
