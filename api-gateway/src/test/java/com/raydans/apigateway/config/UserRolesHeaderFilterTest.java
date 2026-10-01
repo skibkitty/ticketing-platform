@@ -127,6 +127,55 @@ class UserRolesHeaderFilterTest {
     }
 
     @Test
+    void aForgedHeaderInAnyCasingIsOverwritten() {
+        // HTTP header names are case-insensitive, so the casing is the client's
+        // to choose and carries no meaning: `curl -H "x-user-roles: ADMIN"` sends
+        // the same header as the one above. This holds only because HttpHeaders is
+        // backed by a LinkedCaseInsensitiveMap, which is an implementation detail
+        // of Spring rather than a stated contract of this filter — so it is
+        // asserted here instead of assumed, and the key set is checked as well as
+        // the value. A remove() that matched the name literally would leave the
+        // client's value under its own spelling, where the lookup that matters
+        // would still find it.
+        for (String forged : new String[] {"x-user-roles", "X-USER-ROLES", "X-User-roles"}) {
+            HttpHeaders forwarded = apply(inbound(forged, "ADMIN"), requestAuthenticatedAs(42L, Role.CUSTOMER));
+
+            assertThat(forwarded.get(UserRolesHeaderFilter.HEADER_NAME))
+                    .as("the roles the service reads, for a client spelling of %s", forged)
+                    .containsExactly("CUSTOMER");
+            assertThat(forwarded.keySet())
+                    .as("no key left behind under the client's own spelling, for %s", forged)
+                    .containsExactly(UserRolesHeaderFilter.HEADER_NAME);
+        }
+    }
+
+    @Test
+    void aForgedHeaderPaddedWithWhitespaceIsOverwritten() {
+        // The value side of the same question. A service that split on "," and
+        // trimmed, or trimmed and compared against its own role names, would read
+        // "  ADMIN  " as ADMIN while one that compared the raw string would not;
+        // neither is a difference this platform can let a client choose, and the
+        // gateway writes its own values with no padding at all.
+        HttpHeaders forwarded =
+                apply(inbound(UserRolesHeaderFilter.HEADER_NAME, "  ADMIN  "), requestAuthenticatedAs(42L, Role.CUSTOMER));
+
+        assertThat(forwarded.get(UserRolesHeaderFilter.HEADER_NAME)).containsExactly("CUSTOMER");
+    }
+
+    @Test
+    void anUnauthenticatedRequestsForgedHeaderSurvivesNoSpellingOrPadding() {
+        // The unauthenticated half again, over the shapes a client controls. With
+        // no caller to correct the header, anything that gets through is trusted
+        // for exactly the requests nobody authenticated, so it is checked with the
+        // casing and padding varied rather than once in one canonical shape.
+        for (String forged : new String[] {"x-user-roles", "X-USER-ROLES"}) {
+            HttpHeaders forwarded = apply(inbound(forged, "  ADMIN  "), new MockHttpServletRequest());
+
+            assertThat(forwarded.keySet()).as("nothing left under %s", forged).isEmpty();
+        }
+    }
+
+    @Test
     void theOtherInboundHeadersAreLeftAlone() {
         // This filter's job is the caller's roles and nothing else — the
         // Customer id is CustomerIdHeaderFilter's. A filter that rebuilt the

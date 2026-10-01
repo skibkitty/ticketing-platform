@@ -247,6 +247,43 @@ class GatewayProxyBootTests {
         assertThat(received.get(0).header("X-User-Roles")).isEqualTo("CUSTOMER");
     }
 
+    @Test
+    void aForgedRoleHeaderReachesTheServiceInNoSpellingOrPadding() throws Exception {
+        // The same bypass over a real connection, in the three shapes the client
+        // fully controls and that a single-valued test in the canonical spelling
+        // would not reach: the name in another case, and the value padded. HTTP
+        // header names are case-insensitive, so `x-user-roles` is the same header
+        // as `X-User-Roles` and the forgery is the same forgery — whether that is
+        // true of this filter chain is a property of Spring's HttpHeaders, not a
+        // stated contract of this gateway, so it is proved here rather than
+        // assumed from the unit test.
+        for (String spelling : new String[] {"x-user-roles", "X-USER-ROLES", "X-User-Roles"}) {
+            mvc.perform(get("/api/v1/events")
+                            .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                            .header(spelling, "  ADMIN  "))
+                    .andExpect(status().isOk());
+
+            assertThat(received.get(received.size() - 1).header("X-User-Roles"))
+                    .as("what the service reads, for a client spelling of %s", spelling)
+                    .isEqualTo("CUSTOMER");
+        }
+    }
+
+    @Test
+    void aForgedRoleHeaderIsOverwrittenWhenTheTokenIsTheMorePowerfulOne() throws Exception {
+        // The inverse, and the one that matters more: a client forging a role the
+        // gateway was going to grant anyway proves nothing, since the gateway
+        // would have written it. The bypass only pays when the forged value is the
+        // higher one — an ADMIN arriving on a CUSTOMER's token. Asserted with the
+        // casing the canonical-spooling test above does not use.
+        mvc.perform(get("/api/v1/events")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                        .header("x-user-roles", "ADMIN"))
+                .andExpect(status().isOk());
+
+        assertThat(received.get(received.size() - 1).header("X-User-Roles")).isEqualTo("CUSTOMER");
+    }
+
     // --- X-Customer-Id: the identity a reservation is booked against -----------
 
     @Test
