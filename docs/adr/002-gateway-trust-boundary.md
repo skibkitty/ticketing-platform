@@ -142,26 +142,34 @@ the login surface is production-grade password authentication. It is not:
 - **A token is valid until its expiry** and nothing shorter. `JWT_TTL` defaults
   to an hour and there is no refresh token, so the honest description of
   "logging out" is "stop sending it".
-- **Nobody is rate-limited at the login surface.** `/auth/login` is the one
-  endpoint reachable with no token, and it has no attempt limit, so it is
-  guessable at whatever rate the network allows. Constant-time comparison and an
-  identical response for an unknown username and a wrong password mean the
-  endpoint does not leak *which* credentials exist; it does nothing about
-  *how many* tries. Login brute-force protection is its own follow-up,
-  [#43](https://github.com/skibkitty/ticketing-platform/issues/43), and is
-  deliberately separate from the flash-sale rate limiting in
-  [#13](https://github.com/skibkitty/ticketing-platform/issues/13), which is
-  scoped to `POST /api/v1/reservations` and would not cover it.
+- **The login surface is rate-limited, and the limit is per process.** `/auth/login`
+  is the one endpoint reachable with no token, so it counts failed guesses on two
+  independent axes — five per account and twenty per remote address over a
+  five-minute window, after which the attempt is refused with `429` and a
+  `Retry-After` (ADR 015). Constant-time comparison and an identical response for
+  an unknown username and a wrong password mean the endpoint does not leak *which*
+  credentials exist, and the limiter is built not to leak it either: failures are
+  counted whether or not the name exists, and the limit is checked before the
+  password is read, so a correct password is refused exactly like a wrong one.
+  What it cannot do is mean one number across replicas or survive a restart —
+  counters live in each gateway process, so N gateways behind a load balancer give
+  an attacker N times the budget. A deployment that needs the limit to be global
+  needs a shared store. The flash-sale rate limiting in
+  [#13](https://github.com/skibkitty/ticketing-platform/issues/13) is separate and
+  still open: it is scoped to `POST /api/v1/reservations` and would not cover this.
 - **Roles come from configuration too.** A caller's roles are whatever
   `app.gateway.callers.*.roles` says, so the role table is an operator's
   configuration decision rather than something a user can hold or change.
 
 Production identity management — a credential store, hashing, rotation that
-revokes, refresh and revocation, and a rate limit on the login endpoint — is a
-follow-up, and it is the part of this boundary that has to change before the
-platform carries real users. Nothing else in this ADR has to change with it: the
-gateway is already the single place a token is verified, so replacing what
-verifies it is a change behind one interface.
+revokes, and refresh and revocation — is a follow-up, and it is the part of this
+boundary that has to change before the platform carries real users. The login
+limiter already in place (ADR 015) does not change with it, and would have to be
+revisited for one reason only: its counters are per process, so a deployment
+scaling the gateway past one replica needs them shared before the number it
+configures means anything. Nothing else in this ADR has to change: the gateway is
+already the single place a token is verified, so replacing what verifies it is a
+change behind one interface.
 
 Making reservations Customer-only is a change in behaviour, and the one this
 decision is most likely to be second-guessed on: an organizer or an admin can no
@@ -173,22 +181,49 @@ would be expensive to reverse the other way, which is why the authorization
 table and the header filter ask `isCustomer()` rather than re-deriving the
 answer from a role set each.
 
-The safety of trusting these headers still rests on network hygiene, not on
-protocol: nothing except our own services may reach an internal service. The
-default `docker-compose.yml` therefore publishes no port for
-reservation-service, payment-service or notification-service at all — they are
-reachable by service name on the compose network, and by nothing else, with
-`docker-compose.debug.yml` as the opt-in exception for host-side debugging. See
-ADR 012, which records that decision, and ADR 013, which extends it to postgres,
-kafka and kafka-ui, so the default file publishes one port in total: the
-gateway's. A host port is a debugging convenience, never an access path: an
-internal service with no gateway route in front of it is not safe to expose, and
-one that reads a Customer's data by an id in the path has nothing of its own to
-stop that. A host-local process can still forge the headers, which is accepted at
-demo scale. If this ever runs on a shared or untrusted network, each service must
-validate the JWT itself instead of trusting the headers, and the `X-Customer-Id`
-derivation above stops being load-bearing for authorization only because each
-service would be deriving it from the token itself.
+**Network isolation is the security boundary, and that is an accepted
+decision.** Everything above assumes that the two headers this gateway writes are
+only ever written by the gateway: a service that trusts `X-User-Roles` and
+`X-Customer-Id` has no authentication of its own and would believe a forged value
+without noticing. The thing that makes the values trustworthy is therefore not a
+signature, a shared secret or a protocol — it is that nothing except our own
+services can reach an internal service. That is a property of the deployment, not
+of the code, and it is the part of this ADR most likely to be misread as a claim
+about the messages: the guarantee is "these headers did not come from the
+network's edge", not "these headers are authenticated".
+
+So the default `docker-compose.yml` publishes no port for reservation-service,
+payment-service or notification-service at all — they are reachable by service name
+on the compose network, and by nothing else, with `docker-compose.debug.yml` as the
+opt-in exception for host-side debugging. See ADR 012, which records that decision,
+and ADR 013, which extends it to postgres, kafka and kafka-ui, so the default file
+publishes one port in total: the gateway's. A host port is a debugging
+convenience, never an access path: an internal service with no gateway route in
+front of it is not safe to expose, and one that reads a Customer's data by an id in
+the path has nothing of its own to stop that.
+
+**The residual risk, stated plainly:** any process on the gateway host can reach an
+internal service and write whatever it likes into these headers. It does not need
+a token, a valid signature or a route through the gateway — the compose network is
+where the trust is placed, and a host-local process is inside it. That is accepted
+at demo scale and it is the only reason the header filters are sufficient. The
+debugging override is the same risk on purpose, which is why it is asserted to
+publish on loopback only: it is a convenience for an operator who is already
+trusted, not a path for anyone else.
+
+**What would change if the services were ever meant to be independently
+reachable** — a second host, a shared or untrusted network, an operator connecting
+from a laptop, a service reachable from anything this platform does not control —
+is each service validating the JWT itself instead of trusting the headers, with
+gateway-to-service mTLS or an equivalent authenticated internal identity to
+establish who is on the other end. Both halves are needed: the signature answers
+"is this token ours and unexpired" and cannot answer "did this caller reach me
+through the gateway", and the network answers the second question only by
+excluding everything else. Today the second question is answered by exclusion
+alone, which is what the port assertions in `platform-tests` hold in place
+(ADR 012, ADR 013). Were that to change, the `X-Customer-Id` derivation above stops
+being load-bearing for authorization — not because it becomes wrong, but because
+each service would then be deriving the same value from the token itself.
 
 **What holds the boundary, and where that is asserted.** The invariant is not
 "the filters strip the headers" on its own — a strip that a later edit moved
@@ -200,7 +235,13 @@ are each a test, and a change to one of these has to break one of them:
   gateway gives no such header at all — including an organizer forging a
   Customer id, which is stripped rather than left to pass (`UserRolesHeaderFilterTest`,
   `CustomerIdHeaderFilterTest`, and both halves end to end in
-  `GatewayProxyBootTests`).
+  `GatewayProxyBootTests`). In any spelling the client chooses and with the value
+  padded, because a header name is case-insensitive on the wire and the padding is
+  theirs to add: the filter asserts the *key set* as well as the value, so a strip
+  that matched the name literally would fail rather than leave a value behind under
+  a spelling the lookup that matters still finds.
+- The login limiter is a test per property rather than one test for the class, and
+  each was mutated to confirm it holds (ADR 015).
 - The header is **overwritten, never appended**, so a value repeated by the
   client — one `X-User-Roles` sent twice by two `curl -H` flags, or
   `X-Customer-Id` as two values — cannot leave a second value behind for a

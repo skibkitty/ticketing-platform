@@ -76,3 +76,22 @@ This does not change what a host-local process can do to the *database*, which
 is still published on every interface for the same debugging reasons. That is a
 separate decision, and ADR 013 makes it: the infrastructure ports are unpublished
 in the default file too, and move to the same debug override.
+
+**An `internal: true` network was considered and rejected.** It is the usual
+suggestion for this problem and it is worth saying why it is not the answer here,
+because the reason is not that it is unsafe — it is that it guards a different
+thing. Marking the compose network `internal: true` removes *outbound* connectivity
+for everything on it: no image pulls from a registry, no calls out to a payment
+provider, no egress at all. That is a containment property, and the exposure
+vector being guarded here is *inbound* — a socket published to the host, which an
+internal network does not unpublish. Setting it would have left the port
+assertions unchanged and their intent unimplemented, while breaking the one thing
+these services legitimately need: the payment-service talking to a provider.
+
+The two are not equally valuable anyway. Outbound egress is not what makes an
+internal service unsafe to expose, and it is not where this platform's data
+leaks — an internal service that trusts `X-Customer-Id` (ADR 002) is unsafe
+because of who can *reach* it and write that header, which is exactly what
+`InternalServiceExposureTests` asserts and what an internal network would leave
+alone. `internal: true` was therefore declined as solving a problem this ADR does
+not have, at the cost of one it does.

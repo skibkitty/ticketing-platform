@@ -129,9 +129,11 @@ same spike profile or the same cost-per-request (a seat hold does real
 write work; a browse is a cheap read).
 
 Worth keeping distinct from login brute-force protection, which is a separate
-follow-up: this is about load on one endpoint, and the other is about an
-unauthenticated endpoint being guessable. A rate limit scoped to the
-reservation route would not cover `/auth/login` at all.
+mechanism and *is* built: this is about load on one endpoint, and the other is
+about an unauthenticated endpoint being guessable. A rate limit scoped to the
+reservation route would not cover `/auth/login` at all, which is why that one
+counts failed logins per account and per remote address instead of capping a
+request rate (ADR 015).
 
 ## Why a circuit breaker + fallback on the payment-status query route, specifically
 
@@ -159,10 +161,16 @@ limitations in full.
 The reason it can stay this small is the shape of the rest of the system: the
 gateway is already the single place a token is verified and the single place a
 role is enforced, so a real credential store, rotation and revocation land
-behind that one interface rather than across every service. Login brute-force
-protection is a separate follow-up from the reservation rate limiting above,
-because the route is the one reachable without a token
-([#43](https://github.com/skibkitty/ticketing-platform/issues/43)).
+behind that one interface rather than across every service.
+
+Guessing at this surface is limited separately, because "unauthenticated" and
+"unguarded" are different words: `POST /auth/login` counts failed attempts on two
+keys — five per account and twenty per remote address over five minutes — and
+refuses with a `Retry-After` before reading the password at all, so a caller over
+the limit learns nothing about whether theirs was right
+([#43](https://github.com/skibkitty/ticketing-platform/issues/43), ADR 015). It
+is deliberately a different mechanism from the reservation rate limiting above,
+which is scoped to a route this one is not.
 
 ## Why JWT validation and CORS live only at the gateway
 

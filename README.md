@@ -95,18 +95,23 @@ production-grade password authentication. Specifically:
   from then on. A token issued before the change stays valid until it expires.
 - **A token is valid until its expiry** (`JWT_TTL`, one hour by default) and
   there is no refresh token, so "logging out" means "stop sending it".
-- **No rate limit on `/auth/login`**, which is the one endpoint reachable
-  without a token. It does not reveal *which* credentials exist — an unknown
-  username and a wrong password are answered identically and compared in
-  constant time — but it does nothing about *how many* attempts. Tracked in
-  [#43](https://github.com/skibkitty/ticketing-platform/issues/43); the
-  flash-sale rate limiting in
-  [#13](https://github.com/skibkitty/ticketing-platform/issues/13) is a
-  different route and does not cover it.
+- **Failed logins are counted, per process.** `/auth/login` refuses a caller over
+  a limit on two keys at once — five failures per account, twenty per remote
+  address, in a five-minute window — and answers `429` with a `Retry-After`. A
+  correct password is refused exactly like a wrong one while the limit is spent, so
+  the endpoint does not reveal *which* credentials exist any more than it did
+  before, and now says nothing about how many attempts it will answer. Two limits
+  it does not overcome: callers behind one NAT share the address budget, and
+  counters live in each gateway, so N replicas behind a load balancer mean N times
+  the budget. The flash-sale rate limiting in
+  [#13](https://github.com/skibkitty/ticketing-platform/issues/13) is a different
+  route and does not cover this.
 - **Roles are configuration**, not something a user holds or changes.
 
 [`docs/adr/002`](docs/adr/002-gateway-trust-boundary.md) records the trust
-boundary these credentials sit behind, and what it costs.
+boundary these credentials sit behind, and what it costs;
+[`docs/adr/015`](docs/adr/015-gateway-login-abuse-prevention.md) records the
+login limiter and the properties it does not have.
 
 ## Example requests
 

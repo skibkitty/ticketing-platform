@@ -76,11 +76,11 @@ app:
       # Failures are counted whether or not the login name exists, so the counter
       # cannot be read as a list of which usernames are real.
       #
-      # No lower bound and no fallback on purpose, and no default in code: a value
-      # that fails to bind is zero, zero refuses every login, and the gateway
-      # refuses to start instead of answering 401 forever. These are the numbers a
-      # deployment would want to state; a deployment that needs a limit to mean one
-      # number across several gateways needs a shared store, which this is not.
+      # No fallback and no default in code: a value that fails to bind is zero, and
+      # zero would refuse every login forever, so the properties refuse to bind
+      # rather than letting a typo quietly produce an unusable gateway. These are
+      # the numbers a deployment states; a deployment that needs the limit to mean
+      # one number across several gateways needs a shared store, which this is not.
       max-failures-per-account: 5
       max-failures-per-address: 20
       window: PT5M
