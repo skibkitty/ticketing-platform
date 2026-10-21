@@ -117,8 +117,8 @@ guarantee (sub-second precision) this use case doesn't need.
 
 ## Why rate limiting + a bulkhead specifically on `POST /api/v1/reservations`, and nowhere else
 
-*Planned in [#13](https://github.com/skibkitty/ticketing-platform/issues/13), not
-built yet.* This is the flash-sale endpoint — the one place a popular event's
+*As built ([#13](https://github.com/skibkitty/ticketing-platform/issues/13)).*
+This is the flash-sale endpoint — the one place a popular event's
 on-sale moment produces a traffic spike orders of magnitude above normal load, often
 from bots. A `RateLimiter` caps the request rate the gateway will forward
 for that route; a `Bulkhead` caps how many of those requests can be
@@ -127,6 +127,16 @@ reservation attempts pile up and exhaust the gateway's threads. Neither is
 applied to, say, `GET /api/v1/events` — browsing traffic doesn't have the
 same spike profile or the same cost-per-request (a seat hold does real
 write work; a browse is a cheap read).
+
+Both refuse with `429` and the shared `ApiErrorResponse` rather than queueing:
+a request parked waiting for a permit holds a gateway thread, which is what a
+spike runs out of first. They run after authentication, so a request with no
+valid token is refused before it can spend the budget, and the budget is one
+per gateway rather than one per caller: it caps what reservation-service is
+asked to absorb. Like the login limiter, it lives in each gateway process, so N
+replicas admit N times the configured rate. Defaults are 100 requests a minute
+and 20 in flight, overridden by `RESERVATION_RATE_LIMIT`,
+`RESERVATION_RATE_LIMIT_PERIOD` and `RESERVATION_BULKHEAD_MAX_CONCURRENT`.
 
 Worth keeping distinct from login brute-force protection, which is a separate
 mechanism and *is* built: this is about load on one endpoint, and the other is
@@ -137,14 +147,29 @@ request rate (ADR 015).
 
 ## Why a circuit breaker + fallback on the payment-status query route, specifically
 
-*Planned in [#13](https://github.com/skibkitty/ticketing-platform/issues/13), not
-built yet.* `GET /api/v1/payments/{reservationId}` is the one gateway route that's a
+*As built ([#13](https://github.com/skibkitty/ticketing-platform/issues/13)).*
+`GET /api/v1/payments/{reservationId}` is the one gateway route that's a
 synchronous proxy call to a service (`payment-service`) that could be
 briefly overloaded by its own consumer workload. Wrapping it in a circuit
 breaker means a struggling payment-service degrades this one
 non-critical status-lookup route to a fast, clear "temporarily unavailable"
 response instead of a hanging request — it doesn't block the reservation
 flow itself, since that's fully async via Kafka.
+
+A `5xx`, or a hop the gateway could not complete, counts as a failure; a `4xx`
+is payment-service answering (no payment for that reservation yet) and does
+not, or ordinary lookups would open the circuit. While open, the route answers
+`503` with the shared `ApiErrorResponse` and sends nothing downstream. The
+`PAYMENTS_CIRCUIT_*` variables set the window, the minimum calls, the failure
+rate and how long it stays open (defaults 10, 5, 50% and 30s). A hop that
+hangs is a failure too: every hop has a read timeout (`GATEWAY_READ_TIMEOUT`,
+10s), without which a service that accepts a connection and never answers
+would hold a gateway thread for good and never be counted.
+
+The bulkhead only bounds in-flight work if the gateway can open that many
+connections to the service: Apache HttpClient's default is 5 per route, so the
+pool is sized by `GATEWAY_MAX_CONNECTIONS_PER_SERVICE` (default 50), which has
+to be at least the bulkhead's cap.
 
 ## Why the login surface is a configured credential set rather than an identity
 

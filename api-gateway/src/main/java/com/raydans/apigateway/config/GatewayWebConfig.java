@@ -4,8 +4,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.raydans.apigateway.auth.JwtAuthenticationFilter;
 import com.raydans.apigateway.auth.JwtService;
 import com.raydans.apigateway.auth.RoleAuthorizer;
+import com.raydans.apigateway.resilience.GatewayResilienceFilter;
 import com.raydans.apigateway.web.ErrorResponseWriter;
 import com.raydans.common.web.CorrelationIdFilter;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.ratelimiter.RateLimiterRegistry;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.cloud.gateway.server.mvc.predicate.MvcPredicateSupplier;
 import org.springframework.cloud.gateway.server.mvc.predicate.PredicateSupplier;
@@ -69,6 +73,28 @@ public class GatewayWebConfig {
         FilterRegistrationBean<JwtAuthenticationFilter> registration =
                 new FilterRegistrationBean<>(new JwtAuthenticationFilter(tokens, authorizer, errors));
         registration.setOrder(Ordered.HIGHEST_PRECEDENCE + 10);
+        return registration;
+    }
+
+    /**
+     * After authentication, so that only a request the gateway would otherwise
+     * forward can spend the flash-sale budget or count against payment-service's
+     * circuit: an unauthenticated flood is refused by the filter above, cheaply,
+     * and leaves both to real callers (#13).
+     */
+    @Bean
+    public FilterRegistrationBean<GatewayResilienceFilter> gatewayResilienceFilter(
+            RateLimiterRegistry rateLimiters,
+            BulkheadRegistry bulkheads,
+            CircuitBreakerRegistry circuitBreakers,
+            ErrorResponseWriter errors) {
+        FilterRegistrationBean<GatewayResilienceFilter> registration = new FilterRegistrationBean<>(
+                new GatewayResilienceFilter(
+                        rateLimiters.rateLimiter("reservations"),
+                        bulkheads.bulkhead("reservations"),
+                        circuitBreakers.circuitBreaker("payments"),
+                        errors));
+        registration.setOrder(Ordered.HIGHEST_PRECEDENCE + 20);
         return registration;
     }
 
