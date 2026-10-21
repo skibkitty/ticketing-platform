@@ -31,6 +31,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -126,12 +127,12 @@ class LateSettlementGuardBootTests {
         // The hold lapses and the scheduled sweep — not SQL surgery — expires it, releasing the seats.
         lapseHold(lateReservationId, created.seatIds());
         holdExpirer.expire();
-        assertThat(reservationStatus(lateReservationId)).isEqualTo("EXPIRED");
+        assertThat(reservationStatus(lateReservationId, 90L)).isEqualTo("EXPIRED");
         assertThat(seatStatus(seatId)).isEqualTo("AVAILABLE");
 
         // A different customer buys the released seat while the money step is still in flight.
         long newHolderId = postReservation(created.eventId(), List.of(seatId), 91L);
-        assertThat(reservationStatus(newHolderId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(reservationStatus(newHolderId, 91L)).isEqualTo("PENDING_PAYMENT");
         assertThat(seatStatus(seatId)).isEqualTo("HELD");
         java.sql.Timestamp newHoldersHoldExpiry = seatHoldExpiresAt(seatId);
 
@@ -140,7 +141,7 @@ class LateSettlementGuardBootTests {
         awaitProcessed(outcomeEventId);
 
         // The 10-minute hold is binding: the late money never revives the expired reservation.
-        assertThat(reservationStatus(lateReservationId))
+        assertThat(reservationStatus(lateReservationId, 90L))
                 .as("a PaymentSucceeded landing after the sweep must not confirm the expired reservation")
                 .isEqualTo("EXPIRED");
         assertThat(outboxCount(lateReservationId, "reservation.ReservationConfirmed"))
@@ -155,7 +156,7 @@ class LateSettlementGuardBootTests {
         assertThat(seatHoldExpiresAt(seatId))
                 .as("the new holder's hold must be untouched (status and expiry alike)")
                 .isEqualTo(newHoldersHoldExpiry);
-        assertThat(reservationStatus(newHolderId))
+        assertThat(reservationStatus(newHolderId, 91L))
                 .as("the late outcome must not disturb the new holder's own pending reservation")
                 .isEqualTo("PENDING_PAYMENT");
     }
@@ -169,7 +170,7 @@ class LateSettlementGuardBootTests {
 
         lapseHold(lateReservationId, created.seatIds());
         holdExpirer.expire();
-        assertThat(reservationStatus(lateReservationId)).isEqualTo("EXPIRED");
+        assertThat(reservationStatus(lateReservationId, 92L)).isEqualTo("EXPIRED");
         assertThat(seatStatus(seatId)).isEqualTo("AVAILABLE");
 
         // Control: an unsupported type IS dead-lettered, so the negative DLT assertion below is
@@ -200,7 +201,7 @@ class LateSettlementGuardBootTests {
         assertThat(processedCount(sentinelEventId))
                 .as("the sentinel is a distinct event, so it claims its own row")
                 .isEqualTo(1);
-        assertThat(reservationStatus(lateReservationId)).isEqualTo("EXPIRED");
+        assertThat(reservationStatus(lateReservationId, 92L)).isEqualTo("EXPIRED");
         assertThat(seatStatus(seatId))
                 .as("neither the original delivery nor its redelivery may touch the released seat")
                 .isEqualTo("AVAILABLE");
@@ -225,10 +226,10 @@ class LateSettlementGuardBootTests {
 
         lapseHold(lateReservationId, created.seatIds());
         holdExpirer.expire();
-        assertThat(reservationStatus(lateReservationId)).isEqualTo("EXPIRED");
+        assertThat(reservationStatus(lateReservationId, 93L)).isEqualTo("EXPIRED");
 
         long newHolderId = postReservation(created.eventId(), List.of(seatId), 94L);
-        assertThat(reservationStatus(newHolderId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(reservationStatus(newHolderId, 94L)).isEqualTo("PENDING_PAYMENT");
         assertThat(seatStatus(seatId)).isEqualTo("HELD");
         java.sql.Timestamp newHoldersHoldExpiry = seatHoldExpiresAt(seatId);
 
@@ -236,7 +237,7 @@ class LateSettlementGuardBootTests {
         producePaymentFailed(outcomeEventId, lateReservationId, "corr-late-failed-" + lateReservationId);
         awaitProcessed(outcomeEventId);
 
-        assertThat(reservationStatus(lateReservationId))
+        assertThat(reservationStatus(lateReservationId, 93L))
                 .as("a PaymentFailed after expiry leaves the reservation EXPIRED, not CANCELLED")
                 .isEqualTo("EXPIRED");
         assertThat(outboxCount(lateReservationId, "reservation.ReservationCancelled")).isZero();
@@ -246,7 +247,7 @@ class LateSettlementGuardBootTests {
         assertThat(seatHoldExpiresAt(seatId))
                 .as("the new holder's hold expiry must be untouched")
                 .isEqualTo(newHoldersHoldExpiry);
-        assertThat(reservationStatus(newHolderId))
+        assertThat(reservationStatus(newHolderId, 94L))
                 .as("the new holder's own reservation is unaffected")
                 .isEqualTo("PENDING_PAYMENT");
     }
@@ -324,8 +325,18 @@ class LateSettlementGuardBootTests {
         return ((Number) response.getBody().get("id")).longValue();
     }
 
-    private String reservationStatus(long reservationId) {
-        ResponseEntity<Map> response = rest.getForEntity("/api/v1/reservations/" + reservationId, Map.class);
+    /**
+     * The reservation's status as its owning Customer sees it.
+     *
+     * <p>The customer id is the gateway's header, not a detail of the test: a
+     * read is scoped by it, so an assertion that left it off would be asserting
+     * against a route that answers nothing (ADR 014).
+     */
+    private String reservationStatus(long reservationId, long customerId) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(CUSTOMER_HEADER, String.valueOf(customerId));
+        ResponseEntity<Map> response = rest.exchange(
+                "/api/v1/reservations/" + reservationId, HttpMethod.GET, new HttpEntity<>(headers), Map.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         return (String) response.getBody().get("status");
     }

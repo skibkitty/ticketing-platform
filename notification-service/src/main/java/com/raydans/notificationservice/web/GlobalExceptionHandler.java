@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -48,6 +49,25 @@ public class GlobalExceptionHandler {
             MissingServletRequestParameterException ex, HttpServletRequest request) {
         HttpStatus status = HttpStatus.BAD_REQUEST;
         String message = "Required request parameter '" + ex.getParameterName() + "' is not present";
+        return ResponseEntity.status(status).body(error(status, status.getReasonPhrase(), message, request, List.of()));
+    }
+
+    /**
+     * A missing {@code X-Customer-Id} on the self-service read, which is the
+     * request that arrives with nothing proven about who is asking (ADR 011).
+     *
+     * <p>Its own case rather than a fold-in with the parameter above because they are
+     * not the same failure and only one of them is an attack: no parameter is a
+     * malformed request, while no header is a request that never came through the
+     * gateway. Left unhandled it fell to the catch-all below and was answered 500,
+     * which reports a server fault for a caller's missing proof and would have
+     * buried the isolation property in a monitoring dashboard.
+     */
+    @ExceptionHandler(MissingRequestHeaderException.class)
+    ResponseEntity<ApiErrorResponse> missingHeader(
+            MissingRequestHeaderException ex, HttpServletRequest request) {
+        HttpStatus status = HttpStatus.BAD_REQUEST;
+        String message = "Required request header '" + ex.getHeaderName() + "' is not present";
         return ResponseEntity.status(status).body(error(status, status.getReasonPhrase(), message, request, List.of()));
     }
 

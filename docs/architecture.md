@@ -117,8 +117,9 @@ guarantee (sub-second precision) this use case doesn't need.
 
 ## Why rate limiting + a bulkhead specifically on `POST /api/v1/reservations`, and nowhere else
 
-This is the flash-sale endpoint — the one place a popular event's on-sale
-moment produces a traffic spike orders of magnitude above normal load, often
+*Planned in [#13](https://github.com/skibkitty/ticketing-platform/issues/13), not
+built yet.* This is the flash-sale endpoint — the one place a popular event's
+on-sale moment produces a traffic spike orders of magnitude above normal load, often
 from bots. A `RateLimiter` caps the request rate the gateway will forward
 for that route; a `Bulkhead` caps how many of those requests can be
 *in flight* at once, so a slow downstream response can't let concurrent
@@ -127,9 +128,17 @@ applied to, say, `GET /api/v1/events` — browsing traffic doesn't have the
 same spike profile or the same cost-per-request (a seat hold does real
 write work; a browse is a cheap read).
 
+Worth keeping distinct from login brute-force protection, which is a separate
+mechanism and *is* built: this is about load on one endpoint, and the other is
+about an unauthenticated endpoint being guessable. A rate limit scoped to the
+reservation route would not cover `/auth/login` at all, which is why that one
+counts failed logins per account and per remote address instead of capping a
+request rate (ADR 015).
+
 ## Why a circuit breaker + fallback on the payment-status query route, specifically
 
-`GET /api/v1/payments/{reservationId}` is the one gateway route that's a
+*Planned in [#13](https://github.com/skibkitty/ticketing-platform/issues/13), not
+built yet.* `GET /api/v1/payments/{reservationId}` is the one gateway route that's a
 synchronous proxy call to a service (`payment-service`) that could be
 briefly overloaded by its own consumer workload. Wrapping it in a circuit
 breaker means a struggling payment-service degrades this one
@@ -137,12 +146,65 @@ non-critical status-lookup route to a fast, clear "temporarily unavailable"
 response instead of a hanging request — it doesn't block the reservation
 flow itself, since that's fully async via Kafka.
 
+## Why the login surface is a configured credential set rather than an identity
+
+*As built, and deliberately not more.* `POST /auth/login` authenticates against
+callers the gateway is configured with — the demo passwords arrive from the
+environment, so nothing usable is in the repository — and issues a stateless
+JWT. That is a real trust boundary for everything past it, and it is not
+password authentication in the sense a production system means: the configured
+value *is* the credential, there is no password store, changing one revokes
+nothing already issued, and a token is good until it expires with no refresh and
+no revocation list. `docs/adr/002-gateway-trust-boundary.md` states the
+limitations in full.
+
+The reason it can stay this small is the shape of the rest of the system: the
+gateway is already the single place a token is verified and the single place a
+role is enforced, so a real credential store, rotation and revocation land
+behind that one interface rather than across every service.
+
+Guessing at this surface is limited separately, because "unauthenticated" and
+"unguarded" are different words: `POST /auth/login` counts failed attempts on two
+keys — five per account and twenty per remote address over five minutes — and
+refuses with a `Retry-After` before reading the password at all, so a caller over
+the limit learns nothing about whether theirs was right
+([#43](https://github.com/skibkitty/ticketing-platform/issues/43), ADR 015). It
+is deliberately a different mechanism from the reservation rate limiting above,
+which is scoped to a route this one is not.
+
 ## Why JWT validation and CORS live only at the gateway
 
-One trust boundary to audit and rotate keys for; downstream services trust
-the `X-User-Roles` header the gateway sets, which only holds because the
-internal services aren't reachable except through the gateway. See
+One trust boundary to audit and rotate keys for; downstream services trust the
+`X-User-Roles` and `X-Customer-Id` headers the gateway sets, which only holds
+because the internal services aren't reachable except through the gateway. The
+token's subject is the caller's own id, so the customer a request runs as is
+read out of a signature the gateway checked rather than a header the client sent
+— which matters because `X-Customer-Id` is what a reservation is booked against.
+A role is a capability and not an identity, so that header is set only for a
+caller holding `CUSTOMER`: an organizer authenticates and is forwarded, but gets
+no Customer id, because the domain does not make it one. See
 `docs/adr/002-gateway-trust-boundary.md` for the tradeoff this creates.
+
+"Not reachable except through the gateway" is a property of the deployment, not
+of the code, so it is asserted where the deployment is: the default compose
+file publishes no port for reservation-service, payment-service or
+notification-service — and none for postgres, kafka or kafka-ui either — the
+gateway reaches them by service name on the compose network, and `platform-tests`
+fails the build if a published port reappears, on the default file or on an
+interface wider than loopback in the debugging override. The default stack
+publishes exactly one port, the gateway's, and that is the invariant the
+allowlist in those tests encodes. See
+`docs/adr/012-gateway-is-the-only-published-surface.md` and
+`docs/adr/013-infrastructure-ports-follow-the-gateway-rule.md`. The
+gateway is the only place a role is enforced, so a way to skip it is a way to
+skip the authorization, which is why a loopback-bound port counts as one.
+
+The CORS preflight exemption follows the same rule from the other side. A
+browser's handshake arrives before it has a token, so it is answered without one
+— but only on `/api/**` and `/auth/**`, the routes a browser application calls.
+`/actuator/**` is not on that list, so the management endpoints are the
+operator's on every method rather than on all of them but `OPTIONS`, and a
+client cannot make the authorization answer depend on the verb it chose.
 
 ## What's intentionally out of scope
 
