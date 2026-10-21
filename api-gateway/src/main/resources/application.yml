@@ -1,6 +1,17 @@
 spring:
   application:
     name: api-gateway
+  http:
+    client:
+      # The proxied hop runs on Apache HttpClient, not the JDK's (#44). The JDK 21
+      # client can fail a hop with a NullPointerException in
+      # Http1Exchange.requestMoreBody: its write task can reach requestMoreBody
+      # before sendBodyAsync has installed the body's subscriber. That reaches the
+      # caller as a 500 on a request the gateway would otherwise have proxied, and
+      # the gateway is the only path to a service (ADR 002), so it is an outage
+      # rather than a retry. Gateway MVC defaults this to jdk when it is unset, so
+      # it is stated here rather than left to classpath detection.
+      factory: http-components
   cloud:
     gateway:
       mvc:
