@@ -1164,6 +1164,8 @@ class GatewayProxyBootTests {
         exchange.sendResponseHeaders(200, body.length);
         try (OutputStream out = exchange.getResponseBody()) {
             out.write(body);
+        } finally {
+            try { exchange.close(); } catch (Exception ignored) {}
         }
     }
 
