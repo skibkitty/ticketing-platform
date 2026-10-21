@@ -12,6 +12,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * A real HTTP server standing in for a service behind the gateway, for the
@@ -29,6 +30,9 @@ final class StandInService {
     private final List<String> received = new CopyOnWriteArrayList<>();
     private volatile CountDownLatch gate = new CountDownLatch(0);
     private volatile int status = 200;
+    private volatile boolean stallMidBody = false;
+    private final AtomicInteger inFlight = new AtomicInteger();
+    private final AtomicInteger mostInFlight = new AtomicInteger();
     private volatile CountDownLatch arrivals = new CountDownLatch(0);
     private final ExecutorService executor;
 
@@ -70,6 +74,21 @@ final class StandInService {
         return arrived;
     }
 
+    /** The most requests this service has had in progress at once since {@link #reset()}. */
+    int mostInFlight() {
+        return mostInFlight.get();
+    }
+
+    /**
+     * From now on, sends the status and headers and the first part of the body,
+     * then holds the rest until {@link #release()}: a service that dies after it
+     * has started answering.
+     */
+    void stallMidBody() {
+        gate = new CountDownLatch(1);
+        stallMidBody = true;
+    }
+
     /** Answers every request from now on with {@code status}, until {@link #reset()}. */
     void answerWith(int status) {
         this.status = status;
@@ -82,7 +101,9 @@ final class StandInService {
     void reset() {
         release();
         status = 200;
+        stallMidBody = false;
         received.clear();
+        mostInFlight.set(0);
     }
 
     void stop() {
@@ -91,14 +112,37 @@ final class StandInService {
         executor.shutdownNow();
     }
 
-    private void handle(HttpExchange exchange) throws IOException {
-        exchange.getRequestBody().readAllBytes();
-        received.add(exchange.getRequestURI().getPath());
-        arrivals.countDown();
+    private void stallAfterHeaders(HttpExchange exchange) throws IOException {
+        byte[] body = "{\"paymentStatus\": \"PENDING\", \"padding\": \"....\"}".getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().add("Content-Type", "application/json");
+        exchange.sendResponseHeaders(status, body.length);
+        OutputStream out = exchange.getResponseBody();
+        out.write(body, 0, body.length / 2);
+        out.flush();
         try {
             gate.await(10, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+        exchange.close();
+    }
+
+    private void handle(HttpExchange exchange) throws IOException {
+        exchange.getRequestBody().readAllBytes();
+        received.add(exchange.getRequestURI().getPath());
+        mostInFlight.accumulateAndGet(inFlight.incrementAndGet(), Math::max);
+        arrivals.countDown();
+        if (stallMidBody) {
+            stallAfterHeaders(exchange);
+            inFlight.decrementAndGet();
+            return;
+        }
+        try {
+            gate.await(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            inFlight.decrementAndGet();
         }
         byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().add("Content-Type", "application/json");

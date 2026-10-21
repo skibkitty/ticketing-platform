@@ -128,15 +128,29 @@ applied to, say, `GET /api/v1/events` — browsing traffic doesn't have the
 same spike profile or the same cost-per-request (a seat hold does real
 write work; a browse is a cheap read).
 
-Both refuse with `429` and the shared `ApiErrorResponse` rather than queueing:
-a request parked waiting for a permit holds a gateway thread, which is what a
-spike runs out of first. They run after authentication, so a request with no
-valid token is refused before it can spend the budget, and the budget is one
-per gateway rather than one per caller: it caps what reservation-service is
-asked to absorb. Like the login limiter, it lives in each gateway process, so N
-replicas admit N times the configured rate. Defaults are 100 requests a minute
-and 20 in flight, overridden by `RESERVATION_RATE_LIMIT`,
-`RESERVATION_RATE_LIMIT_PERIOD` and `RESERVATION_BULKHEAD_MAX_CONCURRENT`.
+The two answer different questions. The rate limit is how many reservations
+may *arrive* per period; the bulkhead is how many may be *in progress* at once,
+which is what a slow reservation-service turns into a pile-up. Both refuse
+with `429` and the shared `ApiErrorResponse` rather than queueing: a request
+parked waiting for a permit holds a gateway thread, which is what a spike runs
+out of first. Only the rate limit's `429` carries a `Retry-After`, the seconds
+until its next permit; when a bulkhead slot frees depends on how fast
+reservation-service answers, which the gateway cannot say. The bulkhead is
+asked first, so a request it refuses does not spend the rate budget.
+
+They run after authentication, so a request with no valid token, an expired
+one, or a token whose role may not reserve is refused before it can spend
+anything. The budget is one per gateway rather than one per caller: it caps
+what reservation-service is asked to absorb, so one caller with a valid token
+can use it up for everyone in that period. It is not distributed: every
+gateway process counts on its own, so N replicas admit N times the configured
+rate and N times the in-flight cap.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RESERVATION_RATE_LIMIT` | `100` | reservations admitted per period |
+| `RESERVATION_RATE_LIMIT_PERIOD` | `PT1M` | the period |
+| `RESERVATION_BULKHEAD_MAX_CONCURRENT` | `20` | reservations in flight at once |
 
 Worth keeping distinct from login brute-force protection, which is a separate
 mechanism and *is* built: this is about load on one endpoint, and the other is
@@ -156,20 +170,61 @@ non-critical status-lookup route to a fast, clear "temporarily unavailable"
 response instead of a hanging request — it doesn't block the reservation
 flow itself, since that's fully async via Kafka.
 
-A `5xx`, or a hop the gateway could not complete, counts as a failure; a `4xx`
-is payment-service answering (no payment for that reservation yet) and does
-not, or ordinary lookups would open the circuit. While open, the route answers
-`503` with the shared `ApiErrorResponse` and sends nothing downstream. The
-`PAYMENTS_CIRCUIT_*` variables set the window, the minimum calls, the failure
-rate and how long it stays open (defaults 10, 5, 50% and 30s). A hop that
-hangs is a failure too: every hop has a read timeout (`GATEWAY_READ_TIMEOUT`,
-10s), without which a service that accepts a connection and never answers
-would hold a gateway thread for good and never be counted.
+What counts: a `5xx` from payment-service, or a hop the gateway could not
+complete (refused, timed out, cut off), is a failure. A `4xx` is
+payment-service answering (no payment for that reservation yet) and counts as
+a success, or ordinary lookups would open the circuit. A failure inside the
+gateway itself is not counted at all, nor is a caller hanging up mid-response:
+neither is evidence about payment-service. Unauthenticated requests are
+refused before they reach the circuit.
 
-The bulkhead only bounds in-flight work if the gateway can open that many
-connections to the service: Apache HttpClient's default is 5 per route, so the
-pool is sized by `GATEWAY_MAX_CONNECTIONS_PER_SERVICE` (default 50), which has
-to be at least the bulkhead's cap.
+Once at least the minimum number of the last *window* calls have been seen
+and the failure rate reaches the threshold, the circuit opens. While open, the
+route answers `503` with the shared `ApiErrorResponse` and sends nothing
+downstream; this is a different answer from a `429`, which means the caller
+was going too fast rather than that the service is unwell. After the open
+period it lets the configured number of trial calls through: if they succeed
+it closes, if they fail it opens again. The open period is a minimum, not a
+promise: the circuit stays open until a request arrives to try, so there is
+no `Retry-After` on the `503`.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PAYMENTS_CIRCUIT_WINDOW_SIZE` | `10` | calls the failure rate is computed over |
+| `PAYMENTS_CIRCUIT_MIN_CALLS` | `5` | calls needed before it judges (at most the window) |
+| `PAYMENTS_CIRCUIT_FAILURE_RATE` | `50` | percentage of failures that opens it |
+| `PAYMENTS_CIRCUIT_OPEN_FOR` | `PT30S` | how long it stays open before trying again |
+| `PAYMENTS_CIRCUIT_TRIAL_CALLS` | `3` | trial calls allowed while half open |
+
+### Timeouts and the connection pool
+
+Every hop, on every route, has a connect timeout and a read timeout. The read
+timeout is how long the gateway waits for the service to send *anything*; it is
+what turns a service that accepts a connection and never answers into a
+counted failure rather than a gateway thread held for good. It is not a limit
+on the whole exchange: a service that keeps sending a byte at a time inside
+the read timeout keeps the hop open.
+
+The gateway holds one connection pool, capped per service, so a service
+holding every connection it may have leaves the others theirs. A hop that
+finds its service's connections all in use waits at most the connect timeout
+for one before failing, rather than Apache HttpClient's default of three
+minutes. The per-service cap has to be at least the bulkhead's, or
+reservations the bulkhead admits would queue inside the gateway for a
+connection; the gateway refuses to start if it is not.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `GATEWAY_CONNECT_TIMEOUT` | `PT2S` | to connect, and to get a pooled connection |
+| `GATEWAY_READ_TIMEOUT` | `PT10S` | for a service to answer, between reads |
+| `GATEWAY_MAX_CONNECTIONS_PER_SERVICE` | `50` | connections per service, at least the bulkhead |
+
+A failed hop answers the gateway's generic `500` with the shared
+`ApiErrorResponse`, naming no address or exception. Every refusal described
+here carries the request's `X-Correlation-Id`. A setting that would start but
+mean something other than it says (a zero timeout, which Apache reads as
+"forever"; a pool smaller than the bulkhead; a minimum larger than the window)
+stops the gateway at startup with a message naming the variable.
 
 ## Why the login surface is a configured credential set rather than an identity
 

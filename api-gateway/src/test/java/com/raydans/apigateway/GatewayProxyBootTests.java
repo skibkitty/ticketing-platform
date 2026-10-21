@@ -15,6 +15,7 @@ import com.raydans.apigateway.auth.JwtService;
 import com.raydans.apigateway.auth.Role;
 import com.raydans.apigateway.auth.RoleAuthorizer;
 import com.raydans.apigateway.auth.RoleAuthorizer.Access;
+import com.raydans.apigateway.resilience.GatewayResilienceFilter;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.jsonwebtoken.Jwts;
@@ -1067,6 +1068,28 @@ class GatewayProxyBootTests {
     // lists are real here — the table from RoleAuthorizer and the routes from the
     // gateway's own application.yml, bound by Boot — so a route added to one and
     // not the other fails the build instead of being discovered in production.
+
+    @Test
+    void theResilienceFilterGuardsExactlyThePathsItsRoutesServe() {
+        // GatewayResilienceFilter matches paths, not route ids, so its patterns have
+        // to be the ones these routes are declared with: a route whose path was
+        // renamed in application.yml and not in the filter would be proxied with no
+        // limit on it. Equal strings parsed by the same parser match the same
+        // requests, so this is the whole claim (#13).
+        Map<String, List<String>> served = routesThisDeploymentServes();
+
+        assertThat(served.get("reservation-service")).contains(GatewayResilienceFilter.RESERVATIONS_PATTERN);
+        assertThat(served.get("payment-service")).containsExactly(GatewayResilienceFilter.PAYMENTS_PATTERN);
+        // And no other route can reach either service's protected paths.
+        served.forEach((route, patterns) -> {
+            if (!route.equals("reservation-service")) {
+                assertThat(patterns).as(route).doesNotContain(GatewayResilienceFilter.RESERVATIONS_PATTERN);
+            }
+            if (!route.equals("payment-service")) {
+                assertThat(patterns).as(route).doesNotContain(GatewayResilienceFilter.PAYMENTS_PATTERN);
+            }
+        });
+    }
 
     @Test
     void everyRouteTheDeploymentServesIsClassifiedByTheAuthorizationTable() {

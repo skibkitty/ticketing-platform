@@ -1,17 +1,22 @@
 package com.raydans.apigateway.resilience;
 
 import com.raydans.apigateway.web.ErrorResponseWriter;
+import com.raydans.apigateway.web.GatewayExceptionHandler;
 import io.github.resilience4j.bulkhead.Bulkhead;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.ratelimiter.RateLimiter;
+import io.github.resilience4j.ratelimiter.internal.AtomicRateLimiter;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
+import java.util.concurrent.TimeUnit;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.server.PathContainer;
+import org.springframework.http.server.RequestPath;
 import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.util.pattern.PathPattern;
 import org.springframework.web.util.pattern.PathPatternParser;
@@ -33,16 +38,27 @@ import org.springframework.web.util.pattern.PathPatternParser;
  * token is refused there and never spends the budget. The budget is one per
  * gateway rather than one per caller: it caps what reservation-service is asked
  * to absorb, which is the thing being protected.
+ *
+ * <p>Every permission taken here is given back exactly once: completed when the
+ * call it admitted ends, however it ends, or released when the request is
+ * refused or the outcome says nothing about the service.
  */
 public class GatewayResilienceFilter extends OncePerRequestFilter {
 
     /**
      * The bare collection and everything under it, for the same reason as the
      * event rule in {@code RoleAuthorizer}: the route proxies every spelling, so a
-     * limit on only one would be a limit a trailing slash walks around.
+     * limit on only one would be a limit a trailing slash walks around. The same
+     * pattern string as the reservation route's own predicate, which
+     * {@code GatewayProxyBootTests} checks, so the two cannot drift apart.
      */
-    private static final PathPattern RESERVATIONS = PathPatternParser.defaultInstance.parse("/api/v1/reservations/**");
-    private static final PathPattern PAYMENTS = PathPatternParser.defaultInstance.parse("/api/v1/payments/**");
+    public static final String RESERVATIONS_PATTERN = "/api/v1/reservations/**";
+
+    /** As above, for the payment-service route. */
+    public static final String PAYMENTS_PATTERN = "/api/v1/payments/**";
+
+    private static final PathPattern RESERVATIONS = PathPatternParser.defaultInstance.parse(RESERVATIONS_PATTERN);
+    private static final PathPattern PAYMENTS = PathPatternParser.defaultInstance.parse(PAYMENTS_PATTERN);
 
     private final RateLimiter reservationRateLimit;
     private final Bulkhead reservationBulkhead;
@@ -63,11 +79,12 @@ public class GatewayResilienceFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
-        // The same path JwtAuthenticationFilter authorizes, so a context path
-        // cannot put a request out of this filter's reach and still in the auth
-        // filter's.
-        PathContainer path = PathContainer.parsePath(
-                request.getRequestURI().substring(request.getContextPath().length()));
+        // Parsed the way Spring MVC parses it for routing: the raw URI with the
+        // context path removed, segments decoded and matrix variables dropped
+        // for matching. A spelling the route matches is therefore a spelling this
+        // matches, and the auth filter sees the same path within the application.
+        PathContainer path = RequestPath.parse(request.getRequestURI(), request.getContextPath())
+                .pathWithinApplication();
         if (PAYMENTS.matches(path)) {
             throughPaymentCircuit(request, response, chain);
         } else if (HttpMethod.POST.matches(request.getMethod()) && RESERVATIONS.matches(path)) {
@@ -85,12 +102,18 @@ public class GatewayResilienceFilter extends OncePerRequestFilter {
         // still be refused after the service recovered. A slot taken and then
         // refused a rate permit is given back without counting as a call.
         if (!reservationBulkhead.tryAcquirePermission()) {
-            refuseReservation(request, response);
+            // No Retry-After: when a slot frees depends on how fast
+            // reservation-service answers, which nothing here can say.
+            errors.write(request, response, HttpStatus.TOO_MANY_REQUESTS,
+                    "Too many reservations in progress; try again shortly");
             return;
         }
         if (!reservationRateLimit.acquirePermission()) {
             reservationBulkhead.releasePermission();
-            refuseReservation(request, response);
+            HttpHeaders headers = new HttpHeaders();
+            headers.set(HttpHeaders.RETRY_AFTER, Long.toString(secondsUntilTheNextRatePermit()));
+            errors.write(request, response, HttpStatus.TOO_MANY_REQUESTS,
+                    "Too many reservation requests; try again shortly", headers);
             return;
         }
         try {
@@ -100,9 +123,17 @@ public class GatewayResilienceFilter extends OncePerRequestFilter {
         }
     }
 
-    private void refuseReservation(HttpServletRequest request, HttpServletResponse response) throws IOException {
-        errors.write(request, response, HttpStatus.TOO_MANY_REQUESTS,
-                "Too many reservation requests; try again shortly");
+    /**
+     * When the limiter's next permit is due, rounded up so that a caller who
+     * waits this long is not refused again for having come back early. At least
+     * one second, because zero would read as "retry now".
+     */
+    private long secondsUntilTheNextRatePermit() {
+        long nanos = reservationRateLimit instanceof AtomicRateLimiter atomic
+                ? atomic.getDetailedMetrics().getNanosToWait()
+                : reservationRateLimit.getRateLimiterConfig().getLimitRefreshPeriod().toNanos();
+        long seconds = (nanos + TimeUnit.SECONDS.toNanos(1) - 1) / TimeUnit.SECONDS.toNanos(1);
+        return Math.max(1, seconds);
     }
 
     private void throughPaymentCircuit(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
@@ -113,38 +144,45 @@ public class GatewayResilienceFilter extends OncePerRequestFilter {
             return;
         }
         long start = paymentCircuit.getCurrentTimestamp();
-        boolean recorded = false;
+        boolean returned = false;
         try {
             chain.doFilter(request, response);
-            long elapsed = paymentCircuit.getCurrentTimestamp() - start;
-            // A 5xx is the service struggling, or the gateway failing to reach it
-            // or timing out, which GatewayExceptionHandler answers as one. A 4xx
-            // is the service answering (no payment for that reservation yet, say),
-            // and counting it would open the circuit on ordinary lookups.
-            if (response.getStatus() >= 500) {
-                paymentCircuit.onError(elapsed, paymentCircuit.getTimestampUnit(),
-                        new PaymentServiceFailure(response.getStatus()));
-            } else {
-                paymentCircuit.onSuccess(elapsed, paymentCircuit.getTimestampUnit());
-            }
-            recorded = true;
+            returned = true;
         } finally {
-            // Anything that escapes the chain is not payment-service's doing:
-            // every downstream failure has already been turned into a response
-            // above. What is left is the caller hanging up mid-response, or the
-            // gateway itself failing, and neither is evidence about the service.
-            // The permission still has to be given back, or a half-open circuit
-            // waits for a trial call that will never report.
-            if (!recorded) {
-                paymentCircuit.releasePermission();
-            }
+            // One decision, made once, however the chain ended, so every
+            // permission is recorded or released exactly once.
+            settle(request, response, returned, paymentCircuit.getCurrentTimestamp() - start);
         }
     }
 
-    /** What the breaker records for a hop that came back 5xx rather than throwing. */
+    private void settle(HttpServletRequest request, HttpServletResponse response, boolean returned, long elapsed) {
+        if (request.getAttribute(GatewayExceptionHandler.HOP_FAILURE_ATTRIBUTE) != null) {
+            // The hop to payment-service failed: refused, timed out, or cut off
+            // part-way through its answer. Decided by the mark rather than the
+            // status, because a hop that fails after the status was sent leaves
+            // that status on the response, and its error page may not get written.
+            paymentCircuit.onError(elapsed, paymentCircuit.getTimestampUnit(), new PaymentServiceFailure(502));
+        } else if (!returned || request.getAttribute(GatewayExceptionHandler.GATEWAY_FAULT_ATTRIBUTE) != null) {
+            // Not payment-service's doing: the gateway failing, or the caller
+            // going away. Released rather than counted, or a gateway defect would
+            // open the circuit and blame payment-service for it, and a half-open
+            // circuit would wait for a trial call that never reports.
+            paymentCircuit.releasePermission();
+        } else if (response.getStatus() >= 500) {
+            // payment-service answered with a 5xx.
+            paymentCircuit.onError(elapsed, paymentCircuit.getTimestampUnit(),
+                    new PaymentServiceFailure(response.getStatus()));
+        } else {
+            // A 4xx is payment-service answering (no payment for that reservation
+            // yet, say), and counting it would open the circuit on ordinary lookups.
+            paymentCircuit.onSuccess(elapsed, paymentCircuit.getTimestampUnit());
+        }
+    }
+
+    /** What the breaker records for a failed call; the status is the service's, or 502 for a failed hop. */
     private static final class PaymentServiceFailure extends RuntimeException {
         PaymentServiceFailure(int status) {
-            super("payment-service answered " + status, null, false, false);
+            super("payment-service call failed with " + status, null, false, false);
         }
     }
 }
