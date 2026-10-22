@@ -98,8 +98,8 @@ class JpaPaymentProcessingService implements PaymentProcessingService {
 
         // One payment per reservation: another event for an already-paid reservation is a
         // no-op here (the processed_events claim above still records the event as handled).
-        int claimedPayments =
-                payments.tryClaim(created.reservationId(), created.amountCents(), outcome.name(), Instant.now());
+        int claimedPayments = payments.tryClaim(
+                created.reservationId(), created.customerId(), created.amountCents(), outcome.name(), Instant.now());
         if (claimedPayments == 0) {
             log.warn(
                     "Ignoring ReservationCreated for reservation {} which already has a payment; "

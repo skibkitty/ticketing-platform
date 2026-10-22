@@ -144,6 +144,11 @@ as an id that was never issued, so the response does not confirm it exists — a
 gateway's header, so neither is reachable without it. See
 `docs/adr/014-reservation-read-ownership.md`.
 
+Payments follow the same rule. `GET /api/v1/payments/<reservationId>` returns the
+payment behind one of the caller's own reservations. Someone else's reservation
+id gets the same 404 as one that was never issued. It is Customer-only at the
+gateway. See `docs/adr/016-payment-read-ownership.md`.
+
 ```bash
 # 1. Log in
 curl -X POST localhost:8080/auth/login \
@@ -179,8 +184,9 @@ curl localhost:8080/api/v1/reservations/1 \
 curl localhost:8080/api/v1/reservations \
   -H "Authorization: Bearer <customer-token>"
 
-# 6. Check the payment record. While payment-service is failing, the circuit
-#    breaker on this route answers 503 at once instead of proxying
+# 6. Check the payment behind your reservation (yours only; anyone else's
+#    is 404). While payment-service is failing, the circuit breaker on this
+#    route answers 503 at once instead of proxying
 curl localhost:8080/api/v1/payments/1 \
   -H "Authorization: Bearer <customer-token>"
 

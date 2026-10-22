@@ -85,6 +85,11 @@ public class RoleAuthorizer {
             // request that arrives with no id and is refused a hop later. Said here
             // instead so the reason is visible in the table (ADR 011).
             Rule.of(new Access.AnyOfRoles(Set.of(Role.CUSTOMER)), null, Set.of("/api/v1/notifications/**"), true),
+            // The money movement behind a Customer's own Reservation, and Customers
+            // only. payment-service scopes the read by the caller's identity, so an
+            // organizer, holding none, would be forwarded only to be refused a hop
+            // later; the table says who a payment belongs to instead (ADR 016).
+            Rule.of(new Access.AnyOfRoles(Set.of(Role.CUSTOMER)), null, Set.of("/api/v1/payments/**"), true),
             // The operator's own routes, kept under one prefix so "a route for looking
             // at somebody else's data" is a visible, deliberate thing to add rather
             // than an exception scattered through the table. This is the only place

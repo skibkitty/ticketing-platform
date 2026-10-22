@@ -8,6 +8,7 @@ import com.raydans.common.event.EventEnvelope;
 import com.raydans.common.web.CorrelationIdFilter;
 import com.raydans.paymentservice.outbox.OutboxPublisher;
 import com.raydans.paymentservice.payment.PaymentProcessingService;
+import com.raydans.paymentservice.web.PaymentController;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -29,6 +30,12 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -45,6 +52,7 @@ class PaymentFlowBootTests {
 
     static final String RESERVATION_EVENTS_TOPIC = "reservation.events.v1";
     static final String PAYMENT_EVENTS_TOPIC = "payment.events.v1";
+    static final long CUSTOMER_ID = 99L;
 
     @Container
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine")
@@ -69,6 +77,9 @@ class PaymentFlowBootTests {
 
     @Autowired
     PaymentProcessingService paymentProcessing;
+
+    @Autowired
+    TestRestTemplate rest;
 
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
@@ -268,6 +279,66 @@ class PaymentFlowBootTests {
         awaitProcessed(validEventId);
     }
 
+    @Test
+    void theOwnerReadsTheirPaymentOutcomeByReservationId() throws Exception {
+        long reservationId = 500L;
+        produceReservationCreated(UUID.randomUUID(), reservationId, 46000, "corr-read-500");
+        awaitPaymentStatus(reservationId, "FAILED");
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT customer_id FROM payment.payments WHERE reservation_id = ?", Long.class, reservationId))
+                .as("the owner is recorded from the ReservationCreated payload")
+                .isEqualTo(CUSTOMER_ID);
+
+        ResponseEntity<String> response = readPayment(reservationId, CUSTOMER_ID);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode body = objectMapper.readTree(response.getBody());
+        assertThat(body.get("reservationId").asLong()).isEqualTo(reservationId);
+        assertThat(body.get("amountCents").asInt()).isEqualTo(46000);
+        assertThat(body.get("status").asText()).isEqualTo("FAILED");
+        assertThat(body.get("createdAt").isNull()).isFalse();
+        assertThat(body.get("settledAt").isNull()).isFalse();
+    }
+
+    @Test
+    void anotherCustomersPaymentIsAnsweredExactlyLikeOneThatDoesNotExist() throws Exception {
+        long reservationId = 501L;
+        produceReservationCreated(UUID.randomUUID(), reservationId, 10000, "corr-read-501");
+        awaitPaymentStatus(reservationId, "SUCCEEDED");
+
+        ResponseEntity<String> notYours = readPayment(reservationId, CUSTOMER_ID + 1);
+        ResponseEntity<String> unissued = readPayment(999_999L, CUSTOMER_ID);
+
+        assertThat(notYours.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(unissued.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        // Same wording for both, so the response cannot be used to probe which ids are paid.
+        assertThat(objectMapper.readTree(notYours.getBody()).get("message").asText())
+                .isEqualTo("Payment for reservation " + reservationId + " was not found");
+        assertThat(objectMapper.readTree(unissued.getBody()).get("message").asText())
+                .isEqualTo("Payment for reservation 999999 was not found");
+    }
+
+    @Test
+    void aPaymentRecordedBeforeOwnershipWasStoredIsReadableByNobody() throws Exception {
+        long reservationId = 502L;
+        // A pre-V4 row: no customer_id, and no way to recover one without querying
+        // another service's schema (ADR 005). The read fails closed on it (ADR 016).
+        jdbc.update(
+                "INSERT INTO payment.payments (reservation_id, amount_cents, status, settled_at) "
+                        + "VALUES (?, 1000, 'SUCCEEDED', now())",
+                reservationId);
+
+        assertThat(readPayment(reservationId, CUSTOMER_ID).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    private ResponseEntity<String> readPayment(long reservationId, long customerId) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(PaymentController.CUSTOMER_HEADER, Long.toString(customerId));
+        return rest.exchange(
+                "/api/v1/payments/{reservationId}", HttpMethod.GET, new HttpEntity<>(headers), String.class, reservationId);
+    }
+
     private boolean awaitOnTopic(String topic, Predicate<ConsumerRecord<String, String>> match) {
         try (KafkaConsumer<String, String> consumer = kafkaConsumer(topic)) {
             Instant deadline = Instant.now().plusSeconds(30);
@@ -338,7 +409,7 @@ class PaymentFlowBootTests {
                 new UUID(0L, reservationId),
                 Map.of(
                         "reservationId", reservationId,
-                        "customerId", 99L,
+                        "customerId", CUSTOMER_ID,
                         "eventId", 7L,
                         "seatIds", List.of(10L),
                         "amountCents", amountCents));
@@ -354,7 +425,7 @@ class PaymentFlowBootTests {
             UUID eventId, long reservationId, int amountCents, String correlationId) {
         Map<String, Object> payload = Map.of(
                 "reservationId", reservationId,
-                "customerId", 99L,
+                "customerId", CUSTOMER_ID,
                 "eventId", 7L,
                 "seatIds", List.of(10L),
                 "amountCents", amountCents);

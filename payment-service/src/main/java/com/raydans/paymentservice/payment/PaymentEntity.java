@@ -21,6 +21,11 @@ public class PaymentEntity {
     @Column(name = "reservation_id", nullable = false, unique = true)
     private long reservationId;
 
+    // Nullable only for rows that predate V4: their owner was never recorded here, and
+    // a null owner matches no caller, so the status read fails closed on them (ADR 016).
+    @Column(name = "customer_id")
+    private Long customerId;
+
     @Column(name = "amount_cents", nullable = false)
     private int amountCents;
 
@@ -37,8 +42,9 @@ public class PaymentEntity {
 
     protected PaymentEntity() {}
 
-    public PaymentEntity(long reservationId, int amountCents, PaymentStatus status) {
+    public PaymentEntity(long reservationId, long customerId, int amountCents, PaymentStatus status) {
         this.reservationId = reservationId;
+        this.customerId = customerId;
         this.amountCents = amountCents;
         this.status = status;
     }
@@ -49,6 +55,10 @@ public class PaymentEntity {
 
     public long getReservationId() {
         return reservationId;
+    }
+
+    public Long getCustomerId() {
+        return customerId;
     }
 
     public int getAmountCents() {

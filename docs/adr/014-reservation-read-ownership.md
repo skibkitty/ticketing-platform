@@ -115,8 +115,10 @@ is the same consequence ADR 011 accepted for notifications.
 owner.** The scheduled `HoldExpirer` is unaffected, so a hold is still released
 on time; only the incidental trigger available to a stranger is gone.
 
-**`GET /api/v1/payments/{reservationId}` is the same shape and is still open** —
+**`GET /api/v1/payments/{reservationId}` is the same shape and was still open** —
 [#22](https://github.com/skibkitty/ticketing-platform/issues/22). It is out of
 scope here and deliberately not fixed: it is a different service, and folding it
 in would make this ADR a change to two contracts at once. The fix is ADR 011's
 and this one's, applied a third time.
+
+*Since closed by ADR 016, which applies this decision to payments.*

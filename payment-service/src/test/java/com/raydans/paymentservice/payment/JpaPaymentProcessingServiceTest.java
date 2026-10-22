@@ -34,6 +34,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 class JpaPaymentProcessingServiceTest {
 
     static final String CORRELATION_ID = "test-correlation-id";
+    static final long CUSTOMER_ID = 99L;
 
     @Mock
     ProcessedEventRepository processedEvents;
@@ -59,13 +60,13 @@ class JpaPaymentProcessingServiceTest {
     void processBelowThresholdCreatesSucceededPaymentOutboxRowAndProcessedRow() {
         UUID eventId = UUID.randomUUID();
         when(processedEvents.tryClaim(eventId)).thenReturn(1);
-        when(payments.tryClaim(eq(101L), eq(45000), eq("SUCCEEDED"), any(Instant.class))).thenReturn(1);
+        when(payments.tryClaim(eq(101L), eq(CUSTOMER_ID), eq(45000), eq("SUCCEEDED"), any(Instant.class))).thenReturn(1);
         when(payments.findByReservationId(101L)).thenReturn(Optional.of(settledPayment(42L, 101L, 45000, PaymentStatus.SUCCEEDED)));
 
         service.process(envelope(eventId, "reservation.ReservationCreated", 101L, 45000), CORRELATION_ID);
 
         verify(processedEvents).tryClaim(eventId);
-        verify(payments).tryClaim(eq(101L), eq(45000), eq("SUCCEEDED"), any(Instant.class));
+        verify(payments).tryClaim(eq(101L), eq(CUSTOMER_ID), eq(45000), eq("SUCCEEDED"), any(Instant.class));
 
         ArgumentCaptor<OutboxEventEntity> outboxCaptor = ArgumentCaptor.forClass(OutboxEventEntity.class);
         verify(outbox).save(outboxCaptor.capture());
@@ -85,7 +86,7 @@ class JpaPaymentProcessingServiceTest {
     void processExactlyAtThresholdCreatesFailedPaymentAndPublishesPaymentFailed() {
         UUID eventId = UUID.randomUUID();
         when(processedEvents.tryClaim(eventId)).thenReturn(1);
-        when(payments.tryClaim(eq(102L), eq(50000), eq("FAILED"), any(Instant.class))).thenReturn(1);
+        when(payments.tryClaim(eq(102L), eq(CUSTOMER_ID), eq(50000), eq("FAILED"), any(Instant.class))).thenReturn(1);
         when(payments.findByReservationId(102L)).thenReturn(Optional.of(settledPayment(43L, 102L, 50000, PaymentStatus.FAILED)));
 
         service.process(envelope(eventId, "reservation.ReservationCreated", 102L, 50000), CORRELATION_ID);
@@ -100,7 +101,7 @@ class JpaPaymentProcessingServiceTest {
     void processOneCentBelowThresholdSucceeds() {
         UUID eventId = UUID.randomUUID();
         when(processedEvents.tryClaim(eventId)).thenReturn(1);
-        when(payments.tryClaim(eq(103L), eq(49999), eq("SUCCEEDED"), any(Instant.class))).thenReturn(1);
+        when(payments.tryClaim(eq(103L), eq(CUSTOMER_ID), eq(49999), eq("SUCCEEDED"), any(Instant.class))).thenReturn(1);
         when(payments.findByReservationId(103L)).thenReturn(Optional.of(settledPayment(44L, 103L, 49999, PaymentStatus.SUCCEEDED)));
 
         service.process(envelope(eventId, "reservation.ReservationCreated", 103L, 49999), CORRELATION_ID);
@@ -112,7 +113,7 @@ class JpaPaymentProcessingServiceTest {
     void zeroAmountIsValidAndSucceeds() {
         UUID eventId = UUID.randomUUID();
         when(processedEvents.tryClaim(eventId)).thenReturn(1);
-        when(payments.tryClaim(eq(104L), eq(0), eq("SUCCEEDED"), any(Instant.class))).thenReturn(1);
+        when(payments.tryClaim(eq(104L), eq(CUSTOMER_ID), eq(0), eq("SUCCEEDED"), any(Instant.class))).thenReturn(1);
         when(payments.findByReservationId(104L)).thenReturn(Optional.of(settledPayment(45L, 104L, 0, PaymentStatus.SUCCEEDED)));
 
         service.process(envelope(eventId, "reservation.ReservationCreated", 104L, 0), CORRELATION_ID);
@@ -127,7 +128,7 @@ class JpaPaymentProcessingServiceTest {
 
         service.process(envelope(eventId, "reservation.ReservationCreated", 105L, 45000), CORRELATION_ID);
 
-        verify(payments, never()).tryClaim(anyLong(), anyInt(), anyString(), any(Instant.class));
+        verify(payments, never()).tryClaim(anyLong(), anyLong(), anyInt(), anyString(), any(Instant.class));
         verify(payments, never()).findByReservationId(anyLong());
         verify(outbox, never()).save(any(OutboxEventEntity.class));
     }
@@ -139,7 +140,7 @@ class JpaPaymentProcessingServiceTest {
 
         service.process(envelope(eventId, "reservation.ReservationCreated", 106L, 45000), CORRELATION_ID);
 
-        verify(payments, never()).tryClaim(anyLong(), anyInt(), anyString(), any(Instant.class));
+        verify(payments, never()).tryClaim(anyLong(), anyLong(), anyInt(), anyString(), any(Instant.class));
         verify(outbox, never()).save(any(OutboxEventEntity.class));
     }
 
@@ -149,7 +150,7 @@ class JpaPaymentProcessingServiceTest {
         // First delivery: the claim succeeds but the outbox write explodes, so the
         // transaction (and with it the processed_events claim) must roll back.
         when(processedEvents.tryClaim(eventId)).thenReturn(1);
-        when(payments.tryClaim(eq(107L), eq(45000), eq("SUCCEEDED"), any(Instant.class))).thenReturn(1);
+        when(payments.tryClaim(eq(107L), eq(CUSTOMER_ID), eq(45000), eq("SUCCEEDED"), any(Instant.class))).thenReturn(1);
         when(payments.findByReservationId(107L))
                 .thenReturn(Optional.of(settledPayment(46L, 107L, 45000, PaymentStatus.SUCCEEDED)));
         when(outbox.save(any(OutboxEventEntity.class)))
@@ -175,7 +176,7 @@ class JpaPaymentProcessingServiceTest {
         service.process(envelope(eventId, "reservation.ReservationConfirmed", 108L, 45000), CORRELATION_ID);
 
         verify(processedEvents, never()).tryClaim(any());
-        verify(payments, never()).tryClaim(anyLong(), anyInt(), anyString(), any(Instant.class));
+        verify(payments, never()).tryClaim(anyLong(), anyLong(), anyInt(), anyString(), any(Instant.class));
         verify(outbox, never()).save(any(OutboxEventEntity.class));
     }
 
@@ -211,7 +212,7 @@ class JpaPaymentProcessingServiceTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("eventId");
 
-        verify(payments, never()).tryClaim(anyLong(), anyInt(), anyString(), any(Instant.class));
+        verify(payments, never()).tryClaim(anyLong(), anyLong(), anyInt(), anyString(), any(Instant.class));
         verify(outbox, never()).save(any(OutboxEventEntity.class));
     }
 
@@ -240,7 +241,7 @@ class JpaPaymentProcessingServiceTest {
                 .hasMessageContaining("amountCents");
 
         verify(processedEvents, never()).tryClaim(any());
-        verify(payments, never()).tryClaim(anyLong(), anyInt(), anyString(), any(Instant.class));
+        verify(payments, never()).tryClaim(anyLong(), anyLong(), anyInt(), anyString(), any(Instant.class));
         verify(outbox, never()).save(any(OutboxEventEntity.class));
     }
 
@@ -387,7 +388,7 @@ class JpaPaymentProcessingServiceTest {
         UUID secondEventId = UUID.randomUUID();
 
         when(processedEvents.tryClaim(firstEventId)).thenReturn(1);
-        when(payments.tryClaim(eq(121L), eq(45000), eq("SUCCEEDED"), any(Instant.class))).thenReturn(1);
+        when(payments.tryClaim(eq(121L), eq(CUSTOMER_ID), eq(45000), eq("SUCCEEDED"), any(Instant.class))).thenReturn(1);
         when(payments.findByReservationId(121L))
                 .thenReturn(Optional.of(settledPayment(47L, 121L, 45000, PaymentStatus.SUCCEEDED)));
         service.process(envelope(firstEventId, "reservation.ReservationCreated", 121L, 45000), CORRELATION_ID);
@@ -395,18 +396,18 @@ class JpaPaymentProcessingServiceTest {
         // A different eventId for the same reservation: the event is still claimed as
         // processed, but no second payment/outbox row is created and nothing is thrown.
         when(processedEvents.tryClaim(secondEventId)).thenReturn(1);
-        when(payments.tryClaim(eq(121L), eq(50000), eq("FAILED"), any(Instant.class))).thenReturn(0);
+        when(payments.tryClaim(eq(121L), eq(CUSTOMER_ID), eq(50000), eq("FAILED"), any(Instant.class))).thenReturn(0);
 
         service.process(envelope(secondEventId, "reservation.ReservationCreated", 121L, 50000), CORRELATION_ID);
 
         verify(processedEvents).tryClaim(firstEventId);
         verify(processedEvents).tryClaim(secondEventId);
-        verify(payments).tryClaim(eq(121L), eq(50000), eq("FAILED"), any(Instant.class));
+        verify(payments).tryClaim(eq(121L), eq(CUSTOMER_ID), eq(50000), eq("FAILED"), any(Instant.class));
         verify(outbox, times(1)).save(any(OutboxEventEntity.class));
     }
 
     private PaymentEntity settledPayment(Long id, long reservationId, int amountCents, PaymentStatus status) {
-        PaymentEntity payment = new PaymentEntity(reservationId, amountCents, status);
+        PaymentEntity payment = new PaymentEntity(reservationId, CUSTOMER_ID, amountCents, status);
         ReflectionTestUtils.setField(payment, "id", id);
         ReflectionTestUtils.setField(payment, "settledAt", Instant.now());
         return payment;
@@ -419,6 +420,6 @@ class JpaPaymentProcessingServiceTest {
 
     private JsonNode payload(long reservationId, int amountCents) {
         return objectMapper.valueToTree(new JpaPaymentProcessingService.ReservationCreatedPayload(
-                reservationId, 99L, 7L, List.of(10L), amountCents));
+                reservationId, CUSTOMER_ID, 7L, List.of(10L), amountCents));
     }
 }
