@@ -4,6 +4,7 @@ import com.raydans.apigateway.auth.InvalidCredentialsException;
 import com.raydans.apigateway.auth.ThrottledLoginException;
 import com.raydans.common.web.ApiErrorResponse;
 import jakarta.servlet.http.HttpServletRequest;
+import java.io.IOException;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,7 +15,9 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
+import org.springframework.web.util.DisconnectedClientHelper;
 
 /**
  * Maps the login surface's failures to the shared {@code ApiErrorResponse}
@@ -24,6 +27,15 @@ import org.springframework.web.servlet.resource.NoResourceFoundException;
  */
 @RestControllerAdvice
 public class GatewayExceptionHandler {
+
+    /** Set on a request whose hop to a service failed: refused, timed out, cut off. */
+    public static final String HOP_FAILURE_ATTRIBUTE = GatewayExceptionHandler.class.getName() + ".HOP_FAILURE";
+
+    /**
+     * Set on a request whose 500 was not the service's doing: the gateway's own
+     * failure, or the caller going away.
+     */
+    public static final String GATEWAY_FAULT_ATTRIBUTE = GatewayExceptionHandler.class.getName() + ".GATEWAY_FAULT";
 
     private static final Logger log = LoggerFactory.getLogger(GatewayExceptionHandler.class);
 
@@ -121,11 +133,33 @@ public class GatewayExceptionHandler {
         return respond(HttpStatus.NOT_FOUND, "No such route", request, List.of());
     }
 
+    /**
+     * Everything else, which is one of two different things, marked on the
+     * request so the payments circuit breaker counts the one that is evidence
+     * about payment-service and not the other (#13). Both answer the same 500,
+     * so a caller sees no difference and learns nothing about which.
+     */
     @ExceptionHandler(Exception.class)
     ResponseEntity<ApiErrorResponse> fallback(Exception ex, HttpServletRequest request) {
+        request.setAttribute(isHopFailure(ex) ? HOP_FAILURE_ATTRIBUTE : GATEWAY_FAULT_ATTRIBUTE, Boolean.TRUE);
         log.error("Unhandled exception on {} {}", request.getMethod(), request.getRequestURI(), ex);
         return respond(
                 HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred", request, List.of());
+    }
+
+    /**
+     * Whether the proxy's hop to a service failed. Two shapes, because the hop
+     * fails in two places: while RestClient is connecting and waiting for the
+     * status, which it wraps as a {@link ResourceAccessException}; and while the
+     * service's body is being copied to the caller, which happens after RestClient
+     * has returned and so arrives as a raw {@link IOException} (a read timeout,
+     * a connection closed early). An {@code IOException} from the caller's side
+     * of the gateway is the caller going away, not the service failing, which is
+     * what Spring's own check for a disconnected client tells apart.
+     */
+    private static boolean isHopFailure(Exception ex) {
+        return ex instanceof ResourceAccessException
+                || (ex instanceof IOException && !DisconnectedClientHelper.isClientDisconnectedException(ex));
     }
 
     private ResponseEntity<ApiErrorResponse> respond(

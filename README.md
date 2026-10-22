@@ -2,10 +2,9 @@
 
 An event ticketing & reservation system: seat holds with optimistic
 concurrency control, a payment saga with automatic compensation on failure, and
-a single authenticated gateway in front of it. Gateway resilience — rate
-limiting, a bulkhead and a circuit breaker for the flash-sale reservation route —
-is planned in [#13](https://github.com/skibkitty/ticketing-platform/issues/13)
-and not built yet.
+a single authenticated gateway in front of it, with a rate limit and a bulkhead
+on the flash-sale reservation route and a circuit breaker on the payment-status
+route.
 
 **Start here:**
 1. [`docs/architecture.md`](docs/architecture.md) — what this is and why
@@ -103,9 +102,8 @@ production-grade password authentication. Specifically:
   before, and now says nothing about how many attempts it will answer. Two limits
   it does not overcome: callers behind one NAT share the address budget, and
   counters live in each gateway, so N replicas behind a load balancer mean N times
-  the budget. The flash-sale rate limiting in
-  [#13](https://github.com/skibkitty/ticketing-platform/issues/13) is a different
-  route and does not cover this.
+  the budget. The flash-sale rate limit on `POST /api/v1/reservations` is a
+  different mechanism on a different route and does not cover this.
 - **Roles are configuration**, not something a user holds or changes.
 
 [`docs/adr/002`](docs/adr/002-gateway-trust-boundary.md) records the trust
@@ -181,8 +179,8 @@ curl localhost:8080/api/v1/reservations/1 \
 curl localhost:8080/api/v1/reservations \
   -H "Authorization: Bearer <customer-token>"
 
-# 6. Check the payment record. The circuit breaker on this route is planned
-#    in #13 and not built yet; today it is a plain proxied read
+# 6. Check the payment record. While payment-service is failing, the circuit
+#    breaker on this route answers 503 at once instead of proxying
 curl localhost:8080/api/v1/payments/1 \
   -H "Authorization: Bearer <customer-token>"
 

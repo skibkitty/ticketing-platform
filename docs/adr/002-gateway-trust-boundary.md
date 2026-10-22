@@ -154,9 +154,8 @@ the login surface is production-grade password authentication. It is not:
   What it cannot do is mean one number across replicas or survive a restart —
   counters live in each gateway process, so N gateways behind a load balancer give
   an attacker N times the budget. A deployment that needs the limit to be global
-  needs a shared store. The flash-sale rate limiting in
-  [#13](https://github.com/skibkitty/ticketing-platform/issues/13) is separate and
-  still open: it is scoped to `POST /api/v1/reservations` and would not cover this.
+  needs a shared store. The flash-sale rate limit (#13) is separate: it is
+  scoped to `POST /api/v1/reservations` and does not cover this.
 - **Roles come from configuration too.** A caller's roles are whatever
   `app.gateway.callers.*.roles` says, so the role table is an operator's
   configuration decision rather than something a user can hold or change.
