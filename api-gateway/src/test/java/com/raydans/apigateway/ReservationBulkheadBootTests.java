@@ -16,6 +16,8 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -124,14 +126,22 @@ class ReservationBulkheadBootTests {
         try {
             List<Future<Integer>> calls = new ArrayList<>();
             for (int i = 0; i < burst; i++) {
-                calls.add(callers.submit(() -> {
-                    start.await();
-                    int answered = mvc.perform(reserve()).andReturn().getResponse().getStatus();
+                CompletableFuture<Integer> call = CompletableFuture.supplyAsync(() -> {
+                    try {
+                        start.await();
+                        return mvc.perform(reserve()).andReturn().getResponse().getStatus();
+                    } catch (Exception e) {
+                        throw new CompletionException(e);
+                    }
+                }, callers);
+                // A dependent stage runs only once the call is done, so a refusal is
+                // counted no earlier than isDone() can see it.
+                call.thenAccept(answered -> {
                     if (answered == 429) {
                         refused.countDown();
                     }
-                    return answered;
-                }));
+                });
+                calls.add(call);
             }
             start.countDown();
 
