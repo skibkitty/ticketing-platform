@@ -15,8 +15,18 @@ class JpaPaymentQueryService implements PaymentQueryService {
     @Override
     @Transactional(readOnly = true)
     public PaymentResponse get(long reservationId, long customerId) {
-        // Same message for "no such payment" and "not yours", so a caller cannot probe
-        // which reservation ids have been paid for (ADR 014, ADR 016).
+        // Ids are issued from a sequence and are positive, so anything else is a
+        // malformed request rather than an absent Payment: 400, not 404.
+        if (reservationId <= 0) {
+            throw new InvalidPaymentLookupException("reservationId must be a positive id");
+        }
+        // The gateway only ever publishes a positive Customer id; anything else did
+        // not come from it.
+        if (customerId <= 0) {
+            throw new InvalidPaymentLookupException("X-Customer-Id must be a positive id");
+        }
+        // "No such payment" and "not yours" are the same exception. The detail is for
+        // logs only; the response says "Payment not found" for both (ADR 016).
         return payments.findByReservationIdAndCustomerId(reservationId, customerId)
                 .map(PaymentResponse::from)
                 .orElseThrow(() -> new PaymentNotFoundException(

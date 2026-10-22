@@ -1,5 +1,6 @@
 package com.raydans.apigateway;
 
+import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
@@ -28,6 +29,7 @@ final class StandInService {
 
     private final HttpServer server;
     private final List<String> received = new CopyOnWriteArrayList<>();
+    private final List<Headers> receivedHeaders = new CopyOnWriteArrayList<>();
     private volatile CountDownLatch gate = new CountDownLatch(0);
     private volatile int status = 200;
     private volatile boolean stallMidBody = false;
@@ -61,6 +63,11 @@ final class StandInService {
     /** Paths of the requests that reached this service, in arrival order. */
     List<String> received() {
         return received;
+    }
+
+    /** Headers of the requests that reached this service, in the same order as {@link #received()}. */
+    List<Headers> receivedHeaders() {
+        return receivedHeaders;
     }
 
     /**
@@ -103,6 +110,7 @@ final class StandInService {
         status = 200;
         stallMidBody = false;
         received.clear();
+        receivedHeaders.clear();
         mostInFlight.set(0);
     }
 
@@ -129,6 +137,7 @@ final class StandInService {
 
     private void handle(HttpExchange exchange) throws IOException {
         exchange.getRequestBody().readAllBytes();
+        receivedHeaders.add(exchange.getRequestHeaders());
         received.add(exchange.getRequestURI().getPath());
         mostInFlight.accumulateAndGet(inFlight.incrementAndGet(), Math::max);
         arrivals.countDown();

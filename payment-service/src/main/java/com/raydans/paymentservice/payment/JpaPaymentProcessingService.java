@@ -101,6 +101,20 @@ class JpaPaymentProcessingService implements PaymentProcessingService {
         int claimedPayments = payments.tryClaim(
                 created.reservationId(), created.customerId(), created.amountCents(), outcome.name(), Instant.now());
         if (claimedPayments == 0) {
+            // The first event to claim the reservation set its owner, and nothing here
+            // rewrites it (ADR 016). A later event naming a different Customer is a
+            // producer bug rather than a duplicate, so it is recorded loudly — but still
+            // as a no-op, because redelivering it would not make it any more right.
+            Long recordedOwner = payments.findByReservationId(created.reservationId())
+                    .map(PaymentEntity::getCustomerId)
+                    .orElse(null);
+            if (recordedOwner != null && !recordedOwner.equals(created.customerId())) {
+                log.error(
+                        "Ignoring ReservationCreated event {} for reservation {}: it names customer {} but the "
+                                + "payment already belongs to customer {}; ownership left unchanged",
+                        envelope.eventId(), created.reservationId(), created.customerId(), recordedOwner);
+                return;
+            }
             log.warn(
                     "Ignoring ReservationCreated for reservation {} which already has a payment; "
                             + "event {} recorded as processed",

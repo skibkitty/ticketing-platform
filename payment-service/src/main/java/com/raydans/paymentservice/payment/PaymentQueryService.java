@@ -11,6 +11,7 @@ public interface PaymentQueryService {
      *
      * @throws PaymentNotFoundException when there is no Payment for the reservation, or
      *     there is one and it belongs to someone else — deliberately indistinguishable
+     * @throws InvalidPaymentLookupException when either id is not positive
      */
     PaymentResponse get(long reservationId, long customerId);
 }

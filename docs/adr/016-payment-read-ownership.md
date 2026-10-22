@@ -28,7 +28,12 @@ in the same way as ADR 014. It is the same fix a third time, not a new design.
 `payments.customer_id` (V4) is written from the `ReservationCreated` payload in
 the same `INSERT ... ON CONFLICT (reservation_id) DO NOTHING` that creates the
 row. A duplicate event never rewrites it: the first event to claim the
-reservation sets the owner.
+reservation sets the owner, and there is no other write that could change it.
+A later event naming a *different* Customer for the same reservation is a
+producer bug, not a duplicate. It is logged at `ERROR` and recorded as
+processed without changing the owner, because redelivering it would not make it
+right. Concurrent events with conflicting owners leave exactly one owner, and
+only that Customer can read the payment.
 
 The alternatives were worse:
 
@@ -46,9 +51,15 @@ into `findByReservationIdAndCustomerId`. As in ADR 014, this means:
 
 - a Payment that is not the caller's is never loaded;
 - someone else's reservation id and an unissued one get the same 404 with the
-  same wording, so the response does not confirm that a reservation was paid for;
+  same fixed message, `Payment not found`, so the response does not confirm that
+  a reservation was paid for. The exception's own detail goes to the log only;
 - with no header the request is refused with 400 before any lookup, so the route
-  cannot be reached except through the gateway.
+  cannot be reached except through the gateway;
+- a reservation id or `X-Customer-Id` that is zero, negative or not a number is
+  refused with 400 before any lookup, since no Payment can have that id.
+
+Response bodies carry only messages written for the caller. Anything unexpected
+is a 500 with a generic message, with the detail in the server log.
 
 **404, not 403**, for ADR 014's reason: a 403 would confirm the payment exists.
 
@@ -60,9 +71,18 @@ keep compatible.
 
 `customer_id` is nullable and not backfilled. The owner of an older row is only
 known in the `reservation` schema, and ADR 005 rules out cross-schema queries. A
-null owner matches no caller, so those rows fail closed with a 404. That is the
-right failure for a demo platform whose data is recreated with the stack, and
-the column can be tightened to `NOT NULL` once no such rows remain.
+null owner matches no caller, so those rows fail closed with a 404. They can't
+be claimed later either: replaying their `ReservationCreated` hits the same
+`ON CONFLICT` and is a no-op.
+
+This is visible on a running stack. Postgres sits on the `platform-db-data`
+named volume, so payments made before V4 survive the upgrade and become
+unreadable. On this demo platform that data is disposable
+(`docker compose down -v` starts clean). A deployment whose existing payments
+must stay readable needs a backfill from a trusted record of who owns each
+reservation: reservation-service's data, exported and imported deliberately,
+not a cross-schema query and not anything a client supplies. The column can be
+tightened to `NOT NULL` once no ownerless rows remain.
 
 ## The gateway says whose route it is
 

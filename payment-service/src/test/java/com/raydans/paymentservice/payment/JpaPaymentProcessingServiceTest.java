@@ -406,6 +406,24 @@ class JpaPaymentProcessingServiceTest {
         verify(outbox, times(1)).save(any(OutboxEventEntity.class));
     }
 
+    @Test
+    void aLaterEventNamingADifferentOwnerLeavesTheRecordedOwnerAndIsANoOp() {
+        UUID eventId = UUID.randomUUID();
+        when(processedEvents.tryClaim(eventId)).thenReturn(1);
+        // Reservation 122 already belongs to CUSTOMER_ID; this event claims it for 77.
+        when(payments.tryClaim(eq(122L), eq(77L), eq(45000), eq("SUCCEEDED"), any(Instant.class))).thenReturn(0);
+        when(payments.findByReservationId(122L))
+                .thenReturn(Optional.of(settledPayment(48L, 122L, 45000, PaymentStatus.SUCCEEDED)));
+
+        service.process(envelope(eventId, "reservation.ReservationCreated", 122L, 45000, 77L), CORRELATION_ID);
+
+        // Recorded as processed (so it is not redelivered forever), no outcome published,
+        // and no write that could change the owner: tryClaim is the only write there is.
+        verify(processedEvents).tryClaim(eventId);
+        verify(outbox, never()).save(any(OutboxEventEntity.class));
+        verify(payments, never()).save(any(PaymentEntity.class));
+    }
+
     private PaymentEntity settledPayment(Long id, long reservationId, int amountCents, PaymentStatus status) {
         PaymentEntity payment = new PaymentEntity(reservationId, CUSTOMER_ID, amountCents, status);
         ReflectionTestUtils.setField(payment, "id", id);
@@ -414,12 +432,22 @@ class JpaPaymentProcessingServiceTest {
     }
 
     private EventEnvelope<JsonNode> envelope(UUID eventId, String eventType, long reservationId, int amountCents) {
+        return envelope(eventId, eventType, reservationId, amountCents, CUSTOMER_ID);
+    }
+
+    private EventEnvelope<JsonNode> envelope(
+            UUID eventId, String eventType, long reservationId, int amountCents, long customerId) {
         return new EventEnvelope<>(
-                eventId, eventType, Instant.now(), CORRELATION_ID, new UUID(0L, reservationId), payload(reservationId, amountCents));
+                eventId, eventType, Instant.now(), CORRELATION_ID, new UUID(0L, reservationId),
+                payload(reservationId, amountCents, customerId));
     }
 
     private JsonNode payload(long reservationId, int amountCents) {
+        return payload(reservationId, amountCents, CUSTOMER_ID);
+    }
+
+    private JsonNode payload(long reservationId, int amountCents, long customerId) {
         return objectMapper.valueToTree(new JpaPaymentProcessingService.ReservationCreatedPayload(
-                reservationId, CUSTOMER_ID, 7L, List.of(10L), amountCents));
+                reservationId, customerId, 7L, List.of(10L), amountCents));
     }
 }

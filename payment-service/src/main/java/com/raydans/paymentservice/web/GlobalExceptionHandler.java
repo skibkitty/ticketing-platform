@@ -1,6 +1,7 @@
 package com.raydans.paymentservice.web;
 
 import com.raydans.common.web.ApiErrorResponse;
+import com.raydans.paymentservice.payment.InvalidPaymentLookupException;
 import com.raydans.paymentservice.payment.PaymentNotFoundException;
 import jakarta.servlet.http.HttpServletRequest;
 import java.time.Instant;
@@ -20,16 +21,31 @@ public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
+    /**
+     * One fixed message for every absent Payment, whatever the exception says.
+     * Someone else's reservation and an unissued id must produce the same body
+     * (ADR 016), and a constant cannot drift apart for the two cases the way a
+     * message built from the lookup could.
+     */
     @ExceptionHandler(PaymentNotFoundException.class)
     ResponseEntity<ApiErrorResponse> notFound(PaymentNotFoundException ex, HttpServletRequest request) {
+        log.debug("{} on {}", ex.getMessage(), request.getRequestURI());
         HttpStatus status = HttpStatus.NOT_FOUND;
+        return ResponseEntity.status(status).body(error(status, "Payment not found", request));
+    }
+
+    @ExceptionHandler(InvalidPaymentLookupException.class)
+    ResponseEntity<ApiErrorResponse> invalidLookup(InvalidPaymentLookupException ex, HttpServletRequest request) {
+        HttpStatus status = HttpStatus.BAD_REQUEST;
         return ResponseEntity.status(status).body(error(status, ex.getMessage(), request));
     }
 
     @ExceptionHandler(MethodArgumentTypeMismatchException.class)
     ResponseEntity<ApiErrorResponse> typeMismatch(MethodArgumentTypeMismatchException ex, HttpServletRequest request) {
         HttpStatus status = HttpStatus.BAD_REQUEST;
-        String message = "Invalid value for '" + ex.getName() + "': '" + ex.getValue() + "'";
+        // Names the parameter but does not echo the value back: the caller already has
+        // it, and the converter's own text describes this service's types.
+        String message = "Invalid value for '" + ex.getName() + "'";
         return ResponseEntity.status(status).body(error(status, message, request));
     }
 

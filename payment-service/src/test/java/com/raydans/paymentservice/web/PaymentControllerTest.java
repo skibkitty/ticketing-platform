@@ -1,9 +1,12 @@
 package com.raydans.paymentservice.web;
 
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.not;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -11,6 +14,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.raydans.paymentservice.payment.InvalidPaymentLookupException;
 import com.raydans.paymentservice.payment.PaymentNotFoundException;
 import com.raydans.paymentservice.payment.PaymentQueryService;
 import com.raydans.paymentservice.payment.PaymentResponse;
@@ -76,16 +80,17 @@ class PaymentControllerTest {
     @Test
     void anUnknownReservationIs404InTheSharedErrorShape() throws Exception {
         when(payments.get(404L, 99L))
-                .thenThrow(new PaymentNotFoundException("Payment for reservation 404 was not found"));
+                .thenThrow(new PaymentNotFoundException("internal detail: lookup for reservation 404 missed"));
 
         mvc.perform(get("/api/v1/payments/404").header(PaymentController.CUSTOMER_HEADER, "99"))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.status").value(404))
                 .andExpect(jsonPath("$.error").value("Not Found"))
-                .andExpect(jsonPath("$.message").value("Payment for reservation 404 was not found"))
+                // The fixed text, not the exception's: the detail stays in the logs.
+                .andExpect(jsonPath("$.message").value("Payment not found"))
                 .andExpect(jsonPath("$.path").value("/api/v1/payments/404"))
                 .andExpect(jsonPath("$.timestamp").exists())
-                .andExpect(jsonPath("$.details").isArray());
+                .andExpect(jsonPath("$.details").isEmpty());
     }
 
     @Test
@@ -97,7 +102,36 @@ class PaymentControllerTest {
 
         mvc.perform(get("/api/v1/payments/101").header(PaymentController.CUSTOMER_HEADER, "98"))
                 .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.message").value("Payment for reservation 101 was not found"));
+                .andExpect(jsonPath("$.message").value("Payment not found"));
+    }
+
+    @Test
+    void aLookupTheServiceRefusesIs400WithItsClientMessage() throws Exception {
+        when(payments.get(0L, 99L)).thenThrow(new InvalidPaymentLookupException("reservationId must be a positive id"));
+        when(payments.get(-5L, 99L)).thenThrow(new InvalidPaymentLookupException("reservationId must be a positive id"));
+        when(payments.get(101L, 0L)).thenThrow(new InvalidPaymentLookupException("X-Customer-Id must be a positive id"));
+
+        mvc.perform(get("/api/v1/payments/0").header(PaymentController.CUSTOMER_HEADER, "99"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value("reservationId must be a positive id"));
+        mvc.perform(get("/api/v1/payments/-5").header(PaymentController.CUSTOMER_HEADER, "99"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value("reservationId must be a positive id"));
+        mvc.perform(get("/api/v1/payments/101").header(PaymentController.CUSTOMER_HEADER, "0"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value("X-Customer-Id must be a positive id"));
+    }
+
+    @Test
+    void anUnexpectedFailureIsAGeneric500ThatSaysNothingAboutWhy() throws Exception {
+        when(payments.get(101L, 99L)).thenThrow(new IllegalStateException(
+                "could not open connection to jdbc:postgresql://postgres:5432/platform"));
+
+        mvc.perform(get("/api/v1/payments/101").header(PaymentController.CUSTOMER_HEADER, "99"))
+                .andExpect(status().isInternalServerError())
+                .andExpect(jsonPath("$.message").value("An unexpected error occurred"))
+                .andExpect(content().string(not(containsString("postgres"))))
+                .andExpect(content().string(not(containsString("IllegalStateException"))));
     }
 
     @Test
@@ -113,7 +147,8 @@ class PaymentControllerTest {
     void aNonNumericReservationIdIs400NotA500() throws Exception {
         mvc.perform(get("/api/v1/payments/abc").header(PaymentController.CUSTOMER_HEADER, "99"))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.message").value("Invalid value for 'reservationId': 'abc'"));
+                .andExpect(jsonPath("$.message").value("Invalid value for 'reservationId'"))
+                .andExpect(content().string(not(containsString("NumberFormatException"))));
 
         verifyNoInteractions(payments);
     }
@@ -121,6 +156,10 @@ class PaymentControllerTest {
     @Test
     void aNonNumericCustomerHeaderIs400NotA500() throws Exception {
         mvc.perform(get("/api/v1/payments/101").header(PaymentController.CUSTOMER_HEADER, "someone"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value("Invalid value for 'X-Customer-Id'"));
+        // Past the range of a long is the same malformed header, not a server fault.
+        mvc.perform(get("/api/v1/payments/101").header(PaymentController.CUSTOMER_HEADER, "99999999999999999999"))
                 .andExpect(status().isBadRequest());
 
         verifyNoInteractions(payments);
