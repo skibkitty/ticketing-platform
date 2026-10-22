@@ -4,10 +4,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.raydans.common.event.EventEnvelope;
 import com.raydans.common.web.CorrelationIdFilter;
 import com.raydans.paymentservice.outbox.OutboxPublisher;
 import com.raydans.paymentservice.payment.PaymentProcessingService;
+import com.raydans.paymentservice.web.PaymentController;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -29,6 +31,12 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -45,6 +53,8 @@ class PaymentFlowBootTests {
 
     static final String RESERVATION_EVENTS_TOPIC = "reservation.events.v1";
     static final String PAYMENT_EVENTS_TOPIC = "payment.events.v1";
+    static final long CUSTOMER_ID = 99L;
+    static final long OTHER_CUSTOMER_ID = 77L;
 
     @Container
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine")
@@ -69,6 +79,9 @@ class PaymentFlowBootTests {
 
     @Autowired
     PaymentProcessingService paymentProcessing;
+
+    @Autowired
+    TestRestTemplate rest;
 
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
@@ -268,6 +281,125 @@ class PaymentFlowBootTests {
         awaitProcessed(validEventId);
     }
 
+    @Test
+    void theOwnerReadsTheirPaymentOutcomeByReservationId() throws Exception {
+        long reservationId = 500L;
+        produceReservationCreated(UUID.randomUUID(), reservationId, 46000, "corr-read-500");
+        awaitPaymentStatus(reservationId, "FAILED");
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT customer_id FROM payment.payments WHERE reservation_id = ?", Long.class, reservationId))
+                .as("the owner is recorded from the ReservationCreated payload")
+                .isEqualTo(CUSTOMER_ID);
+
+        ResponseEntity<String> response = readPayment(reservationId, CUSTOMER_ID);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode body = objectMapper.readTree(response.getBody());
+        assertThat(body.get("reservationId").asLong()).isEqualTo(reservationId);
+        assertThat(body.get("amountCents").asInt()).isEqualTo(46000);
+        assertThat(body.get("status").asText()).isEqualTo("FAILED");
+        assertThat(body.get("createdAt").isNull()).isFalse();
+        assertThat(body.get("settledAt").isNull()).isFalse();
+    }
+
+    @Test
+    void anotherCustomersPaymentIsAnsweredExactlyLikeOneThatDoesNotExist() throws Exception {
+        long reservationId = 501L;
+        produceReservationCreated(UUID.randomUUID(), reservationId, 10000, "corr-read-501");
+        awaitPaymentStatus(reservationId, "SUCCEEDED");
+
+        ResponseEntity<String> notYours = readPayment(reservationId, CUSTOMER_ID + 1);
+        ResponseEntity<String> unissued = readPayment(999_999L, CUSTOMER_ID);
+
+        assertThat(notYours.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(unissued.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        // The same body for both apart from the path the caller sent and the time, so
+        // the response cannot be used to probe which reservation ids are paid for.
+        assertThat(comparableErrorBody(notYours)).isEqualTo(comparableErrorBody(unissued));
+        assertThat(objectMapper.readTree(notYours.getBody()).get("message").asText()).isEqualTo("Payment not found");
+        assertThat(notYours.getBody()).doesNotContain("46000", "10000", "SUCCEEDED", "customer");
+    }
+
+    @Test
+    void aLaterEventNamingAnotherCustomerDoesNotChangeWhoOwnsThePayment() throws Exception {
+        long reservationId = 503L;
+        produceReservationCreated(UUID.randomUUID(), reservationId, 10000, "corr-owner-503a", CUSTOMER_ID);
+        awaitPaymentStatus(reservationId, "SUCCEEDED");
+
+        UUID conflicting = UUID.randomUUID();
+        produceReservationCreated(conflicting, reservationId, 10000, "corr-owner-503b", OTHER_CUSTOMER_ID);
+        awaitProcessed(conflicting);
+
+        assertSinglePayment(reservationId, "SUCCEEDED", 10000);
+        assertThat(ownerOf(reservationId)).isEqualTo(CUSTOMER_ID);
+        assertThat(readPayment(reservationId, CUSTOMER_ID).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(readPayment(reservationId, OTHER_CUSTOMER_ID).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void concurrentEventsNamingDifferentOwnersLeaveExactlyOneOwnerAndOnlyThatOneCanRead() throws Exception {
+        long reservationId = 504L;
+        EventEnvelope<JsonNode> mine =
+                reservationCreatedEnvelope(UUID.randomUUID(), reservationId, 10000, "corr-owner-504a", CUSTOMER_ID);
+        EventEnvelope<JsonNode> theirs =
+                reservationCreatedEnvelope(UUID.randomUUID(), reservationId, 10000, "corr-owner-504b", OTHER_CUSTOMER_ID);
+
+        runConcurrently(List.of(
+                () -> paymentProcessing.process(mine, "corr-owner-504a"),
+                () -> paymentProcessing.process(theirs, "corr-owner-504b"),
+                () -> paymentProcessing.process(mine, "corr-owner-504a"),
+                () -> paymentProcessing.process(theirs, "corr-owner-504b")));
+
+        assertSinglePayment(reservationId, "SUCCEEDED", 10000);
+        assertSameEventOutboxRows(reservationId, 1);
+        // Either may win the race; what may not happen is both, neither, or a mixture.
+        long owner = ownerOf(reservationId);
+        assertThat(owner).isIn(CUSTOMER_ID, OTHER_CUSTOMER_ID);
+        long loser = owner == CUSTOMER_ID ? OTHER_CUSTOMER_ID : CUSTOMER_ID;
+        assertThat(readPayment(reservationId, owner).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(readPayment(reservationId, loser).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void nonPositiveReservationIdsAreClientErrorsNotLookups() {
+        assertThat(readPayment(0L, CUSTOMER_ID).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(readPayment(-1L, CUSTOMER_ID).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    private long ownerOf(long reservationId) {
+        return jdbc.queryForObject(
+                "SELECT customer_id FROM payment.payments WHERE reservation_id = ?", Long.class, reservationId);
+    }
+
+    /** An error body without the two fields that legitimately differ per request. */
+    private JsonNode comparableErrorBody(ResponseEntity<String> response) throws Exception {
+        ObjectNode body = (ObjectNode) objectMapper.readTree(response.getBody());
+        body.remove("timestamp");
+        body.remove("path");
+        return body;
+    }
+
+    @Test
+    void aPaymentRecordedBeforeOwnershipWasStoredIsReadableByNobody() throws Exception {
+        long reservationId = 502L;
+        // A pre-V4 row: no customer_id, and no way to recover one without querying
+        // another service's schema (ADR 005). The read fails closed on it (ADR 016).
+        jdbc.update(
+                "INSERT INTO payment.payments (reservation_id, amount_cents, status, settled_at) "
+                        + "VALUES (?, 1000, 'SUCCEEDED', now())",
+                reservationId);
+
+        assertThat(readPayment(reservationId, CUSTOMER_ID).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    private ResponseEntity<String> readPayment(long reservationId, long customerId) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(PaymentController.CUSTOMER_HEADER, Long.toString(customerId));
+        return rest.exchange(
+                "/api/v1/payments/{reservationId}", HttpMethod.GET, new HttpEntity<>(headers), String.class, reservationId);
+    }
+
     private boolean awaitOnTopic(String topic, Predicate<ConsumerRecord<String, String>> match) {
         try (KafkaConsumer<String, String> consumer = kafkaConsumer(topic)) {
             Instant deadline = Instant.now().plusSeconds(30);
@@ -320,8 +452,13 @@ class PaymentFlowBootTests {
 
     private void produceReservationCreated(UUID eventId, long reservationId, int amountCents, String correlationId)
             throws Exception {
+        produceReservationCreated(eventId, reservationId, amountCents, correlationId, CUSTOMER_ID);
+    }
+
+    private void produceReservationCreated(
+            UUID eventId, long reservationId, int amountCents, String correlationId, long customerId) throws Exception {
         String value = objectMapper.writeValueAsString(
-                reservationCreatedEnvelope(eventId, reservationId, amountCents, correlationId));
+                reservationCreatedEnvelope(eventId, reservationId, amountCents, correlationId, customerId));
         ProducerRecord<String, String> record = new ProducerRecord<>(
                 RESERVATION_EVENTS_TOPIC, new UUID(0L, reservationId).toString(), value);
         record.headers().add(CorrelationIdFilter.HEADER_NAME, correlationId.getBytes(StandardCharsets.UTF_8));
@@ -338,7 +475,7 @@ class PaymentFlowBootTests {
                 new UUID(0L, reservationId),
                 Map.of(
                         "reservationId", reservationId,
-                        "customerId", 99L,
+                        "customerId", CUSTOMER_ID,
                         "eventId", 7L,
                         "seatIds", List.of(10L),
                         "amountCents", amountCents));
@@ -352,9 +489,14 @@ class PaymentFlowBootTests {
 
     private EventEnvelope<JsonNode> reservationCreatedEnvelope(
             UUID eventId, long reservationId, int amountCents, String correlationId) {
+        return reservationCreatedEnvelope(eventId, reservationId, amountCents, correlationId, CUSTOMER_ID);
+    }
+
+    private EventEnvelope<JsonNode> reservationCreatedEnvelope(
+            UUID eventId, long reservationId, int amountCents, String correlationId, long customerId) {
         Map<String, Object> payload = Map.of(
                 "reservationId", reservationId,
-                "customerId", 99L,
+                "customerId", customerId,
                 "eventId", 7L,
                 "seatIds", List.of(10L),
                 "amountCents", amountCents);

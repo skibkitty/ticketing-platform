@@ -236,9 +236,11 @@ class RoleAuthorizerTest {
     }
 
     @Test
-    void paymentsNeedATokenLikeEverythingElseUnderTheApi() throws Exception {
+    void aPaymentIsTheCustomersAndNotAnyAuthenticatedCaller() throws Exception {
+        // Off the /api/** catch-all for the reason notifications are: payment-service
+        // scopes the read by identity, and the table says whose data it is (ADR 016).
         assertThat(authorizer.decide("GET", "/api/v1/payments/9"))
-                .isInstanceOf(Access.AnyAuthenticated.class);
+                .isEqualTo(new Access.AnyOfRoles(Set.of(Role.CUSTOMER)));
     }
 
     @Test

@@ -16,19 +16,31 @@ public interface PaymentRepository extends JpaRepository<PaymentEntity, Long> {
      * second ReservationCreated for the same reservation (even with a different eventId)
      * is a deterministic no-op rather than a uniqueness violation (ADR 004). Returns 1
      * when this transaction created the payment, 0 when the reservation was already paid.
+     *
+     * <p>{@code customerId} is the reservation's owner, recorded so the status read can be
+     * scoped by it (ADR 016). A duplicate never rewrites it: {@code DO NOTHING} keeps the
+     * owner the first event recorded.
      */
     @Modifying
     @Query(
             value =
-                    "INSERT INTO payment.payments (reservation_id, amount_cents, status, settled_at) "
-                            + "VALUES (:reservationId, :amountCents, :status, :settledAt) "
+                    "INSERT INTO payment.payments (reservation_id, customer_id, amount_cents, status, settled_at) "
+                            + "VALUES (:reservationId, :customerId, :amountCents, :status, :settledAt) "
                             + "ON CONFLICT (reservation_id) DO NOTHING",
             nativeQuery = true)
     int tryClaim(
             @Param("reservationId") long reservationId,
+            @Param("customerId") long customerId,
             @Param("amountCents") int amountCents,
             @Param("status") String status,
             @Param("settledAt") Instant settledAt);
 
     Optional<PaymentEntity> findByReservationId(@Param("reservationId") long reservationId);
+
+    /**
+     * The status read's lookup. The Customer is part of the query rather than compared
+     * against its result, so a Payment that is not the caller's is never loaded, and an
+     * unowned id and an unissued one are the same absence (ADR 014, ADR 016).
+     */
+    Optional<PaymentEntity> findByReservationIdAndCustomerId(long reservationId, long customerId);
 }
