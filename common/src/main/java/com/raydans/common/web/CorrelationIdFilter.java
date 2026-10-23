@@ -7,6 +7,8 @@ import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.util.UUID;
 import java.util.regex.Pattern;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 import org.springframework.web.filter.OncePerRequestFilter;
 
@@ -39,21 +41,20 @@ import org.springframework.web.filter.OncePerRequestFilter;
  * and the platform's agree because the gateway overwrites the header from the
  * MDC before forwarding (ADR 002).
  *
- * <p>A rejected value is not logged. Writing what a caller sent to a log is how a
- * log becomes an injection target, so a replacement is not recorded as the
- * attacker's own text. It is also not yet recorded at all: this module has no
- * logger, and where a replacement should be *visible* — the operator wanting to
- * know why an integration's id stopped being the one in its own logs — is a
- * question about the logging shape that
- * {@code #14} settles rather than one this filter should answer on its own. Until
- * then the only way to see that a value was replaced is the response header,
- * which is the honest minimum: the caller learns the effective id, and the
- * platform's logs and the caller's agree on it.
+ * <p>A replacement is logged, and the rejected value is not. The operator wanting
+ * to know why an integration's id stopped being the one in its own logs finds one
+ * line under the id the platform minted, saying that it was minted in place of
+ * the caller's. What the caller sent stays out of it: the logs are JSON (#14), so
+ * a newline could no longer forge a line, but a value the platform has just
+ * declined to trust is still not one to write down, and a header a client can make
+ * arbitrarily large is not one to copy into every log the request reaches.
  */
 public class CorrelationIdFilter extends OncePerRequestFilter {
 
     public static final String HEADER_NAME = "X-Correlation-Id";
     public static final String MDC_KEY = "correlationId";
+
+    private static final Logger log = LoggerFactory.getLogger(CorrelationIdFilter.class);
 
     /**
      * The canonical form {@link UUID#randomUUID()} produces: 32 hex digits in five
@@ -87,11 +88,12 @@ public class CorrelationIdFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
             throws ServletException, IOException {
-        String correlationId = request.getHeader(HEADER_NAME);
-        if (!isAcceptable(correlationId)) {
-            correlationId = UUID.randomUUID().toString();
-        }
+        String supplied = request.getHeader(HEADER_NAME);
+        String correlationId = isAcceptable(supplied) ? supplied : UUID.randomUUID().toString();
         MDC.put(MDC_KEY, correlationId);
+        if (supplied != null && !supplied.equals(correlationId)) {
+            log.info("Replaced an inbound {} the platform does not propagate with a generated id", HEADER_NAME);
+        }
         response.setHeader(HEADER_NAME, correlationId);
         try {
             filterChain.doFilter(request, response);

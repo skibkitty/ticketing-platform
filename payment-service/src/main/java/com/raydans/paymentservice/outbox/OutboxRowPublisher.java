@@ -9,6 +9,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.messaging.Message;
@@ -60,6 +61,10 @@ public class OutboxRowPublisher {
             log.debug("Skipping outbox row {} already published or claimed elsewhere", candidate.getId());
             return;
         }
+        // The poll runs for no request, so the row's own id is put back in the MDC: the
+        // publish, and anything Kafka's client logs about it, is part of the request
+        // that staged the row (#14).
+        MDC.put(CorrelationIdFilter.MDC_KEY, row.getCorrelationId());
         try {
             String key = aggregateId(row.getAggregateId()).toString();
             EventEnvelope<JsonNode> envelope = new EventEnvelope<>(
@@ -79,12 +84,16 @@ public class OutboxRowPublisher {
             kafka.send(message).get(10, TimeUnit.SECONDS);
             row.markPublished();
             outbox.save(row);
+            log.info("Published {} {} for aggregate {} to {}",
+                    row.getEventType(), row.getEventId(), row.getAggregateId(), OutboxPublisher.PAYMENT_EVENTS_TOPIC);
         } catch (Exception ex) {
             // The send (or the re-serialize) failed before published_at was written; the
             // transaction commits with no changes, the row lock is released, and the next
             // poll re-claims and re-publishes this row.
             log.warn("Failed to publish outbox event {} for aggregate {}; it stays unpublished and will be retried",
                     row.getId(), row.getAggregateId(), ex);
+        } finally {
+            MDC.remove(CorrelationIdFilter.MDC_KEY);
         }
     }
 

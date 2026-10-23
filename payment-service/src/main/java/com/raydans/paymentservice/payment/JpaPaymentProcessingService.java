@@ -133,6 +133,8 @@ class JpaPaymentProcessingService implements PaymentProcessingService {
                 payment.getStatus() == PaymentStatus.SUCCEEDED ? PAYMENT_SUCCEEDED : PAYMENT_FAILED,
                 serializeOutcome(payment),
                 correlationId));
+        log.info("Payment for reservation {} {}: {} cents for customer {}",
+                created.reservationId(), payment.getStatus(), created.amountCents(), created.customerId());
     }
 
     private ReservationCreatedPayload parseCreated(JsonNode payload) {
