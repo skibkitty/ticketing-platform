@@ -64,6 +64,7 @@ public class OutboxRowPublisher {
         // The poll runs for no request, so the row's own id is put back in the MDC: the
         // publish, and anything Kafka's client logs about it, is part of the request
         // that staged the row (#14).
+        String previous = MDC.get(CorrelationIdFilter.MDC_KEY);
         MDC.put(CorrelationIdFilter.MDC_KEY, row.getCorrelationId());
         try {
             String key = aggregateId(row.getAggregateId()).toString();
@@ -93,7 +94,16 @@ public class OutboxRowPublisher {
             log.warn("Failed to publish outbox event {} for aggregate {}; it stays unpublished and will be retried",
                     row.getId(), row.getAggregateId(), ex);
         } finally {
+            restoreCorrelationId(previous);
+        }
+    }
+
+    /** Puts back whatever id was there before, so a caller's context outlives this. */
+    private static void restoreCorrelationId(String previous) {
+        if (previous == null) {
             MDC.remove(CorrelationIdFilter.MDC_KEY);
+        } else {
+            MDC.put(CorrelationIdFilter.MDC_KEY, previous);
         }
     }
 

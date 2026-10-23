@@ -209,6 +209,23 @@ class HoldExpirerTest {
         assertThat(MDC.get(CorrelationIdFilter.MDC_KEY)).isNull();
     }
 
+    @Test
+    void aSweepGivesBackTheCorrelationIdItFoundRatherThanClearingIt() {
+        ReservationEntity overdue = pendingReservation(
+                42L, List.of(heldSeat(10L, Instant.now().minusSeconds(1))), Instant.now().minusSeconds(1));
+        when(reservations.findByStatusAndExpiresAtBefore(
+                        eq(ReservationStatus.PENDING_PAYMENT), any(Instant.class)))
+                .thenReturn(List.of(overdue));
+        MDC.put(CorrelationIdFilter.MDC_KEY, "the-callers-id");
+        try {
+            expirer.expire();
+
+            assertThat(MDC.get(CorrelationIdFilter.MDC_KEY)).isEqualTo("the-callers-id");
+        } finally {
+            MDC.remove(CorrelationIdFilter.MDC_KEY);
+        }
+    }
+
     private static ListAppender<ILoggingEvent> listen(Class<?> type) {
         ListAppender<ILoggingEvent> appender = new ListAppender<>();
         appender.start();

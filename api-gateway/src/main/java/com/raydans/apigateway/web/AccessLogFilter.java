@@ -27,14 +27,30 @@ public class AccessLogFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
             throws ServletException, IOException {
         long started = System.nanoTime();
+        boolean returned = false;
         try {
             filterChain.doFilter(request, response);
+            returned = true;
         } finally {
             log.info("{} {} -> {} in {} ms",
                     request.getMethod(),
                     request.getRequestURI(),
-                    response.getStatus(),
+                    statusSent(response, returned),
                     TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
         }
+    }
+
+    /**
+     * The status the caller gets. An exception that gets past every handler is
+     * turned into a 500 by the container after this filter has returned, so the
+     * response's own status, still untouched, would be logged as a 200 that was
+     * never sent. Unless the response is already committed: then the status has
+     * gone out and the container can no longer change it.
+     */
+    private static int statusSent(HttpServletResponse response, boolean returned) {
+        if (!returned && !response.isCommitted()) {
+            return HttpServletResponse.SC_INTERNAL_SERVER_ERROR;
+        }
+        return response.getStatus();
     }
 }

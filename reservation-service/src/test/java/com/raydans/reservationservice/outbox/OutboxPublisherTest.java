@@ -195,6 +195,22 @@ class OutboxPublisherTest {
         assertThat(MDC.get(CorrelationIdFilter.MDC_KEY)).isNull();
     }
 
+    @Test
+    void aPublishGivesBackTheCorrelationIdItFoundRatherThanClearingIt() {
+        OutboxEventEntity row = new OutboxEventEntity(
+                UUID.randomUUID(), "Reservation", 42L, "reservation.ReservationCreated",
+                "{\"reservationId\":42}", "cid-123");
+        when(kafka.send(any(Message.class))).thenAnswer(invocation -> completed());
+        MDC.put(CorrelationIdFilter.MDC_KEY, "the-callers-id");
+        try {
+            new OutboxPublisher(outbox, kafka, objectMapper).publish(row);
+
+            assertThat(MDC.get(CorrelationIdFilter.MDC_KEY)).isEqualTo("the-callers-id");
+        } finally {
+            MDC.remove(CorrelationIdFilter.MDC_KEY);
+        }
+    }
+
     private static ListAppender<ILoggingEvent> listen(Class<?> type) {
         ListAppender<ILoggingEvent> appender = new ListAppender<>();
         appender.start();

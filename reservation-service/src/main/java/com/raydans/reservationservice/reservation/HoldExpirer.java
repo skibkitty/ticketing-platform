@@ -42,6 +42,7 @@ public class HoldExpirer {
         // @Version-conflict rollback (a concurrent re-hold or confirmation winning the seat or the
         // reservation) undoes the EXPIRED mutation, the seat releases, and the staged row together.
         List<SeatEntity> releasedSeats = new ArrayList<>();
+        String previous = MDC.get(CorrelationIdFilter.MDC_KEY);
         for (ReservationEntity reservation : overdue) {
             // The sweep acts for no request, so each expiry is given an id of its own: the one
             // its log line, its ReservationExpired and the Notification it causes all carry.
@@ -49,13 +50,22 @@ public class HoldExpirer {
             try {
                 releasedSeats.addAll(expiry.expireIfOverdue(reservation, now));
             } finally {
-                MDC.remove(CorrelationIdFilter.MDC_KEY);
+                restoreCorrelationId(previous);
             }
         }
 
         reservations.saveAll(overdue);
         if (!releasedSeats.isEmpty()) {
             seats.saveAll(releasedSeats);
+        }
+    }
+
+    /** Puts back whatever id was there before, so a caller's context outlives this. */
+    private static void restoreCorrelationId(String previous) {
+        if (previous == null) {
+            MDC.remove(CorrelationIdFilter.MDC_KEY);
+        } else {
+            MDC.put(CorrelationIdFilter.MDC_KEY, previous);
         }
     }
 }
