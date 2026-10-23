@@ -19,6 +19,8 @@ import java.time.Instant;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
@@ -29,6 +31,8 @@ class JpaReservationService implements ReservationService {
 
     static final Duration HOLD_DURATION = Duration.ofMinutes(10);
     private static final String RESERVATION_CREATED = "reservation.ReservationCreated";
+
+    private static final Logger log = LoggerFactory.getLogger(JpaReservationService.class);
 
     private final ReservationRepository reservations;
     private final SeatRepository seats;
@@ -57,6 +61,8 @@ class JpaReservationService implements ReservationService {
             List<SeatEntity> heldSeats = loadAndFlipSeats(request, holdExpiresAt);
             ReservationEntity reservation = saveReservation(customerId, heldSeats, holdExpiresAt);
             saveOutboxEvent(reservation, heldSeats);
+            log.info("Reservation {} placed for customer {}: {} seat(s) held until {}",
+                    reservation.getId(), customerId, heldSeats.size(), holdExpiresAt);
             return toResponse(reservation);
         } catch (ObjectOptimisticLockingFailureException ex) {
             throw new SeatUnavailableException("One or more seats are no longer available");

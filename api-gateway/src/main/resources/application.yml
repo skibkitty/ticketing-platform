@@ -189,6 +189,13 @@ management:
     health:
       show-details: never
 
+# One JSON object per line, with the MDC's correlationId as a top-level field,
+# so one request is followed across every service by grepping its id (#14).
+# Boot's own formatter: no encoder dependency, and stack traces stay inside
+# the object as stack_trace instead of spilling onto lines of their own.
 logging:
+  structured:
+    format:
+      console: logstash
   level:
     com.raydans.apigateway: INFO

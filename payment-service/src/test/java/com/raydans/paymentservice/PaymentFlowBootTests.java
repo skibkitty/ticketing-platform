@@ -1,5 +1,9 @@
 package com.raydans.paymentservice;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -47,6 +51,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
+@ExtendWith(OutputCaptureExtension.class)
 @Testcontainers
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class PaymentFlowBootTests {
@@ -666,5 +671,45 @@ class PaymentFlowBootTests {
             Thread.currentThread().interrupt();
             throw new AssertionError("Interrupted while awaiting async state", ex);
         }
+    }
+
+    @Test
+    void aPaymentsHopsAreLoggedAsJsonUnderTheReservationsCorrelationId(CapturedOutput output) throws Exception {
+        // #14: the id the reservation was placed under, carried across Kafka, on
+        // the line that decides the payment and the one that publishes its outcome.
+        long reservationId = 120L;
+        UUID eventId = UUID.randomUUID();
+        String correlationId = UUID.randomUUID().toString();
+        produceReservationCreated(eventId, reservationId, 12000, correlationId);
+
+        awaitPaymentStatus(reservationId, "SUCCEEDED");
+        outboxPublisher.poll();
+
+        List<String> messages = jsonLinesCarrying(output, correlationId).stream()
+                .map(line -> line.path("message").asText())
+                .toList();
+        assertThat(messages)
+                .anySatisfy(message -> assertThat(message)
+                        .contains("Payment for reservation " + reservationId + " SUCCEEDED"))
+                .anySatisfy(message -> assertThat(message).contains("Published payment.PaymentSucceeded"));
+    }
+
+    /**
+     * The captured console lines that are JSON objects whose top-level
+     * {@code correlationId} is {@code correlationId}: what an operator grepping
+     * for the id would find, read the way a log pipeline would read it.
+     */
+    private static List<JsonNode> jsonLinesCarrying(CapturedOutput output, String correlationId) {
+        ObjectMapper json = new ObjectMapper();
+        return output.getOut().lines()
+                .map(line -> {
+                    try {
+                        return json.readTree(line);
+                    } catch (JsonProcessingException notJson) {
+                        return null;
+                    }
+                })
+                .filter(line -> line != null && correlationId.equals(line.path(CorrelationIdFilter.MDC_KEY).asText()))
+                .toList();
     }
 }

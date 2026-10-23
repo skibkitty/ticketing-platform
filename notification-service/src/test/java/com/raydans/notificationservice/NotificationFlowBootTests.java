@@ -1,5 +1,9 @@
 package com.raydans.notificationservice;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import ch.qos.logback.classic.Logger;
@@ -63,6 +67,7 @@ import org.testcontainers.utility.DockerImageName;
  * {@code reservation.events.v1} in, one Notification row and one simulated send out,
  * and the read surface that shows a Customer what they were told.
  */
+@ExtendWith(OutputCaptureExtension.class)
 @Testcontainers
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @Import(NotificationFlowBootTests.TopicOwner.class)
@@ -933,5 +938,42 @@ class NotificationFlowBootTests {
             Thread.currentThread().interrupt();
             throw new AssertionError("Interrupted while awaiting async state", ex);
         }
+    }
+
+    @Test
+    void theSimulatedSendIsLoggedAsJsonUnderTheReservationsCorrelationId(CapturedOutput output) throws Exception {
+        // #14: the last hop of a request's story, findable by the id it started with.
+        long reservationId = 512L;
+        String correlationId = UUID.randomUUID().toString();
+        produce(CONFIRMED, UUID.randomUUID(), reservationId, 912L, List.of(12L), 15000, correlationId);
+
+        awaitNotification(reservationId);
+
+        assertThat(jsonLinesCarrying(output, correlationId))
+                .anySatisfy(line -> {
+                    assertThat(line.path("level").asText()).isEqualTo("INFO");
+                    assertThat(line.path("message").asText())
+                            .contains("Simulated send")
+                            .contains("reservation " + reservationId);
+                });
+    }
+
+    /**
+     * The captured console lines that are JSON objects whose top-level
+     * {@code correlationId} is {@code correlationId}: what an operator grepping
+     * for the id would find, read the way a log pipeline would read it.
+     */
+    private static List<JsonNode> jsonLinesCarrying(CapturedOutput output, String correlationId) {
+        ObjectMapper json = new ObjectMapper();
+        return output.getOut().lines()
+                .map(line -> {
+                    try {
+                        return json.readTree(line);
+                    } catch (JsonProcessingException notJson) {
+                        return null;
+                    }
+                })
+                .filter(line -> line != null && correlationId.equals(line.path(CorrelationIdFilter.MDC_KEY).asText()))
+                .toList();
     }
 }

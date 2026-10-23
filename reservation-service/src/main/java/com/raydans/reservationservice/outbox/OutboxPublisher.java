@@ -10,6 +10,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.messaging.Message;
@@ -45,6 +46,11 @@ public class OutboxPublisher {
     }
 
     void publish(OutboxEventEntity row) {
+        // The poll runs for no request, so the row's own id is put back in the MDC: the
+        // publish, and anything Kafka's client logs about it, is part of the request
+        // that staged the row (#14).
+        String previous = MDC.get(CorrelationIdFilter.MDC_KEY);
+        MDC.put(CorrelationIdFilter.MDC_KEY, row.getCorrelationId());
         try {
             String key = aggregateId(row.getAggregateId()).toString();
             EventEnvelope<JsonNode> envelope = new EventEnvelope<>(
@@ -64,11 +70,24 @@ public class OutboxPublisher {
             kafka.send(message).get(10, TimeUnit.SECONDS);
             row.markPublished();
             outbox.save(row);
+            log.info("Published {} {} for aggregate {} to {}",
+                    row.getEventType(), row.getEventId(), row.getAggregateId(), RESERVATION_EVENTS_TOPIC);
         } catch (Exception ex) {
             // A failure only leaves this row unpublished; the rest of the claimed batch still
             // publishes and SKIP LOCKED re-claims this row on the next poll.
             log.warn("Failed to publish outbox event {} for aggregate {}; it stays unpublished and will be retried",
                     row.getId(), row.getAggregateId(), ex);
+        } finally {
+            restoreCorrelationId(previous);
+        }
+    }
+
+    /** Puts back whatever id was there before, so a caller's context outlives this. */
+    private static void restoreCorrelationId(String previous) {
+        if (previous == null) {
+            MDC.remove(CorrelationIdFilter.MDC_KEY);
+        } else {
+            MDC.put(CorrelationIdFilter.MDC_KEY, previous);
         }
     }
 

@@ -1,5 +1,12 @@
 package com.raydans.reservationservice.reservation;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import com.raydans.common.web.CorrelationIdFilter;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
@@ -169,5 +176,65 @@ class HoldExpirerTest {
                 "Opening Night", "Metropolitan Opera", Instant.parse("2026-11-01T19:30:00Z"));
         ReflectionTestUtils.setField(e, "id", id);
         return e;
+    }
+
+    @Test
+    void eachSweptExpiryIsLoggedUnderTheIdItsEventCarries() {
+        // The sweep acts for no request, so it mints the id. What matters is that
+        // it is one id per expiry and the same one in the log and on the event,
+        // or the Notification at the far end could not be traced back to here.
+        ReservationEntity first = pendingReservation(
+                42L, List.of(heldSeat(10L, Instant.now().minusSeconds(1))), Instant.now().minusSeconds(1));
+        ReservationEntity second = pendingReservation(
+                43L, List.of(heldSeat(11L, Instant.now().minusSeconds(1))), Instant.now().minusSeconds(1));
+        when(reservations.findByStatusAndExpiresAtBefore(
+                        eq(ReservationStatus.PENDING_PAYMENT), any(Instant.class)))
+                .thenReturn(List.of(first, second));
+        ListAppender<ILoggingEvent> logged = listen(ReservationExpiryService.class);
+        try {
+            expirer.expire();
+        } finally {
+            stopListening(ReservationExpiryService.class, logged);
+        }
+
+        ArgumentCaptor<OutboxEventEntity> staged = ArgumentCaptor.forClass(OutboxEventEntity.class);
+        verify(outbox, org.mockito.Mockito.times(2)).save(staged.capture());
+        List<String> stagedIds = staged.getAllValues().stream().map(OutboxEventEntity::getCorrelationId).toList();
+        List<String> loggedIds = logged.list.stream()
+                .map(event -> event.getMDCPropertyMap().get(CorrelationIdFilter.MDC_KEY))
+                .toList();
+
+        assertThat(loggedIds).containsExactlyElementsOf(stagedIds).doesNotHaveDuplicates().doesNotContainNull();
+        assertThat(logged.list).allSatisfy(event -> assertThat(event.getLevel()).isEqualTo(Level.INFO));
+        assertThat(MDC.get(CorrelationIdFilter.MDC_KEY)).isNull();
+    }
+
+    @Test
+    void aSweepGivesBackTheCorrelationIdItFoundRatherThanClearingIt() {
+        ReservationEntity overdue = pendingReservation(
+                42L, List.of(heldSeat(10L, Instant.now().minusSeconds(1))), Instant.now().minusSeconds(1));
+        when(reservations.findByStatusAndExpiresAtBefore(
+                        eq(ReservationStatus.PENDING_PAYMENT), any(Instant.class)))
+                .thenReturn(List.of(overdue));
+        MDC.put(CorrelationIdFilter.MDC_KEY, "the-callers-id");
+        try {
+            expirer.expire();
+
+            assertThat(MDC.get(CorrelationIdFilter.MDC_KEY)).isEqualTo("the-callers-id");
+        } finally {
+            MDC.remove(CorrelationIdFilter.MDC_KEY);
+        }
+    }
+
+    private static ListAppender<ILoggingEvent> listen(Class<?> type) {
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        ((Logger) LoggerFactory.getLogger(type)).addAppender(appender);
+        return appender;
+    }
+
+    private static void stopListening(Class<?> type, ListAppender<ILoggingEvent> appender) {
+        ((Logger) LoggerFactory.getLogger(type)).detachAppender(appender);
+        appender.stop();
     }
 }

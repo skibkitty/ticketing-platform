@@ -5,6 +5,7 @@ import com.raydans.apigateway.auth.JwtAuthenticationFilter;
 import com.raydans.apigateway.auth.JwtService;
 import com.raydans.apigateway.auth.RoleAuthorizer;
 import com.raydans.apigateway.resilience.GatewayResilienceFilter;
+import com.raydans.apigateway.web.AccessLogFilter;
 import com.raydans.apigateway.web.ErrorResponseWriter;
 import com.raydans.common.web.CorrelationIdFilter;
 import io.github.resilience4j.bulkhead.BulkheadRegistry;
@@ -38,6 +39,18 @@ public class GatewayWebConfig {
         FilterRegistrationBean<CorrelationIdFilter> registration =
                 new FilterRegistrationBean<>(new CorrelationIdFilter());
         registration.setOrder(Ordered.HIGHEST_PRECEDENCE);
+        return registration;
+    }
+
+    /**
+     * Inside the correlation id, so the line carries it, and outside everything
+     * else, so a request auth or resilience turns away is logged with the status
+     * it was turned away with.
+     */
+    @Bean
+    public FilterRegistrationBean<AccessLogFilter> accessLogFilter() {
+        FilterRegistrationBean<AccessLogFilter> registration = new FilterRegistrationBean<>(new AccessLogFilter());
+        registration.setOrder(Ordered.HIGHEST_PRECEDENCE + 5);
         return registration;
     }
 

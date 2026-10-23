@@ -1,5 +1,12 @@
 package com.raydans.reservationservice;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
+import com.raydans.common.web.CorrelationIdFilter;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -49,6 +56,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
+@ExtendWith(OutputCaptureExtension.class)
 @Testcontainers
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class ReservationFlowBootTests {
@@ -932,4 +940,44 @@ class ReservationFlowBootTests {
     }
 
     private record CreatedEvent(long eventId, List<Long> seatIds) {}
+
+    @Test
+    void aReservationsHopsAreLoggedAsJsonUnderItsCorrelationId(CapturedOutput output) {
+        // #14: one id, greppable from the request that placed the hold to the event
+        // that left for Kafka, on a line a log pipeline can parse rather than scrape.
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Balcony", "row", "J", "seatNumber", 14, "priceCents", 9000)));
+        ResponseEntity<Map> reservation = postReservation(created.eventId(), List.of(created.seatIds().get(0)), 99L);
+        assertThat(reservation.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        Number reservationId = (Number) reservation.getBody().get("id");
+        String correlationId = reservation.getHeaders().getFirst(CORRELATION_HEADER);
+
+        outboxPublisher.poll();
+
+        List<String> messages = jsonLinesCarrying(output, correlationId).stream()
+                .map(line -> line.path("message").asText())
+                .toList();
+        assertThat(messages)
+                .anySatisfy(message -> assertThat(message).contains("Reservation " + reservationId + " placed"))
+                .anySatisfy(message -> assertThat(message).contains("Published reservation.ReservationCreated"));
+    }
+
+    /**
+     * The captured console lines that are JSON objects whose top-level
+     * {@code correlationId} is {@code correlationId}: what an operator grepping
+     * for the id would find, read the way a log pipeline would read it.
+     */
+    private static List<JsonNode> jsonLinesCarrying(CapturedOutput output, String correlationId) {
+        ObjectMapper json = new ObjectMapper();
+        return output.getOut().lines()
+                .map(line -> {
+                    try {
+                        return json.readTree(line);
+                    } catch (JsonProcessingException notJson) {
+                        return null;
+                    }
+                })
+                .filter(line -> line != null && correlationId.equals(line.path(CorrelationIdFilter.MDC_KEY).asText()))
+                .toList();
+    }
 }

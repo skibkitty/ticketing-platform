@@ -3,11 +3,15 @@ package com.raydans.common.web;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import jakarta.servlet.FilterChain;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 import org.springframework.mock.web.MockFilterChain;
 import org.springframework.mock.web.MockHttpServletRequest;
@@ -237,5 +241,48 @@ class CorrelationIdFilterTest {
         String second = secondResponse.getHeader(CorrelationIdFilter.HEADER_NAME);
 
         assertThat(first).isNotEqualTo(second);
+    }
+
+    @Test
+    void aReplacementIsLoggedUnderTheMintedIdAndWithoutTheCallersValue() throws Exception {
+        request.addHeader(CorrelationIdFilter.HEADER_NAME, "abc\nINFO admin authenticated");
+
+        List<ILoggingEvent> logged = loggedWhile(() -> filter.doFilter(request, response, new MockFilterChain()));
+
+        String minted = response.getHeader(CorrelationIdFilter.HEADER_NAME);
+        assertThat(logged).singleElement().satisfies(event -> {
+            assertThat(event.getMDCPropertyMap()).containsEntry(CorrelationIdFilter.MDC_KEY, minted);
+            assertThat(event.getFormattedMessage()).startsWith("Replaced").doesNotContain("admin authenticated");
+        });
+    }
+
+    @Test
+    void anAcceptedOrAbsentIdIsNotLogged() throws Exception {
+        // Only a replacement is news. A request with no id, or with one the
+        // platform propagates, is every request, and a line for each would bury
+        // the ones that are.
+        request.addHeader(CorrelationIdFilter.HEADER_NAME, A_CALLERS_UUID);
+
+        assertThat(loggedWhile(() -> filter.doFilter(request, response, new MockFilterChain()))).isEmpty();
+        assertThat(loggedWhile(() -> filter.doFilter(
+                new MockHttpServletRequest(), new MockHttpServletResponse(), new MockFilterChain()))).isEmpty();
+    }
+
+    private interface FilterCall {
+        void run() throws Exception;
+    }
+
+    private static List<ILoggingEvent> loggedWhile(FilterCall call) throws Exception {
+        Logger logger = (Logger) LoggerFactory.getLogger(CorrelationIdFilter.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            call.run();
+            return List.copyOf(appender.list);
+        } finally {
+            logger.detachAppender(appender);
+            appender.stop();
+        }
     }
 }

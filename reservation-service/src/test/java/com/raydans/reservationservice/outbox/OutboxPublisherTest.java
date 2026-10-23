@@ -1,5 +1,12 @@
 package com.raydans.reservationservice.outbox;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import com.raydans.common.web.CorrelationIdFilter;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
@@ -142,5 +149,77 @@ class OutboxPublisherTest {
         CompletableFuture<Object> f = new CompletableFuture<>();
         f.complete(null);
         return f;
+    }
+
+    @Test
+    void aPublishIsLoggedUnderTheCorrelationIdOfTheRequestThatStagedIt() {
+        // The poll runs on a scheduler thread with nothing in the MDC; without the
+        // row's id put back, the Kafka hop would be the one line of a request's
+        // story that grepping its id does not find.
+        OutboxEventEntity row = new OutboxEventEntity(
+                UUID.randomUUID(), "Reservation", 42L, "reservation.ReservationCreated",
+                "{\"reservationId\":42}", "cid-123");
+        when(kafka.send(any(Message.class))).thenAnswer(invocation -> completed());
+        ListAppender<ILoggingEvent> logged = listen(OutboxPublisher.class);
+        try {
+            new OutboxPublisher(outbox, kafka, objectMapper).publish(row);
+        } finally {
+            stopListening(OutboxPublisher.class, logged);
+        }
+
+        assertThat(logged.list).singleElement().satisfies(event -> {
+            assertThat(event.getLevel()).isEqualTo(Level.INFO);
+            assertThat(event.getFormattedMessage()).contains("reservation.ReservationCreated").contains("42");
+            assertThat(event.getMDCPropertyMap()).containsEntry(CorrelationIdFilter.MDC_KEY, "cid-123");
+        });
+        assertThat(MDC.get(CorrelationIdFilter.MDC_KEY)).as("the next row is not this one").isNull();
+    }
+
+    @Test
+    void aFailedPublishIsLoggedUnderTheRowsCorrelationIdToo() {
+        OutboxEventEntity row = new OutboxEventEntity(
+                UUID.randomUUID(), "Reservation", 42L, "reservation.ReservationCreated",
+                "{\"reservationId\":42}", "cid-123");
+        when(kafka.send(any(Message.class))).thenThrow(new RuntimeException("broker down"));
+        ListAppender<ILoggingEvent> logged = listen(OutboxPublisher.class);
+        try {
+            new OutboxPublisher(outbox, kafka, objectMapper).publish(row);
+        } finally {
+            stopListening(OutboxPublisher.class, logged);
+        }
+
+        assertThat(logged.list).singleElement().satisfies(event -> {
+            assertThat(event.getLevel()).isEqualTo(Level.WARN);
+            assertThat(event.getMDCPropertyMap()).containsEntry(CorrelationIdFilter.MDC_KEY, "cid-123");
+        });
+        assertThat(MDC.get(CorrelationIdFilter.MDC_KEY)).isNull();
+    }
+
+    @Test
+    void aPublishGivesBackTheCorrelationIdItFoundRatherThanClearingIt() {
+        OutboxEventEntity row = new OutboxEventEntity(
+                UUID.randomUUID(), "Reservation", 42L, "reservation.ReservationCreated",
+                "{\"reservationId\":42}", "cid-123");
+        when(kafka.send(any(Message.class))).thenAnswer(invocation -> completed());
+        MDC.put(CorrelationIdFilter.MDC_KEY, "the-callers-id");
+        try {
+            new OutboxPublisher(outbox, kafka, objectMapper).publish(row);
+
+            assertThat(MDC.get(CorrelationIdFilter.MDC_KEY)).isEqualTo("the-callers-id");
+        } finally {
+            MDC.remove(CorrelationIdFilter.MDC_KEY);
+        }
+    }
+
+    private static ListAppender<ILoggingEvent> listen(Class<?> type) {
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        ((Logger) LoggerFactory.getLogger(type)).addAppender(appender);
+        return appender;
+    }
+
+    private static void stopListening(Class<?> type, ListAppender<ILoggingEvent> appender) {
+        ((Logger) LoggerFactory.getLogger(type)).detachAppender(appender);
+        appender.stop();
     }
 }

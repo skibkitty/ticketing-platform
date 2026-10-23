@@ -286,6 +286,35 @@ browser's handshake arrives before it has a token, so it is answered without one
 operator's on every method rather than on all of them but `OPTIONS`, and a
 client cannot make the authorization answer depend on the verb it chose.
 
+## Following one request through the logs
+
+*As built (#14).* Every service writes one JSON object per line (Spring
+Boot's built-in `logstash` format), and the request's correlation id is a
+top-level `correlationId` field on every line written on its behalf. The id is
+decided once, at the gateway, and travels as `X-Correlation-Id` on the
+proxied request, as a header and an envelope field on each Kafka event, and in
+the outbox row between the two, so the same id is in the MDC wherever work for
+that request is done:
+
+| Service | The lines a reservation leaves |
+| --- | --- |
+| api-gateway | `POST /api/v1/reservations -> 201 in … ms` |
+| reservation-service | `Reservation … placed`, `Published reservation.ReservationCreated …` |
+| payment-service | `Payment for reservation … SUCCEEDED`, `Published payment.PaymentSucceeded …` |
+| reservation-service | `Reservation … confirmed …`, `Published reservation.ReservationConfirmed …` |
+| notification-service | `Simulated send: RESERVATION_CONFIRMED notification …` |
+
+```bash
+docker compose logs --no-log-prefix | grep '"correlationId":"<id>"' | jq -c '{logger_name, message}'
+```
+
+The id comes back to the caller on the response, so `<id>` is whatever
+`X-Correlation-Id` said. Work no request asked for gets an id of its own: each
+hold the sweep expires is minted one, and the `ReservationExpired` event and
+the Notification it causes carry that id. A caller-supplied id the platform will
+not propagate is replaced, and the replacement is logged under the new id
+without the rejected value.
+
 ## What's intentionally out of scope
 
 - **A real payment gateway integration** — `payment-service` simulates an
