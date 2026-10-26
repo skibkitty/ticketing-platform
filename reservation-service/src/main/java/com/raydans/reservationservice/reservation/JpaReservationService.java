@@ -22,6 +22,7 @@ import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -29,7 +30,6 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 class JpaReservationService implements ReservationService {
 
-    static final Duration HOLD_DURATION = Duration.ofMinutes(10);
     private static final String RESERVATION_CREATED = "reservation.ReservationCreated";
 
     private static final Logger log = LoggerFactory.getLogger(JpaReservationService.class);
@@ -39,24 +39,27 @@ class JpaReservationService implements ReservationService {
     private final OutboxEventRepository outbox;
     private final ObjectMapper objectMapper;
     private final ReservationExpiryService expiry;
+    private final Duration holdDuration;
 
     JpaReservationService(
             ReservationRepository reservations,
             SeatRepository seats,
             OutboxEventRepository outbox,
             ObjectMapper objectMapper,
-            ReservationExpiryService expiry) {
+            ReservationExpiryService expiry,
+            @Value("${app.hold.duration}") Duration holdDuration) {
         this.reservations = reservations;
         this.seats = seats;
         this.outbox = outbox;
         this.objectMapper = objectMapper;
         this.expiry = expiry;
+        this.holdDuration = holdDuration;
     }
 
     @Override
     @Transactional
     public ReservationResponse create(ReservationRequest request, long customerId) {
-        Instant holdExpiresAt = Instant.now().plus(HOLD_DURATION);
+        Instant holdExpiresAt = Instant.now().plus(holdDuration);
         try {
             List<SeatEntity> heldSeats = loadAndFlipSeats(request, holdExpiresAt);
             ReservationEntity reservation = saveReservation(customerId, heldSeats, holdExpiresAt);

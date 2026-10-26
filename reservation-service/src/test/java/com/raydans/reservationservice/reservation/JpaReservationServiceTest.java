@@ -19,6 +19,7 @@ import com.raydans.reservationservice.web.ReservationRequest;
 import com.raydans.reservationservice.web.ReservationResponse;
 import com.raydans.reservationservice.web.SeatStatus;
 import com.raydans.reservationservice.web.SeatUnavailableException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -35,6 +36,8 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 @ExtendWith(MockitoExtension.class)
 class JpaReservationServiceTest {
+
+    static final Duration HOLD_DURATION = Duration.ofSeconds(30);
 
     static final String CORRELATION_ID = "test-correlation-id";
 
@@ -60,7 +63,8 @@ class JpaReservationServiceTest {
                 seats,
                 outbox,
                 objectMapper,
-                new ReservationExpiryService(outbox, objectMapper));
+                new ReservationExpiryService(outbox, objectMapper),
+                HOLD_DURATION);
         MDC.put("correlationId", CORRELATION_ID);
     }
 
@@ -108,6 +112,25 @@ class JpaReservationServiceTest {
                 .contains("\"eventId\":7")
                 .contains("\"seatIds\":[10,11]")
                 .contains("\"amountCents\":27000");
+    }
+
+    @Test
+    void createHoldsSeatsForTheConfiguredHoldDuration() {
+        SeatEntity seat1 = seat(10L, "Orchestra", "A", 1, 15000);
+        when(seats.findAllById(List.of(10L))).thenReturn(List.of(seat1));
+        when(reservations.saveAndFlush(any(ReservationEntity.class)))
+                .thenAnswer(invocation -> {
+                    ReservationEntity r = invocation.getArgument(0);
+                    ReflectionTestUtils.setField(r, "id", 42L);
+                    return r;
+                });
+
+        Instant before = Instant.now();
+        ReservationResponse response = service.create(new ReservationRequest(7L, List.of(10L)), 99L);
+        Instant after = Instant.now();
+
+        assertThat(response.expiresAt()).isBetween(before.plus(HOLD_DURATION), after.plus(HOLD_DURATION));
+        assertThat(seat1.getHoldExpiresAt()).isEqualTo(response.expiresAt());
     }
 
     @Test

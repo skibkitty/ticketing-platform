@@ -101,6 +101,10 @@ services:
       DB_USER: platform
       DB_PASSWORD: platform
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # How long a Hold lasts. Ten minutes unless the shell or .env says
+      # otherwise; `HOLD_DURATION=PT30S docker compose up` lets a demo watch one
+      # lapse to EXPIRED.
+      HOLD_DURATION: ${HOLD_DURATION:-PT10M}
     depends_on:
       postgres:
         condition: service_healthy
@@ -119,8 +123,9 @@ services:
       # Deterministic failure rule for reproducible demos rather than pure
       # randomness: reservations at or above this amount simulate a declined
       # payment, so the compensating (seat-release) path is easy to trigger
-      # on purpose when demoing.
-      PAYMENT_DECLINE_THRESHOLD_CENTS: 50000
+      # on purpose when demoing. The shell or .env can move it, as with
+      # HOLD_DURATION; PAYMENT_DECLINE_THRESHOLD_CENTS=0 declines every payment.
+      PAYMENT_DECLINE_THRESHOLD_CENTS: ${PAYMENT_DECLINE_THRESHOLD_CENTS:-50000}
     depends_on:
       postgres:
         condition: service_healthy
