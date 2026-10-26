@@ -45,3 +45,10 @@ This is **at-least-once publication, not exactly-once**. Moving to exactly
 -once would require Kafka transactions / an idempotent producer plus a
 commit that atomically covers both the Kafka send and the `published_at`
 write — not implemented here.
+**Gotchas (from the T14 walkthrough):** the Kafka producer is created lazily,
+by the first publish after a service starts, so the first event a fresh stack
+publishes takes a few seconds longer than the rest (about six from
+`Reservation … placed` to `Published …` on the first reservation, against the
+one-second poll). Its startup lines are logged under the correlation id of the
+outbox row that triggered it, so the first request traced through a new stack
+shows Kafka client configuration among its own lines.

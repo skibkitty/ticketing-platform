@@ -113,8 +113,6 @@ login limiter and the properties it does not have.
 
 ## Example requests
 
-*(To be filled in with real, tested commands as part of T14 (#15).)*
-
 The demo logins are `customer`, `organizer` and `admin`, with the passwords you
 set in `.env`. A token's subject is the caller's own id — `42` for `customer` —
 and for a caller that is a Customer that id is its `Customer.id`, which is the
@@ -149,56 +147,173 @@ payment behind one of the caller's own reservations. Someone else's reservation
 id gets the same 404 as one that was never issued. It is Customer-only at the
 gateway. See `docs/adr/016-payment-read-ownership.md`.
 
+### The walkthrough
+
+Every command below was run against `docker compose up --build`, in order, on an
+empty database; the ids in the expected output are what a fresh stack hands out,
+so on a stack that has seen earlier runs use the ids your own responses return.
+To watch a Hold lapse without waiting ten minutes, start the stack with a short
+one:
+
 ```bash
-# 1. Log in
-curl -X POST localhost:8080/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"organizer","password":"<your DEMO_ORGANIZER_PASSWORD>"}'
-
-# 2. Create an event with seats (ORGANIZER/ADMIN token)
-curl -X POST localhost:8080/api/v1/events \
-  -H "Authorization: Bearer <organizer-token>" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Radiohead","venue":"The Fillmore","eventDate":"2026-11-01T20:00:00Z","seats":[{"section":"A","row":1,"seatNumber":1,"priceCents":15000},{"section":"A","row":1,"seatNumber":2,"priceCents":15000}]}'
-
-# 3. Browse available seats
-curl localhost:8080/api/v1/events/1/seats?status=AVAILABLE \
-  -H "Authorization: Bearer <token>"
-
-# 4. Reserve seats (CUSTOMER token) — low amount, expect it to
-#    succeed through the saga
-curl -X POST localhost:8080/api/v1/reservations \
-  -H "Authorization: Bearer <customer-token>" \
-  -H "Content-Type: application/json" \
-  -d '{"eventId":1,"seatIds":[1,2]}'
-
-# 5. Watch it get confirmed a few seconds later. This read is scoped by
-#    the customer id the gateway derived from the token, so a Customer
-#    gets 404 for anyone's reservation but their own. No header is
-#    needed — the gateway supplies it — and asking for someone else's
-#    with ?customerId= is refused with 400.
-curl localhost:8080/api/v1/reservations/1 \
-  -H "Authorization: Bearer <customer-token>"
-
-# 5b. List the caller's own reservations
-curl localhost:8080/api/v1/reservations \
-  -H "Authorization: Bearer <customer-token>"
-
-# 6. Check the payment behind your reservation (yours only; anyone else's
-#    is 404). While payment-service is failing, the circuit breaker on this
-#    route answers 503 at once instead of proxying
-curl localhost:8080/api/v1/payments/1 \
-  -H "Authorization: Bearer <customer-token>"
-
-# 7. Check the simulated notification — the inbox is the caller's own,
-#    scoped by the id the gateway verified, not by anything in the URL
-curl localhost:8080/api/v1/notifications \
-  -H "Authorization: Bearer <customer-token>"
-
-# 8. To see the compensating path: reserve enough seats that the total
-#    exceeds PAYMENT_DECLINE_THRESHOLD_CENTS, then re-check step 3 — the
-#    seats should be back to AVAILABLE and the reservation CANCELLED.
+HOLD_DURATION=PT30S docker compose up --build -d
 ```
+
+The knobs the walkthrough leans on, both read by `docker-compose.yml` from the
+shell or `.env`:
+
+| Variable | Default | What it decides |
+| --- | --- | --- |
+| `HOLD_DURATION` | `PT10M` | how long a Reservation holds its Seats before the sweep may expire it |
+| `PAYMENT_DECLINE_THRESHOLD_CENTS` | `50000` | the simulated payment declines any Reservation whose total is **this or more**, and succeeds below it |
+
+#### Log in
+
+```bash
+set -a; . ./.env; set +a   # the demo passwords, into this shell only
+
+ORG=$(curl -s -X POST localhost:8080/auth/login -H "Content-Type: application/json" \
+  -d "{\"username\":\"organizer\",\"password\":\"$DEMO_ORGANIZER_PASSWORD\"}" \
+  | sed -E 's/.*"token":"([^"]+)".*/\1/')
+CUS=$(curl -s -X POST localhost:8080/auth/login -H "Content-Type: application/json" \
+  -d "{\"username\":\"customer\",\"password\":\"$DEMO_CUSTOMER_PASSWORD\"}" \
+  | sed -E 's/.*"token":"([^"]+)".*/\1/')
+```
+
+A login answers `{"token":"…","roles":["ORGANIZER"],"expiresAt":"…"}`; the
+token is good for an hour (`JWT_TTL`).
+
+#### Create an Event with Seats (Organizer)
+
+Two cheap Seats for the success path, two dear ones for the decline, and one for
+the expiry.
+
+```bash
+curl -s -X POST localhost:8080/api/v1/events \
+  -H "Authorization: Bearer $ORG" -H "Content-Type: application/json" \
+  -d '{"name":"Radiohead","venue":"The Fillmore","eventDate":"2026-11-01T20:00:00Z","seats":[
+        {"section":"A","row":"1","seatNumber":1,"priceCents":15000},
+        {"section":"A","row":"1","seatNumber":2,"priceCents":15000},
+        {"section":"B","row":"1","seatNumber":1,"priceCents":30000},
+        {"section":"B","row":"1","seatNumber":2,"priceCents":30000},
+        {"section":"C","row":"1","seatNumber":1,"priceCents":5000}]}'
+# 201 {"eventId":1,"seatIds":[1,2,3,4,5]}
+
+curl -s "localhost:8080/api/v1/events/1/seats?status=AVAILABLE" -H "Authorization: Bearer $CUS"
+# 200 — all five Seats, each "status":"AVAILABLE"
+```
+
+#### 1. Payment succeeds: CONFIRMED, Seats SOLD
+
+Seats 1 and 2 total 30000 cents, under the decline threshold.
+
+```bash
+curl -s -X POST localhost:8080/api/v1/reservations \
+  -H "Authorization: Bearer $CUS" -H "Content-Type: application/json" \
+  -d '{"eventId":1,"seatIds":[1,2]}'
+# 201 {"id":1,"customerId":42,"status":"PENDING_PAYMENT","amountCents":30000,
+#      "expiresAt":"…",  "seats":[… "status":"HELD" …]}
+
+# A few seconds later, once the saga has run:
+curl -s localhost:8080/api/v1/reservations/1 -H "Authorization: Bearer $CUS"
+# 200 {"id":1,"status":"CONFIRMED", … "seats":[… "status":"SOLD" …]}
+
+curl -s localhost:8080/api/v1/payments/1 -H "Authorization: Bearer $CUS"
+# 200 {"reservationId":1,"amountCents":30000,"status":"SUCCEEDED","settledAt":"…"}
+
+curl -s localhost:8080/api/v1/notifications -H "Authorization: Bearer $CUS"
+# 200 {"items":[{"reservationId":1,"type":"RESERVATION_CONFIRMED",
+#      "message":"Your reservation 1 is confirmed. Seats 1, 2 are yours.", …}],"nextCursor":null}
+```
+
+#### 2. Payment declined: CANCELLED, Seats released
+
+Seats 3 and 4 total 60000 cents, over the threshold, so the payment fails and
+reservation-service compensates.
+
+```bash
+curl -s -X POST localhost:8080/api/v1/reservations \
+  -H "Authorization: Bearer $CUS" -H "Content-Type: application/json" \
+  -d '{"eventId":1,"seatIds":[3,4]}'
+# 201 {"id":2,"status":"PENDING_PAYMENT","amountCents":60000, …}
+
+# A few seconds later:
+curl -s localhost:8080/api/v1/reservations/2 -H "Authorization: Bearer $CUS"
+# 200 {"id":2,"status":"CANCELLED", … "seats":[… "status":"AVAILABLE" …]}
+
+curl -s localhost:8080/api/v1/payments/2 -H "Authorization: Bearer $CUS"
+# 200 {"reservationId":2,"amountCents":60000,"status":"FAILED", …}
+
+curl -s "localhost:8080/api/v1/events/1/seats?status=AVAILABLE" -H "Authorization: Bearer $CUS"
+# 200 — Seats 3, 4 and 5: the declined pair is back on sale
+
+curl -s localhost:8080/api/v1/notifications -H "Authorization: Bearer $CUS"
+# newest item: "type":"RESERVATION_CANCELLED",
+#   "message":"Your reservation 2 was cancelled because the payment was declined. Seats 3, 4 have been released."
+```
+
+Every payment settles within seconds, so the only way to make one fail on demand
+is the threshold: reserve at least `PAYMENT_DECLINE_THRESHOLD_CENTS` worth of
+Seats, or start the stack with a lower one (`PAYMENT_DECLINE_THRESHOLD_CENTS=0`
+declines every payment).
+
+#### 3. The Hold lapses: EXPIRED, Seats released
+
+A Hold only lapses if no payment outcome arrives first, and the simulated payment
+always answers within seconds. Stopping payment-service stands in for a customer
+who never completes checkout:
+
+```bash
+docker compose stop payment-service
+
+curl -s -X POST localhost:8080/api/v1/reservations \
+  -H "Authorization: Bearer $CUS" -H "Content-Type: application/json" \
+  -d '{"eventId":1,"seatIds":[5]}'
+# 201 {"id":3,"status":"PENDING_PAYMENT","expiresAt":"<now + HOLD_DURATION>", …}
+
+# Once expiresAt has passed (about 30 s with HOLD_DURATION=PT30S), the sweep
+# releases the Seat on its own:
+curl -s "localhost:8080/api/v1/events/1/seats?status=AVAILABLE" -H "Authorization: Bearer $CUS"
+# 200 — Seats 3, 4 and 5
+
+curl -s localhost:8080/api/v1/reservations/3 -H "Authorization: Bearer $CUS"
+# 200 {"id":3,"status":"EXPIRED", … "seats":[… "status":"AVAILABLE" …]}
+
+curl -s localhost:8080/api/v1/notifications -H "Authorization: Bearer $CUS"
+# newest item: "type":"RESERVATION_EXPIRED",
+#   "message":"Your reservation 3 expired before payment completed. Seat 5 has been released."
+```
+
+Bring payment-service back and it settles the abandoned Reservation late. The
+outcome is ignored ([ADR 007](docs/adr/007-payment-outcome-guard.md)): the
+Reservation stays `EXPIRED`, its Seat stays on sale, and no second notification
+is sent, even though the payment itself reads `SUCCEEDED`.
+
+```bash
+docker compose start payment-service
+
+# Once it has caught up (around half a minute while it starts):
+curl -s localhost:8080/api/v1/payments/3 -H "Authorization: Bearer $CUS"
+# 200 {"reservationId":3,"amountCents":5000,"status":"SUCCEEDED", …}
+
+curl -s localhost:8080/api/v1/reservations/3 -H "Authorization: Bearer $CUS"
+# 200 {"id":3,"status":"EXPIRED", …}
+```
+
+#### Following one request through the logs
+
+Every response carries the `X-Correlation-Id` the gateway decided on, and every
+service logs it as `correlationId` on each line written for that request, Kafka
+hops included. Add `-D -` to a reservation's `POST` to see its id, then:
+
+```bash
+docker compose logs --no-log-prefix api-gateway reservation-service payment-service notification-service \
+  | grep '"correlationId":"<that id>"'
+```
+
+For the reservation in flow 1 that is the gateway's `POST /api/v1/reservations -> 201`,
+`Reservation 1 placed`, `Payment for reservation 1 SUCCEEDED`, `Reservation 1
+confirmed`, and notification-service's `Simulated send: RESERVATION_CONFIRMED`.
 
 ## Testing
 
@@ -213,4 +328,7 @@ curl localhost:8080/api/v1/notifications \
   boundary. It reads the compose files and, where Docker is installed, asks
   `docker compose config` for the model the containers would start from.
 
-Run everything: `mvn verify` from the repo root.
+Run everything: `mvn verify` from the repo root. It needs Docker for the
+Testcontainers suites, and it starts its own Postgres and Kafka, so stop the
+compose stack first on a small machine: the two together outgrow a few-GB WSL
+VM, and Docker stops answering rather than failing cleanly.

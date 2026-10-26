@@ -29,7 +29,7 @@ deliberately not split into a separate "catalog service," see below.
 Customer -> POST /api/v1/reservations {eventId, seatIds}
   -> reservation-service, ONE local transaction:
        - optimistically lock + flip each requested Seat: AVAILABLE -> HELD
-         (holdExpiresAt = now + 10 min)
+         (holdExpiresAt = now + HOLD_DURATION, 10 min by default)
        - any seat already taken -> whole transaction rolls back, 409 to the
          customer, no partial holds
        - create Reservation (PENDING_PAYMENT)
@@ -37,7 +37,8 @@ Customer -> POST /api/v1/reservations {eventId, seatIds}
   -> OutboxPublisher sends it to reservation.events.v1
 
   -> payment-service consumes ReservationCreated
-       - simulates a payment attempt
+       - simulates a payment attempt: declined when amountCents is at or
+         over PAYMENT_DECLINE_THRESHOLD_CENTS (50000), succeeded otherwise
        - writes PaymentSucceeded or PaymentFailed to payment.events.v1
 
   -> reservation-service consumes payment.events.v1
@@ -114,6 +115,16 @@ the purchase. A scheduled poll (`@Scheduled`, checking for
 satisfies a minutes-scale deadline — a Kafka delayed-message pattern or a
 Redis key-expiry-notification setup would add real infrastructure for a
 guarantee (sub-second precision) this use case doesn't need.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HOLD_DURATION` | `PT10M` | how long a Reservation holds its Seats |
+| `HOLD_EXPIRE_INTERVAL_MS` | `1000` | how often the sweep looks for lapsed Holds |
+
+The ten minutes is the design; `HOLD_DURATION` exists so a demo can watch a Hold
+lapse (`HOLD_DURATION=PT30S docker compose up`) without waiting for one. A Hold
+is released within about a second of `expiresAt`, by the sweep or by the first
+read that finds it.
 
 ## Why rate limiting + a bulkhead specifically on `POST /api/v1/reservations`, and nowhere else
 
@@ -251,6 +262,27 @@ the limit learns nothing about whether theirs was right
 ([#43](https://github.com/skibkitty/ticketing-platform/issues/43), ADR 015). It
 is deliberately a different mechanism from the reservation rate limiting above,
 which is scoped to a route this one is not.
+
+## Routes
+
+*As built.* Everything goes through the gateway on `:8080`; the role column is
+`RoleAuthorizer`'s table, and every route but the login needs a valid token.
+
+| Route | Service | Who |
+| --- | --- | --- |
+| `POST /auth/login` | gateway | anyone (failed attempts throttled, ADR 015) |
+| `POST /api/v1/events` | reservation-service | `ORGANIZER`, `ADMIN` |
+| `GET /api/v1/events`, `/{eventId}`, `/{eventId}/seats[?status=]` | reservation-service | any authenticated caller |
+| `POST /api/v1/reservations`, `GET /api/v1/reservations[/{id}]` | reservation-service | `CUSTOMER`, own Reservations only (ADR 014) |
+| `GET /api/v1/payments/{reservationId}` | payment-service | `CUSTOMER`, own Reservations only (ADR 016) |
+| `GET /api/v1/notifications` | notification-service | `CUSTOMER`, own inbox (ADR 011) |
+| `GET /api/v1/admin/customers/{id}/notifications` | notification-service | `ADMIN` |
+| `/actuator/**` | gateway | `ADMIN` |
+
+Two Kafka topics carry the saga, both JSON `EventEnvelope`s:
+`reservation.events.v1` (reservation-service's `ReservationCreated`,
+`ReservationConfirmed`, `ReservationCancelled`, `ReservationExpired`) and
+`payment.events.v1` (payment-service's `PaymentSucceeded`, `PaymentFailed`).
 
 ## Why JWT validation and CORS live only at the gateway
 
