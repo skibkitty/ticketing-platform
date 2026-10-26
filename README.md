@@ -157,6 +157,7 @@ one:
 
 ```bash
 HOLD_DURATION=PT30S docker compose up --build -d
+until curl -s -o /dev/null localhost:8080/auth/login; do sleep 2; done   # the gateway is listening
 ```
 
 The knobs the walkthrough leans on, both read by `docker-compose.yml` from the
@@ -178,10 +179,19 @@ ORG=$(curl -s -X POST localhost:8080/auth/login -H "Content-Type: application/js
 CUS=$(curl -s -X POST localhost:8080/auth/login -H "Content-Type: application/json" \
   -d "{\"username\":\"customer\",\"password\":\"$DEMO_CUSTOMER_PASSWORD\"}" \
   | sed -E 's/.*"token":"([^"]+)".*/\1/')
+
+# The gateway is up before the services behind it, and a hop to one that is
+# still starting answers 500. Wait until all three answer:
+until curl -s -o /dev/null -w '%{http_code}' localhost:8080/api/v1/events -H "Authorization: Bearer $ORG" | grep -q 200 \
+   && curl -s -o /dev/null -w '%{http_code}' localhost:8080/api/v1/payments/999999 -H "Authorization: Bearer $CUS" | grep -q 404 \
+   && curl -s -o /dev/null -w '%{http_code}' localhost:8080/api/v1/notifications -H "Authorization: Bearer $CUS" | grep -q 200
+do sleep 2; done
 ```
 
 A login answers `{"token":"…","roles":["ORGANIZER"],"expiresAt":"…"}`; the
-token is good for an hour (`JWT_TTL`).
+token is good for an hour (`JWT_TTL`). On a cold start the services take a
+minute or more to come up after the gateway; the loop above is what tells you
+they have.
 
 #### Create an Event with Seats (Organizer)
 
@@ -224,6 +234,7 @@ curl -s localhost:8080/api/v1/payments/1 -H "Authorization: Bearer $CUS"
 curl -s localhost:8080/api/v1/notifications -H "Authorization: Bearer $CUS"
 # 200 {"items":[{"reservationId":1,"type":"RESERVATION_CONFIRMED",
 #      "message":"Your reservation 1 is confirmed. Seats 1, 2 are yours.", …}],"nextCursor":null}
+# (the Seats are listed in no particular order)
 ```
 
 #### 2. Payment declined: CANCELLED, Seats released
