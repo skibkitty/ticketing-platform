@@ -709,6 +709,17 @@ class GatewayProxyBootTests {
     }
 
     @Test
+    void aProxiedResponseCarriesTheCorrelationIdOnce() throws Exception {
+        // The gateway sets the header itself, and the service behind it answers
+        // with the same one; copying both would hand the caller the id twice.
+        mvc.perform(get("/api/v1/events")
+                        .header(HttpHeaders.AUTHORIZATION, bearerFor(CUSTOMER_ID, Role.CUSTOMER))
+                        .header("X-Correlation-Id", A_CALLERS_CORRELATION_ID))
+                .andExpect(status().isOk())
+                .andExpect(header().stringValues("X-Correlation-Id", A_CALLERS_CORRELATION_ID));
+    }
+
+    @Test
     void aTraceIdTheCallerSuppliesIsForwardedToo() throws Exception {
         // The other id shape the platform propagates: a 32-character hexadecimal
         // trace id, which is what a caller holding a W3C traceparent or an
@@ -1176,6 +1187,12 @@ class GatewayProxyBootTests {
         record(exchange);
         byte[] body = "{\"eventId\": 1, \"name\": \"probed by the gateway\"}".getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().add("Content-Type", "application/json");
+        // Every service behind the gateway answers with the id it was handed, as
+        // CorrelationIdFilter does, so the stand-in does too.
+        String correlationId = exchange.getRequestHeaders().getFirst("X-Correlation-Id");
+        if (correlationId != null) {
+            exchange.getResponseHeaders().add("X-Correlation-Id", correlationId);
+        }
         exchange.sendResponseHeaders(200, body.length);
         try (OutputStream out = exchange.getResponseBody()) {
             out.write(body);

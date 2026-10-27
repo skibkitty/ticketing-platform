@@ -68,6 +68,18 @@
                     <groupId>org.springframework.boot</groupId>
                     <artifactId>spring-boot-maven-plugin</artifactId>
                     <version>${spring-boot.version}</version>
+                    <!-- Bound by hand: this pom imports Boot's BOM rather than
+                         inheriting spring-boot-starter-parent, which is what binds
+                         repackage for you. Without it `package` builds a plain jar
+                         with no Main-Class, and every image fails at `java -jar`. -->
+                    <executions>
+                        <execution>
+                            <id>repackage</id>
+                            <goals>
+                                <goal>repackage</goal>
+                            </goals>
+                        </execution>
+                    </executions>
                 </plugin>
             </plugins>
         </pluginManagement>

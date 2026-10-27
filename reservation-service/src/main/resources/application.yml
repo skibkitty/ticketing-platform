@@ -31,6 +31,10 @@ app:
   outbox:
     poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:1000}
   hold:
+    # How long a Reservation holds its Seats before the sweep may expire it. Ten
+    # minutes is the design (docs/architecture.md); a demo shortens it to watch a
+    # Hold lapse without waiting for one.
+    duration: ${HOLD_DURATION:PT10M}
     expire-interval-ms: ${HOLD_EXPIRE_INTERVAL_MS:1000}
   kafka:
     topics:
