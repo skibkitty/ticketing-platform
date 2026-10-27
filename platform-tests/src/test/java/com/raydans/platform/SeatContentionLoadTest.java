@@ -98,13 +98,21 @@ class SeatContentionLoadTest {
         Race race = runRace(customer, event.id(), requests);
         print(race.report(event));
 
-        // A 429 means the limiter, not the database, decided who lost: the run did
-        // not measure what it is for, whatever else it shows.
-        assertThat(race.count(429))
-                .as("buyers refused by the gateway's limiter (429); raise RESERVATION_RATE_LIMIT,"
-                        + " RESERVATION_BULKHEAD_MAX_CONCURRENT and GATEWAY_MAX_CONNECTIONS_PER_SERVICE"
-                        + " for the run, as docs/load-test.md shows")
-                .isZero();
+        // Every buyer gets one of the two answers the race has: a Reservation, or
+        // "taken". Anything else means the run did not measure what it is for. A
+        // 429 is the limiter, not the database, deciding who lost; a 5xx or no
+        // response at all is a buyer whose outcome nobody knows, which a clean
+        // end state would otherwise paper over.
+        assertThat(race.attempts()).as("buyers who got an answer, or a failure").hasSize(BUYERS);
+        assertThat(race.unexpected())
+                .as("buyers answered neither 201 nor 409 (status -1 is no response). %s%s",
+                        race.unexpectedSummary(),
+                        race.count(429) > 0
+                                ? " A 429 is the gateway's limiter: raise RESERVATION_RATE_LIMIT,"
+                                        + " RESERVATION_BULKHEAD_MAX_CONCURRENT and"
+                                        + " GATEWAY_MAX_CONNECTIONS_PER_SERVICE for the run, as docs/load-test.md shows."
+                                : "")
+                .isEmpty();
         assertThat(race.count(201)).as("buyers who got a Reservation").isPositive();
 
         List<JsonNode> reservations = awaitSettled(customer, event.id());
@@ -220,6 +228,22 @@ class SeatContentionLoadTest {
             return attempts.stream().filter(a -> a.status() == status).count();
         }
 
+        /** Attempts answered with anything but 201 or 409, including no response (-1). */
+        List<Attempt> unexpected() {
+            return attempts.stream().filter(a -> a.status() != 201 && a.status() != 409).toList();
+        }
+
+        /** Counts by status, and up to three bodies, for the assertion message. */
+        String unexpectedSummary() {
+            Map<Integer, Long> byStatus = new TreeMap<>(unexpected().stream()
+                    .collect(Collectors.groupingBy(Attempt::status, Collectors.counting())));
+            StringBuilder out = new StringBuilder("By status: ").append(byStatus).append('.');
+            unexpected().stream()
+                    .limit(3)
+                    .forEach(a -> out.append(" e.g. ").append(a.status()).append(": ").append(a.body()).append('.'));
+            return out.toString();
+        }
+
         Set<Long> createdReservationIds() {
             Set<Long> ids = new HashSet<>();
             for (Attempt attempt : attempts) {
@@ -330,12 +354,23 @@ class SeatContentionLoadTest {
                     onThisEvent.add(reservation);
                 }
             });
-            boolean pending = onThisEvent.stream().anyMatch(r -> "PENDING_PAYMENT".equals(r.path("status").asText()));
-            if (!pending || Instant.now().isAfter(deadline)) {
-                Map<String, Long> byStatus = onThisEvent.stream()
-                        .collect(Collectors.groupingBy(r -> r.path("status").asText(), TreeMap::new, Collectors.counting()));
-                print("  settled      " + byStatus + (pending ? " (gave up waiting for PENDING_PAYMENT)" : "") + '\n');
+            List<Long> pending = onThisEvent.stream()
+                    .filter(r -> "PENDING_PAYMENT".equals(r.path("status").asText()))
+                    .map(r -> r.path("id").asLong())
+                    .toList();
+            Map<String, Long> byStatus = onThisEvent.stream()
+                    .collect(Collectors.groupingBy(r -> r.path("status").asText(), TreeMap::new, Collectors.counting()));
+            if (pending.isEmpty()) {
+                print("  settled      " + byStatus + '\n');
                 return onThisEvent;
+            }
+            if (Instant.now().isAfter(deadline)) {
+                // Checking an end state the saga has not reached would verify a
+                // moment, not the outcome, so this is a failure rather than a
+                // partial result.
+                throw new AssertionError("The saga did not settle within " + SAGA_SETTLES_WITHIN
+                        + ": Reservations " + pending + " are still PENDING_PAYMENT (all on Event " + eventId
+                        + ": " + byStatus + "). Is payment-service running and consuming reservation.events.v1?");
             }
             Thread.sleep(1000);
         }
@@ -472,20 +507,33 @@ class SeatContentionLoadTest {
             List<String> command = List.of("docker", "compose", "exec", "-T", "postgres",
                     "psql", "-U", "platform", "-d", "platform", "-tA", "-v", "ON_ERROR_STOP=1",
                     "-c", DOUBLE_HELD.formatted(eventId));
-            Process process = new ProcessBuilder(command)
-                    .directory(ComposeStack.repositoryRoot().toFile())
-                    .redirectErrorStream(true)
-                    .start();
-            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            if (!process.waitFor(60, TimeUnit.SECONDS)) {
-                process.destroyForcibly();
-                throw new IllegalStateException("psql in the postgres container did not finish in 60s");
+            // Output goes to a file rather than a pipe this thread reads, so nothing
+            // here blocks on a stream: a command that hangs with its output open
+            // still reaches the timeout below, which then bounds the whole call.
+            Path output = Files.createTempFile("load-test-psql", ".txt");
+            try {
+                Process process = new ProcessBuilder(command)
+                        .directory(ComposeStack.repositoryRoot().toFile())
+                        .redirectErrorStream(true)
+                        .redirectOutput(output.toFile())
+                        .start();
+                if (!process.waitFor(60, TimeUnit.SECONDS)) {
+                    // docker compose runs the docker CLI under it; stop the whole tree.
+                    process.descendants().forEach(ProcessHandle::destroyForcibly);
+                    process.destroyForcibly();
+                    throw new IllegalStateException("`" + String.join(" ", command.subList(0, 5))
+                            + " psql` did not finish in 60s and was killed. Output so far:\n"
+                            + Files.readString(output, StandardCharsets.UTF_8));
+                }
+                String text = Files.readString(output, StandardCharsets.UTF_8);
+                if (process.exitValue() != 0) {
+                    throw new IllegalStateException("`" + String.join(" ", command.subList(0, 5)) + " psql` failed with "
+                            + process.exitValue() + ":\n" + text);
+                }
+                return text.lines().filter(line -> !line.isBlank()).toList();
+            } finally {
+                Files.deleteIfExists(output);
             }
-            if (process.exitValue() != 0) {
-                throw new IllegalStateException("`" + String.join(" ", command.subList(0, 5)) + " psql` failed with "
-                        + process.exitValue() + ":\n" + output);
-            }
-            return output.lines().filter(line -> !line.isBlank()).toList();
         }
     }
 }

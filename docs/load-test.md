@@ -27,11 +27,16 @@ against a compose stack that is already up:
    Reservation is all or nothing.
 4. Counts every status separately: `201`, `409`, `429`, any other status, and
    "no response" for a connection that failed.
-5. Waits for the saga to settle (no Reservation still `PENDING_PAYMENT`), then
-   checks:
-   - **No 429.** A 429 means the limiter, not the database, decided who lost,
-     and the run didn't measure the race. The test fails and says which
-     variables to raise.
+5. Checks that **every buyer got a 201 or a 409**, and nothing else. The test
+   fails on anything else and gives the counts by status and example bodies:
+   - A 429 means the limiter, not the database, decided who lost, so the run
+     didn't measure the race. The message says which variables to raise.
+   - A 5xx or no response means a buyer whose outcome nobody knows, which a
+     clean end state would otherwise hide.
+6. Waits up to 2 minutes for the saga to settle (no Reservation still
+   `PENDING_PAYMENT`). If it doesn't settle, the test fails and names the
+   Reservations still pending, because checking the state before the saga
+   finishes would verify a moment, not the outcome. Then it checks:
    - **Every 201 is a real Reservation, and nothing else made one.** The
      Event's Reservations are exactly the ids the 201s returned, so no 409 (or
      anything else) left a Reservation or a held Seat behind.
@@ -51,7 +56,16 @@ fairness between Customers or any per-Customer limit.
 
 ## Results
 
-All runs on 2026-10-26, against the same stack, each on a fresh Event:
+Each failure path was also run on purpose, once, to show it fires:
+
+| Set-up | Result |
+| --- | --- |
+| Gateway at its default limits | failed: `By status: {429=100}`, with example bodies |
+| payment-service stopped | failed: `The saga did not settle within PT2M: Reservations [22, 17, 15] are still PENDING_PAYMENT` |
+| `@Version` removed from `SeatEntity` | failed: 13 Reservations for 5 Seats, one Seat in 7 of them |
+
+Runs before the stricter status and settle checks were added, all on
+2026-10-26, against the same stack, each on a fresh Event:
 
 | Run | Code | 201 | 409 | 429 | Other | Oversells | Throughput | p50 | p95 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -64,6 +78,13 @@ All runs on 2026-10-26, against the same stack, each on a fresh Event:
 
 Run 4's timings weren't recorded. Run 5 was the check that the test can fail;
 its timings aren't comparable.
+
+With the stricter checks, on a fresh stack:
+
+| Run | Code | 201 | 409 | Other | Oversells | Throughput | p50 | p95 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 (first after start) | as built | 4 | 196 | 0 | **0** | 78 req/s | 1917 ms | 2414 ms |
+| 2 (after the `@Version` check, reverted) | as built | 4 | 196 | 0 | **0** | 128 req/s | 1172 ms | 1379 ms |
 
 Winners vary between 3 and 5 because a pair can win, and a winning pair takes
 two of the five Seats. Every run ended with every Seat sold exactly once or not
