@@ -338,6 +338,10 @@ confirmed`, and notification-service's `Simulated send: RESERVATION_CONFIRMED`.
   internal service publishes a port, which is what makes the gateway the trust
   boundary. It reads the compose files and, where Docker is installed, asks
   `docker compose config` for the model the containers would start from.
+- The seat-contention load test, in `platform-tests` but run only under
+  `-Pload-test`: 200 concurrent buyers race for 5 Seats through the gateway,
+  and no Seat is ever sold twice. Results, hardware and the rerun command are
+  in [`docs/load-test.md`](docs/load-test.md).
 
 Run everything: `mvn verify` from the repo root. It needs Docker for the
 Testcontainers suites, and it starts its own Postgres and Kafka, so stop the
