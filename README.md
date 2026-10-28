@@ -1,33 +1,90 @@
 # Ticketing Platform
 
-An event ticketing & reservation system: seat holds with optimistic
-concurrency control, a payment saga with automatic compensation on failure, and
-a single authenticated gateway in front of it, with a rate limit and a bulkhead
-on the flash-sale reservation route and a circuit breaker on the payment-status
-route.
+An event ticketing backend: customers hold Seats, pay, and the hold either
+confirms or, if payment fails or never arrives, releases on its own. The two
+hard parts are **concurrency**, since many buyers can grab the same Seat at once,
+and **consistency across services**, since "hold the Seat" and "charge the
+card" cannot be one database transaction. The first is handled by optimistic
+locking on `Seat`, the second by a choreographed saga over Kafka with a
+compensating step. A single authenticated gateway sits in front, with a rate
+limit and a bulkhead on the flash-sale route.
 
-**Start here:**
-1. [`docs/architecture.md`](docs/architecture.md) — what this is and why
-   every non-obvious decision was made the way it was.
-2. [`docs/adr/`](docs/adr) — short decision records for the main
-   choices; fill these in as you build.
-3. The [GitHub issue plan](https://github.com/skibkitty/ticketing-platform/issues/1)
-   — the spec and its child tickets are the single source of truth for what
-   gets built and in what order.
+Java 21, Spring Boot 3.4, Spring Cloud Gateway MVC, Kafka (KRaft), Postgres,
+Resilience4j, Testcontainers, Docker Compose.
 
-## For opencode / whoever implements this
+```mermaid
+flowchart LR
+    client([Client]) -->|"HTTP :8080, JWT"| gw["api-gateway<br/>auth, roles, CORS<br/>rate limit + bulkhead on POST /reservations<br/>circuit breaker on /payments"]
+    gw --> res["reservation-service<br/>Events, Seats, Reservations<br/>hold-expiry sweep"]
+    gw --> pay["payment-service<br/>simulated Payments"]
+    gw --> noti["notification-service<br/>Notifications"]
+    res -->|outbox| rt[["reservation.events.v1"]]
+    rt -->|ReservationCreated| pay
+    rt -->|confirmed / cancelled / expired| noti
+    pay -->|outbox| pt[["payment.events.v1"]]
+    pt -->|succeeded / failed| res
+    res --- dbr[("Postgres<br/>reservation schema")]
+    pay --- dbp[("Postgres<br/>payment schema")]
+    noti --- dbn[("Postgres<br/>notification schema")]
+```
 
-Scaffolding already exists: parent + module `pom.xml`s, `docker-compose.yml`,
-per-module `Dockerfile`s, package directories, CI workflow. Verify `mvn -q
-compile` before writing feature code, then work the plan from the GitHub
-issues (spec #1 + its child tickets) one ticket at a time, blockers-first —
-payment-service's consumer can't be meaningfully tested until
-reservation-service actually publishes `ReservationCreated`.
+Only the gateway publishes a port. The services trust the identity it forwards,
+reach each other only through Kafka, and each owns one schema in a shared
+Postgres instance.
 
-Double check before building: the Spring Cloud release-train version in the
-root `pom.xml` against the Spring Boot 3.4.5 compatibility matrix
-(https://spring.io/projects/spring-cloud#overview), and the `apache/kafka`
-Docker image tag in `docker-compose.yml`.
+## What it demonstrates
+
+- **No oversells under contention.** 200 concurrent buyers raced for 5 Seats
+  through the gateway, and no Seat was ever sold or held twice, checked
+  through the API and in the database. With the `@Version` lock removed, the
+  same test sold the 5 Seats to 13 Reservations and failed.
+  [`docs/load-test.md`](docs/load-test.md) has the results, the hardware and the
+  rerun command.
+- **The saga, end to end, with every outcome.** A tested walkthrough
+  ([below](#the-walkthrough)) drives each branch against the running stack:
+
+  | Payment | Reservation | Seats |
+  | --- | --- | --- |
+  | succeeds | `CONFIRMED` | `SOLD` |
+  | declined | `CANCELLED` (compensated) | released |
+  | never arrives | `EXPIRED` by the sweep | released |
+
+  It also shows a late payment after expiry being ignored safely
+  ([ADR 007](docs/adr/007-payment-outcome-guard.md)), and one request followed
+  across all four services by its correlation id.
+- **At-least-once delivery made safe.** Transactional outboxes on the
+  producing services, idempotent consumers keyed on event id, and, in the two
+  services that drive the saga, poison messages retried and then
+  dead-lettered ([ADR 008](docs/adr/008-poison-message-handling.md)).
+- **A trust boundary the build checks.** `platform-tests` asks
+  `docker compose config` what each container would publish, and fails if
+  anything but the gateway is reachable from the host.
+
+## Design decisions
+
+[`docs/architecture.md`](docs/architecture.md) tells the whole story: the
+saga step by step, the routes and roles, and the reasons behind each
+non-obvious choice. [`CONTEXT.md`](CONTEXT.md) is the domain glossary. Each
+main decision has a short record in [`docs/adr/`](docs/adr):
+
+| ADR | Decision |
+| --- | --- |
+| [001](docs/adr/001-gateway-mvc.md) | Spring Cloud Gateway MVC instead of the reactive gateway |
+| [002](docs/adr/002-gateway-trust-boundary.md) | JWT validated only at the gateway; identity comes from the token |
+| [003](docs/adr/003-outbox-pattern.md) | Transactional outbox instead of writing to the database and Kafka separately |
+| [004](docs/adr/004-idempotent-consumers.md) | Idempotent Kafka consumers via a `processed_events` table |
+| [005](docs/adr/005-schema-per-service.md) | One schema per service in one Postgres instance |
+| [006](docs/adr/006-optimistic-locking-seats.md) | Optimistic locking on Seat instead of pessimistic row locks |
+| [007](docs/adr/007-payment-outcome-guard.md) | Ignore a payment outcome for a Reservation that is no longer pending |
+| [008](docs/adr/008-poison-message-handling.md) | Poison messages: retry, then dead-letter |
+| [009](docs/adr/009-processed-events-retention.md) | `processed_events` retention, and why there is no cleanup job yet |
+| [010](docs/adr/010-notification-service-no-outbox.md) | notification-service has no outbox |
+| [011](docs/adr/011-notification-read-ownership.md) | Notifications are read by the caller's identity; operators get a separate route |
+| [012](docs/adr/012-gateway-is-the-only-published-surface.md) | The gateway is the only published HTTP surface |
+| [013](docs/adr/013-infrastructure-ports-follow-the-gateway-rule.md) | Postgres, Kafka and the Kafka UI follow the same no-published-port rule |
+| [014](docs/adr/014-reservation-read-ownership.md) | Reservations are read by the caller's identity |
+| [015](docs/adr/015-gateway-login-abuse-prevention.md) | Failed logins counted per account and per address |
+| [016](docs/adr/016-payment-read-ownership.md) | Payments are read by the caller's identity |
 
 ## Running it
 
@@ -347,3 +404,55 @@ Run everything: `mvn verify` from the repo root. It needs Docker for the
 Testcontainers suites, and it starts its own Postgres and Kafka, so stop the
 compose stack first on a small machine: the two together outgrow a few-GB WSL
 VM, and Docker stops answering rather than failing cleanly.
+
+## Known gaps
+
+- **A payment that settles after its Hold expired is not refunded.** The
+  Reservation side is safe ([ADR 007](docs/adr/007-payment-outcome-guard.md)):
+  the late outcome is ignored and the Seats stay on sale. But the Payment stays
+  `SUCCEEDED`, so with a real charge the customer would pay and get no ticket.
+  The walkthrough's flow 3 shows it. The fix is a compensating refund on the
+  payment side, tracked in
+  [#52](https://github.com/skibkitty/ticketing-platform/issues/52).
+- **Payments are simulated.** payment-service declines by a price threshold
+  instead of calling a provider. The saga's mechanics are the point, not a
+  PCI-scope integration.
+- **`processed_events` grows forever.** There is no retention job yet
+  ([ADR 009](docs/adr/009-processed-events-retention.md)).
+- **Static JWT signing key.** One shared secret, no rotation, no JWKS.
+- **Log-based tracing only.** Correlation ids follow a request across every
+  service and Kafka hop, but there is no OpenTelemetry collector or UI.
+- **No waiting room.** The rate limit protects the reservation route, but there
+  is no queue in front of it for an on-sale moment.
+
+[`docs/architecture.md`](docs/architecture.md#whats-intentionally-out-of-scope)
+lists what was left out on purpose and why.
+
+## How this was built
+
+I wrote the specification
+([#1](https://github.com/skibkitty/ticketing-platform/issues/1)), split it
+into vertical-slice tickets on GitHub Issues, and made the design decisions
+recorded in the ADRs. AI coding agents implemented most of the tickets:
+opencode early on, then Claude Code. Each ticket was done on its own branch, as
+a pull request that closes it. I reviewed every pull request, and merging was
+always my decision, never an agent's. Commits and pull requests from the later
+tickets credit Claude as co-author.
+
+The rules the agents worked under are part of the repository:
+
+- [`AGENTS.md`](AGENTS.md): the entry point an agent reads first.
+- [`docs/agents/`](docs/agents): how tickets are written and triaged
+  (`needs-triage` → `ready-for-agent`), where the domain language lives, and the
+  git workflow.
+- [`.githooks/pre-push`](.githooks/pre-push): refuses any direct push to `main`.
+  `main` is also protected on GitHub: a pull request with green CI is required.
+- A merge is a GitHub API call, which no git hook can see, so "merging is the
+  human's decision" is a written rule rather than a technical control.
+  [`docs/agents/git-workflow.md`](docs/agents/git-workflow.md) says why.
+
+The walkthrough under "Example requests" was run by hand against the real
+stack before it was written down. It found two bugs the test suites had
+missed: service images that could not start, and a response header sent twice.
+Both were fixed first. The load test was also run against the real stack, and
+was itself checked by removing the lock it tests.
