@@ -678,6 +678,48 @@ class JpaNotificationServiceTest {
         assertThat(simulatedSends()).isEmpty();
     }
 
+    @Test
+    void aRefundMissingItsReservationIsRejectedSoItIsDeadLetteredNotLost() {
+        EventEnvelope<JsonNode> envelope = refundEnvelope(UUID.randomUUID(), 0L, 980L);
+        ((com.fasterxml.jackson.databind.node.ObjectNode) envelope.payload()).remove("reservationId");
+
+        assertThatThrownBy(() -> service.record(envelope))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("reservationId");
+        verify(processedEvents, never()).tryClaim(any());
+    }
+
+    @Test
+    void aRefundNamingANonPositiveOwnerIsAProducerBugAndIsRejected() {
+        // Absent is a pre-V4 Payment and is skipped; present but impossible is a bug, and
+        // skipping it would hide one.
+        assertThatThrownBy(() -> service.record(refundEnvelope(UUID.randomUUID(), 816L, 0L)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("customerId");
+        verify(processedEvents, never()).tryClaim(any());
+    }
+
+    @Test
+    void anUnreadableRefundPayloadIsRejected() {
+        EventEnvelope<JsonNode> envelope = refundEnvelope(UUID.randomUUID(), 817L, 980L);
+        ((com.fasterxml.jackson.databind.node.ObjectNode) envelope.payload()).put("reservationId", "not-a-number");
+
+        assertThatThrownBy(() -> service.record(envelope)).isInstanceOf(IllegalStateException.class);
+        verify(processedEvents, never()).tryClaim(any());
+    }
+
+    @Test
+    void aRefundWithNoPayloadIsRejected() {
+        EventEnvelope<JsonNode> refund = refundEnvelope(UUID.randomUUID(), 818L, 980L);
+        EventEnvelope<JsonNode> envelope = new EventEnvelope<>(
+                refund.eventId(), refund.eventType(), refund.occurredAt(), refund.correlationId(),
+                refund.aggregateId(), null);
+
+        assertThatThrownBy(() -> service.record(envelope))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("payload");
+    }
+
     private EventEnvelope<JsonNode> refundEnvelope(UUID eventId, long reservationId, Long customerId) {
         Map<String, Object> fields = new LinkedHashMap<>();
         fields.put("paymentId", 7L);

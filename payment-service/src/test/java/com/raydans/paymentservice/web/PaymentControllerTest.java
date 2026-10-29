@@ -65,7 +65,32 @@ class PaymentControllerTest {
                 .andExpect(jsonPath("$.amountCents").value(44000))
                 .andExpect(jsonPath("$.status").value("SUCCEEDED"))
                 .andExpect(jsonPath("$.createdAt").value("2026-10-21T10:15:30Z"))
-                .andExpect(jsonPath("$.settledAt").value("2026-10-21T10:15:31Z"));
+                .andExpect(jsonPath("$.settledAt").value("2026-10-21T10:15:31Z"))
+                // Present and null, not absent: a client written before #52 sees the same
+                // fields, and one written after can tell "not refunded" from "unknown".
+                .andExpect(jsonPath("$.refundedAt").isEmpty());
+    }
+
+    @Test
+    void aRefundedPaymentReadsRefundedWithWhenItWasRefunded() throws Exception {
+        when(payments.get(103L, 99L)).thenReturn(new PaymentResponse(
+                9L,
+                103L,
+                44000,
+                PaymentStatus.REFUNDED,
+                Instant.parse("2026-10-21T10:15:30Z"),
+                Instant.parse("2026-10-21T10:15:31Z"),
+                Instant.parse("2026-10-21T10:16:02Z")));
+
+        mvc.perform(get("/api/v1/payments/103").header(PaymentController.CUSTOMER_HEADER, "99"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(9))
+                .andExpect(jsonPath("$.reservationId").value(103))
+                .andExpect(jsonPath("$.amountCents").value(44000))
+                .andExpect(jsonPath("$.status").value("REFUNDED"))
+                .andExpect(jsonPath("$.createdAt").value("2026-10-21T10:15:30Z"))
+                .andExpect(jsonPath("$.settledAt").value("2026-10-21T10:15:31Z"))
+                .andExpect(jsonPath("$.refundedAt").value("2026-10-21T10:16:02Z"));
     }
 
     @Test

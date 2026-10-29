@@ -407,6 +407,11 @@ confirmed`, and notification-service's `Simulated send: RESERVATION_CONFIRMED`.
   `-Pload-test`: 200 concurrent buyers race for 5 Seats through the gateway,
   and no Seat is ever sold twice. Results, hardware and the rerun command are
   in [`docs/load-test.md`](docs/load-test.md).
+- The late-settlement refund stack test, also in `platform-tests`, run only
+  under `-Pstack-test`, against a stack with a short Hold. It makes a payment
+  late by stopping payment-service, checks the one refund and one notice end
+  to end across the real topics, then replays every consumer group from offset
+  zero and checks again. See [`docs/stack-test.md`](docs/stack-test.md).
 
 Run everything: `mvn verify` from the repo root. It needs Docker for the
 Testcontainers suites, and it starts its own Postgres and Kafka, so stop the
@@ -415,13 +420,6 @@ VM, and Docker stops answering rather than failing cleanly.
 
 ## Known gaps
 
-- **A payment that settles after its Hold expired is not refunded.** The
-  Reservation side is safe ([ADR 007](docs/adr/007-payment-outcome-guard.md)):
-  the late outcome is ignored and the Seats stay on sale. But the Payment stays
-  `SUCCEEDED`, so with a real charge the customer would pay and get no ticket.
-  The walkthrough's flow 3 shows it. The fix is a compensating refund on the
-  payment side, tracked in
-  [#52](https://github.com/skibkitty/ticketing-platform/issues/52).
 - **Payments are simulated.** payment-service declines by a price threshold
   instead of calling a provider. The saga's mechanics are the point, not a
   PCI-scope integration.

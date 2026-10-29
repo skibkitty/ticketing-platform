@@ -37,15 +37,15 @@ is refunded (see **Refund**).
 
 **Payment**:
 The money movement for a Reservation — one per Reservation. States:
-`PENDING`, `SUCCEEDED`, `FAILED`, `REFUNDED`. `REFUNDED` is reached only
-from `SUCCEEDED`, and is terminal.
+`PENDING`, `SUCCEEDED`, `FAILED`, `REFUNDED` (see **Refund**).
 
 **Refund**:
 The compensating step that returns a late-settled Payment's money: a
 Payment that succeeded after its Reservation had already `EXPIRED` moves
-to `REFUNDED`. A state of the one Payment, not a record of its own.
-Triggered by reservation-service's `LatePaymentRejected`, never by a late
-`PaymentFailed` (nothing was charged).
+from `SUCCEEDED` to the terminal `REFUNDED`. A state of the one Payment,
+not a record of its own. Triggered by reservation-service's
+`LatePaymentRejected`, never by a late `PaymentFailed` (nothing was
+charged).
 
 **Customer**:
 The person a Reservation belongs to; referenced by identifier only, no

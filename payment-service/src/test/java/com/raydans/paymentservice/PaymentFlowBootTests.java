@@ -306,6 +306,8 @@ class PaymentFlowBootTests {
         assertThat(body.get("status").asText()).isEqualTo("FAILED");
         assertThat(body.get("createdAt").isNull()).isFalse();
         assertThat(body.get("settledAt").isNull()).isFalse();
+        assertThat(body.has("refundedAt")).as("refundedAt is always in the response").isTrue();
+        assertThat(body.get("refundedAt").isNull()).as("and null for a Payment never refunded").isTrue();
     }
 
     @Test
@@ -351,6 +353,69 @@ class PaymentFlowBootTests {
         assertThat(payload.get("amountCents").asInt()).isEqualTo(44000);
         assertThat(payload.get("status").asText()).isEqualTo("REFUNDED");
         assertThat(payload.get("refundedAt").isNull()).isFalse();
+    }
+
+    @Test
+    void concurrentLatePaymentRejectedEventsRefundOnceAndOnlyTheWinnerPublishes() throws Exception {
+        long reservationId = 603L;
+        produceReservationCreated(UUID.randomUUID(), reservationId, 44000, "corr-refund-603");
+        awaitPaymentStatus(reservationId, "SUCCEEDED");
+
+        // Four distinct rejections (as if reservation-service had ignored four differently
+        // ID'd successes) and two copies of one of them, all racing through the same bean:
+        // the consumer is single-threaded, so the real race lives here, as in the
+        // ReservationCreated race above.
+        UUID duplicated = UUID.randomUUID();
+        List<EventEnvelope<JsonNode>> envelopes = new ArrayList<>(List.of(
+                latePaymentRejectedEnvelope(duplicated, reservationId),
+                latePaymentRejectedEnvelope(duplicated, reservationId)));
+        for (int i = 0; i < 4; i++) {
+            envelopes.add(latePaymentRejectedEnvelope(UUID.randomUUID(), reservationId));
+        }
+        runConcurrently(envelopes.stream()
+                .<Runnable>map(envelope -> () -> paymentProcessing.process(envelope, "corr-refund-603"))
+                .toList());
+
+        assertSinglePayment(reservationId, "REFUNDED", 44000);
+        assertThat(refundedOutboxRows(reservationId))
+                .as("only the transaction that won SUCCEEDED -> REFUNDED writes PaymentRefunded")
+                .isEqualTo(1);
+        assertProcessedOnce(duplicated);
+        java.sql.Timestamp refundedAt = jdbc.queryForObject(
+                "SELECT refunded_at FROM payment.payments WHERE reservation_id = ?", java.sql.Timestamp.class,
+                reservationId);
+        assertThat(refundedAt).isNotNull();
+
+        // A consumer restart that replays the topic from an old offset delivers every one of
+        // them again. The event claims and the status guard make all of it a no-op.
+        for (EventEnvelope<JsonNode> envelope : envelopes) {
+            paymentProcessing.process(envelope, "corr-refund-603-replay");
+        }
+        assertSinglePayment(reservationId, "REFUNDED", 44000);
+        assertThat(refundedOutboxRows(reservationId)).as("a replay publishes nothing new").isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                        "SELECT refunded_at FROM payment.payments WHERE reservation_id = ?", java.sql.Timestamp.class,
+                        reservationId))
+                .as("a replay does not move refundedAt")
+                .isEqualTo(refundedAt);
+
+        outboxPublisher.poll();
+        assertThat(awaitOutcome(reservationId, "payment.PaymentRefunded")).isNotNull();
+    }
+
+    @Test
+    void aLatePaymentRejectedForAPaymentThatNeverSucceededRefundsNothingAndIsNotDeadLettered() throws Exception {
+        long reservationId = 604L;
+        produceReservationCreated(UUID.randomUUID(), reservationId, 46000, "corr-refund-604");
+        awaitPaymentStatus(reservationId, "FAILED");
+
+        UUID rejectedEventId = UUID.randomUUID();
+        produceLatePaymentRejected(rejectedEventId, reservationId, "corr-refund-604");
+        awaitProcessed(rejectedEventId);
+
+        assertSinglePayment(reservationId, "FAILED", 46000);
+        assertThat(refundedOutboxRows(reservationId)).isZero();
+        assertNotDeadLettered(rejectedEventId);
     }
 
     @Test
@@ -556,6 +621,25 @@ class PaymentFlowBootTests {
                 RESERVATION_EVENTS_TOPIC, new UUID(0L, reservationId).toString(), objectMapper.writeValueAsString(envelope));
         record.headers().add(CorrelationIdFilter.HEADER_NAME, correlationId.getBytes(StandardCharsets.UTF_8));
         kafka.send(record).get(10, TimeUnit.SECONDS);
+    }
+
+    private EventEnvelope<JsonNode> latePaymentRejectedEnvelope(UUID eventId, long reservationId) {
+        long paymentId = jdbc.queryForObject(
+                "SELECT id FROM payment.payments WHERE reservation_id = ?", Long.class, reservationId);
+        return new EventEnvelope<>(
+                eventId,
+                "reservation.LatePaymentRejected",
+                Instant.now(),
+                "corr-refund-" + reservationId,
+                new UUID(0L, reservationId),
+                objectMapper.valueToTree(Map.of("reservationId", reservationId, "paymentId", paymentId)));
+    }
+
+    private int refundedOutboxRows(long reservationId) {
+        Integer rows = jdbc.queryForObject(
+                "SELECT count(*) FROM payment.outbox_events WHERE aggregate_id = ? AND event_type = 'payment.PaymentRefunded'",
+                Integer.class, reservationId);
+        return rows == null ? 0 : rows;
     }
 
     private void produceMalformedReservationCreated(UUID eventId, long reservationId, int amountCents, String correlationId)

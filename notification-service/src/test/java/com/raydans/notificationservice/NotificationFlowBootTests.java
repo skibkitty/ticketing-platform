@@ -315,6 +315,42 @@ class NotificationFlowBootTests {
     }
 
     @Test
+    void aMalformedRefundIsDeadLetteredOnThePaymentTopicAndTheConsumerKeepsProcessing() throws Exception {
+        UUID malformedEventId = UUID.randomUUID();
+        produceOnPaymentTopic(malformedEventId, REFUNDED, 819L, 0L, 44000, "REFUNDED");
+        produceRefund(UUID.randomUUID(), 820L, 983L, 1000);
+
+        assertThat(awaitOnTopic(PAYMENT_DEAD_LETTER_TOPIC, record -> record.value().contains(malformedEventId.toString())))
+                .as("a refund this service cannot act on is quarantined on payment.events.v1.dlt, not dropped")
+                .isTrue();
+        awaitNotification(820L);
+        assertThat(notificationCount(819L)).isZero();
+    }
+
+    @Test
+    void oneConsumerGroupReadsBothTopics() throws Exception {
+        try (org.apache.kafka.clients.admin.AdminClient admin = org.apache.kafka.clients.admin.AdminClient.create(
+                Map.of("bootstrap.servers", KAFKA.getBootstrapServers()))) {
+            Instant deadline = Instant.now().plusSeconds(30);
+            java.util.Set<String> topics = java.util.Set.of();
+            while (Instant.now().isBefore(deadline)) {
+                topics = admin.describeConsumerGroups(List.of("notification-service")).all()
+                        .get(10, TimeUnit.SECONDS).get("notification-service").members().stream()
+                        .flatMap(member -> member.assignment().topicPartitions().stream())
+                        .map(org.apache.kafka.common.TopicPartition::topic)
+                        .collect(java.util.stream.Collectors.toSet());
+                if (topics.size() == 2) {
+                    break;
+                }
+                sleep(500);
+            }
+            assertThat(topics)
+                    .as("the notification-service group, and only it, is assigned both topics")
+                    .containsExactlyInAnyOrder(RESERVATION_EVENTS_TOPIC, PAYMENT_EVENTS_TOPIC);
+        }
+    }
+
+    @Test
     void theRestOfThePaymentTopicAndAnOwnerlessRefundPassByWithoutANotice() throws Exception {
         // A Payment that predates its owner being stored (ADR 016) is still refunded, but
         // there is nobody to tell: the notice is skipped and logged, not dead-lettered.
@@ -845,6 +881,20 @@ class NotificationFlowBootTests {
                 PAYMENT_EVENTS_TOPIC, 0, new UUID(0L, reservationId).toString(), value);
         record.headers().add(CorrelationIdFilter.HEADER_NAME, ("corr-" + reservationId).getBytes(StandardCharsets.UTF_8));
         kafka.send(record).get(10, TimeUnit.SECONDS);
+    }
+
+    private boolean awaitOnTopic(String topic, Predicate<ConsumerRecord<String, String>> match) {
+        Instant deadline = Instant.now().plusSeconds(30);
+        try (KafkaConsumer<String, String> consumer = newConsumer(topic)) {
+            while (Instant.now().isBefore(deadline)) {
+                for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofSeconds(1)).records(topic)) {
+                    if (match.test(record)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
     }
 
     private long countOnTopicWithin(String topic, Duration window, Predicate<ConsumerRecord<String, String>> match) {
