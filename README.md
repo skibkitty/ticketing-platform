@@ -50,7 +50,8 @@ Postgres instance.
   | never arrives | `EXPIRED` by the sweep | released |
 
   It also shows a late payment after expiry being ignored safely
-  ([ADR 007](docs/adr/007-payment-outcome-guard.md)), and one request followed
+  ([ADR 007](docs/adr/007-payment-outcome-guard.md)) and then refunded
+  ([ADR 017](docs/adr/017-refund-late-settled-payment.md)), and one request followed
   across all four services by its correlation id.
 - **At-least-once delivery made safe.** Transactional outboxes on the
   producing services, idempotent consumers keyed on event id, and, in the two
@@ -354,18 +355,25 @@ curl -s localhost:8080/api/v1/notifications -H "Authorization: Bearer $CUS"
 
 Bring payment-service back and it settles the abandoned Reservation late. The
 outcome is ignored ([ADR 007](docs/adr/007-payment-outcome-guard.md)): the
-Reservation stays `EXPIRED`, its Seat stays on sale, and no second notification
-is sent, even though the payment itself reads `SUCCEEDED`.
+Reservation stays `EXPIRED` and its Seat stays on sale. The money is not kept,
+though. reservation-service reports the late success, payment-service refunds
+it, and the Customer is told
+([ADR 017](docs/adr/017-refund-late-settled-payment.md)).
 
 ```bash
 docker compose start payment-service
 
 # Once it has caught up (around half a minute while it starts):
 curl -s localhost:8080/api/v1/payments/3 -H "Authorization: Bearer $CUS"
-# 200 {"reservationId":3,"amountCents":5000,"status":"SUCCEEDED", …}
+# 200 {"reservationId":3,"amountCents":5000,"status":"REFUNDED","settledAt":"…","refundedAt":"…", …}
 
 curl -s localhost:8080/api/v1/reservations/3 -H "Authorization: Bearer $CUS"
 # 200 {"id":3,"status":"EXPIRED", …}
+
+curl -s localhost:8080/api/v1/notifications -H "Authorization: Bearer $CUS"
+# newest two items: "type":"PAYMENT_REFUNDED",
+#   "message":"Your payment for reservation 3 was refunded because it arrived after the reservation expired."
+# then the "RESERVATION_EXPIRED" from before
 ```
 
 #### Following one request through the logs

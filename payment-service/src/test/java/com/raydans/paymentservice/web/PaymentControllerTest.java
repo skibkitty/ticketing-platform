@@ -55,7 +55,8 @@ class PaymentControllerTest {
                 44000,
                 PaymentStatus.SUCCEEDED,
                 Instant.parse("2026-10-21T10:15:30Z"),
-                Instant.parse("2026-10-21T10:15:31Z")));
+                Instant.parse("2026-10-21T10:15:31Z"),
+                null));
 
         mvc.perform(get("/api/v1/payments/101").header(PaymentController.CUSTOMER_HEADER, "99"))
                 .andExpect(status().isOk())
@@ -70,7 +71,7 @@ class PaymentControllerTest {
     @Test
     void aDeclinedPaymentIsReadLikeAnyOther() throws Exception {
         when(payments.get(102L, 99L)).thenReturn(new PaymentResponse(
-                8L, 102L, 50000, PaymentStatus.FAILED, Instant.parse("2026-10-21T10:15:30Z"), null));
+                8L, 102L, 50000, PaymentStatus.FAILED, Instant.parse("2026-10-21T10:15:30Z"), null, null));
 
         mvc.perform(get("/api/v1/payments/102").header(PaymentController.CUSTOMER_HEADER, "99"))
                 .andExpect(status().isOk())

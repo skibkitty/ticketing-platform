@@ -1,10 +1,12 @@
 package com.raydans.notificationservice.notification;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.raydans.common.event.EventEnvelope;
 
+import java.util.Collections;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,7 +37,7 @@ class JpaNotificationService implements NotificationService {
     }
 
     /**
-     * Records a Notification for a terminal reservation event idempotently.
+     * Records a Notification for a terminal reservation event, or a Refund, idempotently.
      *
      * <p>Two atomic database claims stand between a delivered event and a Customer
      * being told about their Reservation twice (ADR 004):
@@ -64,12 +66,12 @@ class JpaNotificationService implements NotificationService {
         if (eventType == null || eventType.isBlank()) {
             throw new IllegalArgumentException("envelope.eventType must be set, got: " + envelope);
         }
-        // Everything else on the shared reservation.events.v1 topic (notably
-        // reservation.ReservationCreated) is another service's business: deliberately
+        // Everything else on the shared topics (notably reservation.ReservationCreated
+        // and the payment outcomes) is another service's business: deliberately
         // ignored, not claimed, not dead-lettered.
         NotificationType type = NotificationType.fromEventType(eventType);
         if (type == null) {
-            log.debug("Ignoring {} on reservation.events.v1", eventType);
+            log.debug("Ignoring {}", eventType);
             return;
         }
         if (envelope.eventId() == null) {
@@ -78,7 +80,12 @@ class JpaNotificationService implements NotificationService {
         if (envelope.payload() == null) {
             throw new IllegalArgumentException("envelope.payload must be set for " + eventType);
         }
-        ReservationTerminalPayload terminal = parseTerminal(envelope.payload());
+        ReservationTerminalPayload terminal = type == NotificationType.PAYMENT_REFUNDED
+                ? refundAsTerminal(envelope)
+                : parseTerminal(envelope.payload());
+        if (terminal == null) {
+            return;
+        }
         validate(terminal);
 
         // Idempotency claim (ADR 004): 1 = this transaction won the event, 0 = duplicate.
@@ -166,6 +173,35 @@ class JpaNotificationService implements NotificationService {
         return NotificationCursor.of(response.sentAt(), response.id()).encode();
     }
 
+    /**
+     * A {@code payment.PaymentRefunded} in the shape the rest of {@link #record} reads: the
+     * Reservation it is about, who to tell, and no Seats (they went with the expiry).
+     *
+     * <p>Returns {@code null} for a Refund with no recorded owner: a Payment that predates
+     * payment-service storing one (ADR 016). The money is already back, there is nobody to
+     * tell, and redelivering would not change that, so it is logged and skipped rather than
+     * dead-lettered. A present but non-positive owner is still a producer bug, and
+     * {@link #validate} rejects it like any other.
+     */
+    private ReservationTerminalPayload refundAsTerminal(EventEnvelope<JsonNode> envelope) {
+        PaymentRefundedPayload refund;
+        try {
+            refund = objectMapper.treeToValue(envelope.payload(), PaymentRefundedPayload.class);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("Failed to deserialize PaymentRefunded payload", ex);
+        }
+        if (refund.customerId() == null) {
+            log.warn(
+                    "No notice for refund event {} of reservation {}: its Payment has no recorded owner",
+                    envelope.eventId(), refund.reservationId());
+            return null;
+        }
+        // Not List.of(): validate() asks the seat list whether it contains null, which an
+        // immutable List.of() answers by throwing.
+        return new ReservationTerminalPayload(
+                refund.reservationId(), refund.customerId(), null, Collections.emptyList(), refund.amountCents());
+    }
+
     private ReservationTerminalPayload parseTerminal(JsonNode payload) {
         try {
             return objectMapper.treeToValue(payload, ReservationTerminalPayload.class);
@@ -244,6 +280,13 @@ class JpaNotificationService implements NotificationService {
             return null;
         }
     }
+
+    /**
+     * Wire payload of {@code payment.PaymentRefunded} (payment-service contract), the fields
+     * this service reads. {@code customerId} is null for a Payment with no recorded owner.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record PaymentRefundedPayload(Long reservationId, Long customerId, Integer amountCents) {}
 
     /** What is persisted as a Notification's {@code payload}. */
     public record NotificationPayload(String message) {}

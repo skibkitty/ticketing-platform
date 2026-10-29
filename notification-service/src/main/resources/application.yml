@@ -32,6 +32,9 @@ app:
       # the topic is not this service's job — reservation-service produces it and provisions
       # it, so startup order here cannot decide its partitions (see adr/002, adr/008).
       reservation-events: ${RESERVATION_EVENTS_TOPIC:reservation.events.v1}
+      # payment-service's facts, for the one this service tells a Customer about: a Refund
+      # (#52). reservation-service provisions it too, as the topic's other consumer.
+      payment-events: ${PAYMENT_EVENTS_TOPIC:payment.events.v1}
   notifications:
     # An inbox is read a page at a time. The default keeps a normal read small; the
     # maximum is the hard ceiling no single request can ask past, so one customer's

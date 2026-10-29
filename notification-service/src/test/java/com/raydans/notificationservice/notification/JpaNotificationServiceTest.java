@@ -653,6 +653,44 @@ class JpaNotificationServiceTest {
         return row;
     }
 
+    @Test
+    void aPaymentRefundedRecordsOneRefundNoticeForThePaymentsOwner() {
+        UUID eventId = UUID.randomUUID();
+        when(processedEvents.tryClaim(eventId)).thenReturn(1);
+        when(notifications.tryClaim(anyLong(), anyLong(), anyString(), anyString())).thenReturn(1);
+
+        service.record(refundEnvelope(eventId, 810L, 980L));
+
+        ArgumentCaptor<String> payload = ArgumentCaptor.forClass(String.class);
+        verify(notifications).tryClaim(eq(980L), eq(810L), eq("PAYMENT_REFUNDED"), payload.capture());
+        assertThat(payload.getValue())
+                .contains("Your payment for reservation 810 was refunded because it arrived after the reservation expired.");
+        assertThat(simulatedSends()).hasSize(1);
+    }
+
+    @Test
+    void aRefundWithNoRecordedOwnerIsSkippedRatherThanDeadLettered() {
+        UUID eventId = UUID.randomUUID();
+
+        service.record(refundEnvelope(eventId, 813L, null));
+
+        verify(notifications, never()).tryClaim(anyLong(), anyLong(), anyString(), anyString());
+        assertThat(simulatedSends()).isEmpty();
+    }
+
+    private EventEnvelope<JsonNode> refundEnvelope(UUID eventId, long reservationId, Long customerId) {
+        Map<String, Object> fields = new LinkedHashMap<>();
+        fields.put("paymentId", 7L);
+        fields.put("reservationId", reservationId);
+        fields.put("customerId", customerId);
+        fields.put("amountCents", 44000);
+        fields.put("status", "REFUNDED");
+        fields.put("refundedAt", "2026-10-29T10:00:00Z");
+        return new EventEnvelope<>(
+                eventId, "payment.PaymentRefunded", Instant.now(), "cid", new UUID(0L, reservationId),
+                objectMapper.valueToTree(fields));
+    }
+
     private EventEnvelope<JsonNode> envelope(
             UUID eventId, String eventType, long reservationId, long customerId, List<Long> seatIds, int amountCents) {
         return envelope(eventId, eventType, reservationId, customerId, seatIds, amountCents, null);

@@ -18,8 +18,10 @@ import org.springframework.transaction.annotation.Transactional;
 class JpaPaymentProcessingService implements PaymentProcessingService {
 
     static final String RESERVATION_CREATED = "reservation.ReservationCreated";
+    static final String LATE_PAYMENT_REJECTED = "reservation.LatePaymentRejected";
     static final String PAYMENT_SUCCEEDED = "payment.PaymentSucceeded";
     static final String PAYMENT_FAILED = "payment.PaymentFailed";
+    static final String PAYMENT_REFUNDED = "payment.PaymentRefunded";
 
     private static final Logger log = LoggerFactory.getLogger(JpaPaymentProcessingService.class);
 
@@ -73,12 +75,16 @@ class JpaPaymentProcessingService implements PaymentProcessingService {
         if (eventType == null || eventType.isBlank()) {
             throw new IllegalArgumentException("envelope.eventType must be set, got: " + envelope);
         }
-        // Everything else on reservation.events.v1 is deliberately ignored, unprocessed.
-        if (!RESERVATION_CREATED.equals(eventType)) {
-            log.debug("Ignoring {} on reservation.events.v1", eventType);
-            return;
+        switch (eventType) {
+            case RESERVATION_CREATED -> processCreated(envelope, correlationId);
+            case LATE_PAYMENT_REJECTED -> processLatePaymentRejected(envelope, correlationId);
+            // Everything else on reservation.events.v1 is deliberately ignored, unprocessed.
+            default -> log.debug("Ignoring {} on reservation.events.v1", eventType);
         }
+    }
 
+    private void processCreated(EventEnvelope<JsonNode> envelope, String correlationId) {
+        String eventType = envelope.eventType();
         if (envelope.eventId() == null) {
             throw new IllegalArgumentException("envelope.eventId must be set for " + eventType);
         }
@@ -135,6 +141,91 @@ class JpaPaymentProcessingService implements PaymentProcessingService {
                 correlationId));
         log.info("Payment for reservation {} {}: {} cents for customer {}",
                 created.reservationId(), payment.getStatus(), created.amountCents(), created.customerId());
+    }
+
+    /**
+     * The compensating step for a late settlement (#52): reservation-service ignored a
+     * {@code PaymentSucceeded} because the Hold had already expired, so the money this
+     * Payment took must go back. Idempotent the same way as {@link #processCreated}: the
+     * {@code processed_events} claim dedupes a redelivered event, and the status-guarded
+     * update makes a differently ID'd repeat a no-op once the Payment is {@code REFUNDED}.
+     * The {@code PaymentRefunded} outbox row is written only by the transaction that won
+     * the transition, so the Customer is told once.
+     */
+    private void processLatePaymentRejected(EventEnvelope<JsonNode> envelope, String correlationId) {
+        String eventType = envelope.eventType();
+        if (envelope.eventId() == null) {
+            throw new IllegalArgumentException("envelope.eventId must be set for " + eventType);
+        }
+        if (envelope.payload() == null) {
+            throw new IllegalArgumentException("envelope.payload must be set for " + eventType);
+        }
+        LatePaymentRejectedPayload rejected = parseRejected(envelope.payload());
+        if (rejected.reservationId() == null || rejected.reservationId() <= 0) {
+            throw new IllegalArgumentException(
+                    "LatePaymentRejected reservationId must be a positive id: " + rejected.reservationId());
+        }
+
+        // Idempotency claim (ADR 004): 1 = this transaction won the event, 0 = duplicate.
+        if (processedEvents.tryClaim(envelope.eventId()) == 0) {
+            log.debug("Skipping duplicate delivery of event {}", envelope.eventId());
+            return;
+        }
+
+        if (payments.tryRefund(rejected.reservationId(), Instant.now()) == 0) {
+            // Already REFUNDED is the expected repeat. Any other state means the late outcome
+            // reservation-service saw was never a success here: a producer bug, recorded loudly,
+            // but not retried, because redelivering it would not make it any more right.
+            PaymentStatus status = payments.findByReservationId(rejected.reservationId())
+                    .map(PaymentEntity::getStatus)
+                    .orElse(null);
+            if (status == PaymentStatus.REFUNDED) {
+                log.warn(
+                        "Ignoring LatePaymentRejected for reservation {} which is already refunded; "
+                                + "event {} recorded as processed",
+                        rejected.reservationId(), envelope.eventId());
+            } else {
+                log.error(
+                        "Ignoring LatePaymentRejected event {} for reservation {}: its Payment is {}, not SUCCEEDED; "
+                                + "nothing to refund",
+                        envelope.eventId(), rejected.reservationId(), status);
+            }
+            return;
+        }
+
+        PaymentEntity payment = payments.findByReservationId(rejected.reservationId()).orElseThrow(
+                () -> new IllegalStateException(
+                        "Refunded payment row for reservation " + rejected.reservationId() + " not found"));
+        outbox.save(new OutboxEventEntity(
+                UUID.randomUUID(),
+                "Payment",
+                rejected.reservationId(),
+                PAYMENT_REFUNDED,
+                serializeRefund(payment),
+                correlationId));
+        log.info("Payment for reservation {} REFUNDED: it settled after the Hold expired", rejected.reservationId());
+    }
+
+    private String serializeRefund(PaymentEntity payment) {
+        try {
+            return objectMapper.writeValueAsString(new PaymentRefundedPayload(
+                    payment.getId(),
+                    payment.getReservationId(),
+                    payment.getCustomerId(),
+                    payment.getAmountCents(),
+                    payment.getStatus(),
+                    payment.getRefundedAt()));
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("Failed to serialize PaymentRefunded payload", ex);
+        }
+    }
+
+    private LatePaymentRejectedPayload parseRejected(JsonNode payload) {
+        try {
+            return objectMapper.treeToValue(payload, LatePaymentRejectedPayload.class);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("Failed to deserialize LatePaymentRejected payload", ex);
+        }
     }
 
     private ReservationCreatedPayload parseCreated(JsonNode payload) {
@@ -196,6 +287,20 @@ class JpaPaymentProcessingService implements PaymentProcessingService {
      */
     public record ReservationCreatedPayload(
             Long reservationId, Long customerId, Long eventId, List<Long> seatIds, Integer amountCents) {}
+
+    /**
+     * Wire payload of a {@code reservation.LatePaymentRejected} event (reservation-service
+     * contract). The Payment is found by {@code reservationId}, one per Reservation;
+     * {@code paymentId} only documents which outcome was rejected.
+     */
+    public record LatePaymentRejectedPayload(Long reservationId, Long paymentId) {}
+
+    /**
+     * Wire payload of a {@code payment.PaymentRefunded} event. {@code customerId} is who
+     * notification-service tells; it is null only on a Payment that predates V4 (ADR 016).
+     */
+    public record PaymentRefundedPayload(
+            long paymentId, long reservationId, Long customerId, int amountCents, PaymentStatus status, Instant refundedAt) {}
 
     /** Wire payload of a {@code payment.PaymentSucceeded} / {@code payment.PaymentFailed} event. */
     public record PaymentProcessedPayload(long paymentId, long reservationId, int amountCents, PaymentStatus status) {}

@@ -309,6 +309,74 @@ class PaymentFlowBootTests {
     }
 
     @Test
+    void aLatePaymentRejectedRefundsTheSucceededPaymentAndTheStatusRouteSaysSo() throws Exception {
+        long reservationId = 600L;
+        produceReservationCreated(UUID.randomUUID(), reservationId, 44000, "corr-refund-600");
+        awaitPaymentStatus(reservationId, "SUCCEEDED");
+
+        UUID rejectedEventId = UUID.randomUUID();
+        produceLatePaymentRejected(rejectedEventId, reservationId, "corr-refund-600");
+
+        awaitPaymentStatus(reservationId, "REFUNDED");
+        awaitProcessed(rejectedEventId);
+        assertSinglePayment(reservationId, "REFUNDED", 44000);
+
+        ResponseEntity<String> response = readPayment(reservationId, CUSTOMER_ID);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode body = objectMapper.readTree(response.getBody());
+        assertThat(body.get("status").asText()).isEqualTo("REFUNDED");
+        assertThat(body.get("settledAt").isNull()).isFalse();
+        assertThat(body.get("refundedAt").isNull()).as("refundedAt is set on a refund").isFalse();
+    }
+
+    @Test
+    void aRefundPublishesPaymentRefundedForTheCustomerToBeTold() throws Exception {
+        long reservationId = 601L;
+        produceReservationCreated(UUID.randomUUID(), reservationId, 44000, "corr-refund-601");
+        awaitPaymentStatus(reservationId, "SUCCEEDED");
+        outboxPublisher.poll();
+        awaitOutcome(reservationId, "payment.PaymentSucceeded");
+
+        produceLatePaymentRejected(UUID.randomUUID(), reservationId, "corr-refund-601");
+        awaitPaymentStatus(reservationId, "REFUNDED");
+        outboxPublisher.poll();
+
+        ConsumerRecord<String, String> refunded = awaitOutcome(reservationId, "payment.PaymentRefunded");
+        assertThat(refunded.key()).isEqualTo(new UUID(0L, reservationId).toString());
+        assertThat(new String(refunded.headers().lastHeader(CorrelationIdFilter.HEADER_NAME).value()))
+                .isEqualTo("corr-refund-601");
+        JsonNode payload = objectMapper.readTree(refunded.value()).get("payload");
+        assertThat(payload.get("reservationId").asLong()).isEqualTo(reservationId);
+        assertThat(payload.get("customerId").asLong()).isEqualTo(CUSTOMER_ID);
+        assertThat(payload.get("amountCents").asInt()).isEqualTo(44000);
+        assertThat(payload.get("status").asText()).isEqualTo("REFUNDED");
+        assertThat(payload.get("refundedAt").isNull()).isFalse();
+    }
+
+    @Test
+    void aRedeliveredOrRepeatedLatePaymentRejectedRefundsOnceAndPublishesOnce() throws Exception {
+        long reservationId = 602L;
+        produceReservationCreated(UUID.randomUUID(), reservationId, 44000, "corr-refund-602");
+        awaitPaymentStatus(reservationId, "SUCCEEDED");
+
+        UUID rejectedEventId = UUID.randomUUID();
+        UUID repeatEventId = UUID.randomUUID();
+        produceLatePaymentRejected(rejectedEventId, reservationId, "corr-refund-602");
+        produceLatePaymentRejected(rejectedEventId, reservationId, "corr-refund-602");
+        produceLatePaymentRejected(repeatEventId, reservationId, "corr-refund-602");
+
+        awaitProcessed(repeatEventId);
+        assertNotDeadLettered(rejectedEventId);
+        assertNotDeadLettered(repeatEventId);
+        assertSinglePayment(reservationId, "REFUNDED", 44000);
+        assertProcessedOnce(rejectedEventId);
+        Integer refundRows = jdbc.queryForObject(
+                "SELECT count(*) FROM payment.outbox_events WHERE aggregate_id = ? AND event_type = 'payment.PaymentRefunded'",
+                Integer.class, reservationId);
+        assertThat(refundRows).as("one PaymentRefunded however often the rejection arrives").isEqualTo(1);
+    }
+
+    @Test
     void anotherCustomersPaymentIsAnsweredExactlyLikeOneThatDoesNotExist() throws Exception {
         long reservationId = 501L;
         produceReservationCreated(UUID.randomUUID(), reservationId, 10000, "corr-read-501");
@@ -466,6 +534,26 @@ class PaymentFlowBootTests {
                 reservationCreatedEnvelope(eventId, reservationId, amountCents, correlationId, customerId));
         ProducerRecord<String, String> record = new ProducerRecord<>(
                 RESERVATION_EVENTS_TOPIC, new UUID(0L, reservationId).toString(), value);
+        record.headers().add(CorrelationIdFilter.HEADER_NAME, correlationId.getBytes(StandardCharsets.UTF_8));
+        kafka.send(record).get(10, TimeUnit.SECONDS);
+    }
+
+    /**
+     * What reservation-service publishes when its ADR 007 guard ignores a late
+     * {@code PaymentSucceeded}: the fact, on its own topic, that the money came too late.
+     */
+    private void produceLatePaymentRejected(UUID eventId, long reservationId, String correlationId) throws Exception {
+        long paymentId = jdbc.queryForObject(
+                "SELECT id FROM payment.payments WHERE reservation_id = ?", Long.class, reservationId);
+        EventEnvelope<JsonNode> envelope = new EventEnvelope<>(
+                eventId,
+                "reservation.LatePaymentRejected",
+                Instant.now(),
+                correlationId,
+                new UUID(0L, reservationId),
+                objectMapper.valueToTree(Map.of("reservationId", reservationId, "paymentId", paymentId)));
+        ProducerRecord<String, String> record = new ProducerRecord<>(
+                RESERVATION_EVENTS_TOPIC, new UUID(0L, reservationId).toString(), objectMapper.writeValueAsString(envelope));
         record.headers().add(CorrelationIdFilter.HEADER_NAME, correlationId.getBytes(StandardCharsets.UTF_8));
         kafka.send(record).get(10, TimeUnit.SECONDS);
     }
