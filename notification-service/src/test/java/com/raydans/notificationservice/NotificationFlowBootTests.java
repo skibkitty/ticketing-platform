@@ -75,6 +75,9 @@ class NotificationFlowBootTests {
 
     static final String RESERVATION_EVENTS_TOPIC = "reservation.events.v1";
     static final String DEAD_LETTER_TOPIC = RESERVATION_EVENTS_TOPIC + ".dlt";
+    static final String PAYMENT_EVENTS_TOPIC = "payment.events.v1";
+    static final String PAYMENT_DEAD_LETTER_TOPIC = PAYMENT_EVENTS_TOPIC + ".dlt";
+    static final String REFUNDED = "payment.PaymentRefunded";
 
     static final String CONFIRMED = "reservation.ReservationConfirmed";
     static final String CANCELLED = "reservation.ReservationCancelled";
@@ -152,7 +155,9 @@ class NotificationFlowBootTests {
         KafkaAdmin.NewTopics testOwnedTopics() {
             return new KafkaAdmin.NewTopics(
                     new NewTopic(RESERVATION_EVENTS_TOPIC, 1, (short) 1),
-                    new NewTopic(DEAD_LETTER_TOPIC, 1, (short) 1));
+                    new NewTopic(DEAD_LETTER_TOPIC, 1, (short) 1),
+                    new NewTopic(PAYMENT_EVENTS_TOPIC, 1, (short) 1),
+                    new NewTopic(PAYMENT_DEAD_LETTER_TOPIC, 1, (short) 1));
         }
     }
 
@@ -262,6 +267,110 @@ class NotificationFlowBootTests {
             serviceLogger.detachAppender(appender);
             appender.stop();
         }
+    }
+
+    @Test
+    void aLateSettlementsRefundIsToldAfterTheExpiryThatCausedIt() throws Exception {
+        long customerId = 980L;
+        long reservationId = 810L;
+        produce(EXPIRED, UUID.randomUUID(), reservationId, customerId, List.of(50L), 44000);
+        awaitNotificationCount(customerId, 1);
+        produceRefund(UUID.randomUUID(), reservationId, customerId, 44000);
+
+        awaitNotificationCount(customerId, 2);
+
+        List<Map<String, Object>> rows = itemsOf(readInboxAs(customerId, "").getBody());
+        assertThat(rows.stream().map(row -> row.get("type")).toList())
+                .as("newest first: the refund explains the charge the expiry left behind")
+                .containsExactly("PAYMENT_REFUNDED", "RESERVATION_EXPIRED");
+        assertThat(rows.stream().map(row -> longValue(row, "reservationId")).toList())
+                .containsOnly(reservationId);
+        assertThat((String) rows.get(0).get("message"))
+                .contains("reservation 810")
+                .contains("refunded");
+    }
+
+    @Test
+    void aRedeliveredOrRepeatedRefundIsToldOnceAndIsNeverDeadLettered() throws Exception {
+        long customerId = 981L;
+        long reservationId = 811L;
+        UUID refundEventId = UUID.randomUUID();
+        produceRefund(refundEventId, reservationId, customerId, 44000);
+        produceRefund(refundEventId, reservationId, customerId, 44000);
+        produceRefund(UUID.randomUUID(), reservationId, customerId, 44000);
+        // Strictly behind all three on the one partition: once it is told, they were consumed.
+        produceRefund(UUID.randomUUID(), 812L, customerId, 1000);
+
+        awaitNotification(812L);
+
+        assertThat(notificationCount(reservationId))
+                .as("one refund notice however often it arrives")
+                .isEqualTo(1);
+        assertThat(notificationType(reservationId)).isEqualTo("PAYMENT_REFUNDED");
+        assertThat(processedCount(refundEventId)).isEqualTo(1);
+        assertThat(countOnTopicWithin(PAYMENT_DEAD_LETTER_TOPIC, Duration.ofSeconds(12),
+                        record -> record.value().contains(refundEventId.toString())))
+                .as("an idempotency duplicate must never be classified as poison")
+                .isZero();
+    }
+
+    @Test
+    void aMalformedRefundIsDeadLetteredOnThePaymentTopicAndTheConsumerKeepsProcessing() throws Exception {
+        UUID malformedEventId = UUID.randomUUID();
+        produceOnPaymentTopic(malformedEventId, REFUNDED, 819L, 0L, 44000, "REFUNDED");
+        produceRefund(UUID.randomUUID(), 820L, 983L, 1000);
+
+        assertThat(awaitOnTopic(PAYMENT_DEAD_LETTER_TOPIC, record -> record.value().contains(malformedEventId.toString())))
+                .as("a refund this service cannot act on is quarantined on payment.events.v1.dlt, not dropped")
+                .isTrue();
+        awaitNotification(820L);
+        assertThat(notificationCount(819L)).isZero();
+    }
+
+    @Test
+    void oneConsumerGroupReadsBothTopics() throws Exception {
+        try (org.apache.kafka.clients.admin.AdminClient admin = org.apache.kafka.clients.admin.AdminClient.create(
+                Map.of("bootstrap.servers", KAFKA.getBootstrapServers()))) {
+            Instant deadline = Instant.now().plusSeconds(30);
+            java.util.Set<String> topics = java.util.Set.of();
+            while (Instant.now().isBefore(deadline)) {
+                topics = admin.describeConsumerGroups(List.of("notification-service")).all()
+                        .get(10, TimeUnit.SECONDS).get("notification-service").members().stream()
+                        .flatMap(member -> member.assignment().topicPartitions().stream())
+                        .map(org.apache.kafka.common.TopicPartition::topic)
+                        .collect(java.util.stream.Collectors.toSet());
+                if (topics.size() == 2) {
+                    break;
+                }
+                sleep(500);
+            }
+            assertThat(topics)
+                    .as("the notification-service group, and only it, is assigned both topics")
+                    .containsExactlyInAnyOrder(RESERVATION_EVENTS_TOPIC, PAYMENT_EVENTS_TOPIC);
+        }
+    }
+
+    @Test
+    void theRestOfThePaymentTopicAndAnOwnerlessRefundPassByWithoutANotice() throws Exception {
+        // A Payment that predates its owner being stored (ADR 016) is still refunded, but
+        // there is nobody to tell: the notice is skipped and logged, not dead-lettered.
+        UUID ownerlessEventId = UUID.randomUUID();
+        produceOnPaymentTopic(ownerlessEventId, REFUNDED, 813L, null, 44000, "REFUNDED");
+        UUID succeededEventId = UUID.randomUUID();
+        produceOnPaymentTopic(succeededEventId, "payment.PaymentSucceeded", 814L, null, 44000, "SUCCEEDED");
+        produceRefund(UUID.randomUUID(), 815L, 982L, 1000);
+
+        awaitNotification(815L);
+
+        assertThat(notificationCount(813L)).isZero();
+        assertThat(notificationCount(814L)).isZero();
+        assertThat(processedCount(succeededEventId))
+                .as("an outcome this service does not act on is not claimed")
+                .isZero();
+        assertThat(countOnTopicWithin(PAYMENT_DEAD_LETTER_TOPIC, Duration.ofSeconds(12),
+                        record -> record.value().contains(ownerlessEventId.toString())
+                                || record.value().contains(succeededEventId.toString())))
+                .isZero();
     }
 
     @Test
@@ -748,6 +857,59 @@ class NotificationFlowBootTests {
                 RESERVATION_EVENTS_TOPIC, 0, new UUID(0L, reservationId).toString(), value);
         record.headers().add(CorrelationIdFilter.HEADER_NAME, correlationId.getBytes(StandardCharsets.UTF_8));
         kafka.send(record).get(10, TimeUnit.SECONDS);
+    }
+
+    private void produceRefund(UUID eventId, long reservationId, long customerId, int amountCents) throws Exception {
+        produceOnPaymentTopic(eventId, REFUNDED, reservationId, customerId, amountCents, "REFUNDED");
+    }
+
+    /** A payment-service fact, as its outbox publishes it, pinned to partition 0 like {@link #produce}. */
+    private void produceOnPaymentTopic(
+            UUID eventId, String eventType, long reservationId, Long customerId, int amountCents, String status)
+            throws Exception {
+        Map<String, Object> payload = new java.util.HashMap<>();
+        payload.put("paymentId", reservationId + 1000);
+        payload.put("reservationId", reservationId);
+        payload.put("customerId", customerId);
+        payload.put("amountCents", amountCents);
+        payload.put("status", status);
+        payload.put("refundedAt", Instant.now().toString());
+        String value = objectMapper.writeValueAsString(new EventEnvelope<>(
+                eventId, eventType, Instant.now(), "corr-" + reservationId, new UUID(0L, reservationId),
+                objectMapper.valueToTree(payload)));
+        ProducerRecord<String, String> record = new ProducerRecord<>(
+                PAYMENT_EVENTS_TOPIC, 0, new UUID(0L, reservationId).toString(), value);
+        record.headers().add(CorrelationIdFilter.HEADER_NAME, ("corr-" + reservationId).getBytes(StandardCharsets.UTF_8));
+        kafka.send(record).get(10, TimeUnit.SECONDS);
+    }
+
+    private boolean awaitOnTopic(String topic, Predicate<ConsumerRecord<String, String>> match) {
+        Instant deadline = Instant.now().plusSeconds(30);
+        try (KafkaConsumer<String, String> consumer = newConsumer(topic)) {
+            while (Instant.now().isBefore(deadline)) {
+                for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofSeconds(1)).records(topic)) {
+                    if (match.test(record)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+    }
+
+    private long countOnTopicWithin(String topic, Duration window, Predicate<ConsumerRecord<String, String>> match) {
+        try (KafkaConsumer<String, String> consumer = newConsumer(topic)) {
+            Instant deadline = Instant.now().plus(window);
+            long count = 0;
+            while (Instant.now().isBefore(deadline)) {
+                for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofSeconds(1)).records(topic)) {
+                    if (match.test(record)) {
+                        count++;
+                    }
+                }
+            }
+            return count;
+        }
     }
 
     private EventEnvelope<JsonNode> terminalEnvelope(

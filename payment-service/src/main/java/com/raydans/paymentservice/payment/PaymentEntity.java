@@ -40,6 +40,9 @@ public class PaymentEntity {
     @Column(name = "settled_at")
     private Instant settledAt;
 
+    @Column(name = "refunded_at")
+    private Instant refundedAt;
+
     protected PaymentEntity() {}
 
     public PaymentEntity(long reservationId, long customerId, int amountCents, PaymentStatus status) {
@@ -75,5 +78,9 @@ public class PaymentEntity {
 
     public Instant getSettledAt() {
         return settledAt;
+    }
+
+    public Instant getRefundedAt() {
+        return refundedAt;
     }
 }

@@ -21,17 +21,21 @@ import org.springframework.transaction.annotation.Transactional;
  * action — it cancels the reservation and releases its seats back to {@code AVAILABLE}. Both
  * run in the same transaction that claims the event in {@code processed_events} (ADR 004),
  * write the {@code ReservationConfirmed}/{@code ReservationCancelled} outbox row, and are
- * gated on the reservation still being {@code PENDING_PAYMENT} (ADR 007).
+ * gated on the reservation still being {@code PENDING_PAYMENT} (ADR 007). A success that
+ * arrives after the Hold expired is reported back as {@code LatePaymentRejected}, so
+ * payment-service can refund it (#52).
  */
 @Service
 class JpaReservationConfirmationService implements ReservationConfirmationService {
 
     static final String PAYMENT_SUCCEEDED = "payment.PaymentSucceeded";
     static final String PAYMENT_FAILED = "payment.PaymentFailed";
+    static final String PAYMENT_REFUNDED = "payment.PaymentRefunded";
     static final String PAYMENT_SUCCEEDED_STATUS = "SUCCEEDED";
     static final String PAYMENT_FAILED_STATUS = "FAILED";
     static final String RESERVATION_CONFIRMED = "reservation.ReservationConfirmed";
     static final String RESERVATION_CANCELLED = "reservation.ReservationCancelled";
+    static final String LATE_PAYMENT_REJECTED = "reservation.LatePaymentRejected";
 
     private static final Logger log = LoggerFactory.getLogger(JpaReservationConfirmationService.class);
 
@@ -64,6 +68,9 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
         switch (eventType) {
             case PAYMENT_SUCCEEDED -> processPaymentSucceeded(envelope, correlationId);
             case PAYMENT_FAILED -> processPaymentFailed(envelope, correlationId);
+            // The refund of a late success is the Customer's news, not this service's: it is a
+            // normal part of the topic and passes by, unclaimed (notification-service acts on it).
+            case PAYMENT_REFUNDED -> log.debug("Ignoring {} on payment.events.v1", eventType);
             // Anything else is an unrecognized event on our topic: reject it deliberately so
             // the record goes through the retry/DLT path (ADR 008) instead of vanishing.
             default -> throw new IllegalArgumentException(
@@ -91,7 +98,7 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
         ReservationEntity reservation = reservations.findById(outcome.reservationId())
                 .orElseThrow(() -> new IllegalStateException(
                         "PaymentSucceeded for unknown reservation " + outcome.reservationId()));
-        confirmIfPending(reservation, envelope.eventId(), correlationId);
+        confirmIfPending(reservation, outcome, envelope.eventId(), correlationId);
     }
 
     private void processPaymentFailed(EventEnvelope<JsonNode> envelope, String correlationId) {
@@ -122,14 +129,28 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
      * PENDING_PAYMENT}. Otherwise the event has already been claimed as processed and we no-op —
      * a late {@code PaymentSucceeded} must not re-brand a meanwhile-expired/cancelled reservation
      * or touch seats it no longer owns.
+     *
+     * <p>When the reservation {@code EXPIRED}, though, the Customer was charged for Seats they
+     * will not get, so the ignored success is reported back as {@code LatePaymentRejected} in
+     * this same transaction (#52). Riding the {@code processed_events} claim, it is written at
+     * most once per outcome event. No other status reports anything: a {@code CONFIRMED}
+     * reservation's Seats are the Customer's, so its money stays, and {@code CANCELLED} is
+     * reached only by a {@code PaymentFailed}, so a success after it is a producer bug rather
+     * than money that came too late.
      */
     private void confirmIfPending(
-            ReservationEntity reservation, UUID eventId, String correlationId) {
+            ReservationEntity reservation, PaymentOutcomePayload outcome, UUID eventId, String correlationId) {
         if (reservation.getStatus() != ReservationStatus.PENDING_PAYMENT) {
             log.info(
                     "Ignoring PaymentSucceeded {} for reservation {} with status {} (ADR 007 guard); "
                             + "event recorded as processed",
                     eventId, reservation.getId(), reservation.getStatus());
+            if (reservation.getStatus() == ReservationStatus.EXPIRED) {
+                outbox.save(latePaymentRejectedEvent(reservation, outcome, correlationId));
+                log.info(
+                        "Reservation {} expired before payment {} settled; reported for refund",
+                        reservation.getId(), outcome.paymentId());
+            }
             return;
         }
 
@@ -230,6 +251,23 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
         }
     }
 
+    private OutboxEventEntity latePaymentRejectedEvent(
+            ReservationEntity reservation, PaymentOutcomePayload outcome, String correlationId) {
+        try {
+            String payload = objectMapper.writeValueAsString(
+                    new LatePaymentRejectedPayload(reservation.getId(), outcome.paymentId()));
+            return new OutboxEventEntity(
+                    UUID.randomUUID(),
+                    "Reservation",
+                    reservation.getId(),
+                    LATE_PAYMENT_REJECTED,
+                    payload,
+                    correlationId);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("Failed to serialize LatePaymentRejected payload", ex);
+        }
+    }
+
     private PaymentOutcomePayload parseOutcome(JsonNode payload) {
         try {
             return objectMapper.treeToValue(payload, PaymentOutcomePayload.class);
@@ -285,6 +323,13 @@ class JpaReservationConfirmationService implements ReservationConfirmationServic
     /** Wire payload of a {@code reservation.ReservationConfirmed} event. */
     public record ReservationConfirmedPayload(
             long reservationId, long customerId, long eventId, List<Long> seatIds, int amountCents) {}
+
+    /**
+     * Wire payload of a {@code reservation.LatePaymentRejected} event: this reservation's Hold
+     * expired before its successful payment was applied, so the money must go back.
+     * {@code paymentId} is the one the rejected outcome named, and may be null if it named none.
+     */
+    public record LatePaymentRejectedPayload(long reservationId, Long paymentId) {}
 
     /** Wire payload of a {@code reservation.ReservationCancelled} event. */
     public record ReservationCancelledPayload(

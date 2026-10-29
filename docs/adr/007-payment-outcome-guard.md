@@ -6,16 +6,16 @@
 
 **Decision:** The outcome consumer in reservation-service only applies a payment outcome while the reservation is `PENDING_PAYMENT`. Otherwise it records the event as processed and does nothing.
 
-**Consequences:** A settled-but-late outcome is dropped rather than reconciled — the 10-minute hold is binding and the seats may already belong to someone else. No reconcile loop, no poison messages, and a `PaymentFailed` arriving after expiry leaves the reservation `EXPIRED`, not `CANCELLED`.
+**Consequences:** A settled-but-late outcome never revives the reservation — the 10-minute hold is binding and the seats may already belong to someone else. No reconcile loop, no poison messages, and a `PaymentFailed` arriving after expiry leaves the reservation `EXPIRED`, not `CANCELLED`, and publishes nothing (nothing was charged). The money side is reconciled rather than dropped: a `PaymentSucceeded` ignored on an `EXPIRED` reservation writes a `LatePaymentRejected` to the outbox in the same transaction, and payment-service refunds it ([ADR 017](017-refund-late-settled-payment.md)).
+
 **Gotchas (from the T14 walkthrough):**
 
-- *Dropped* means the money is not reconciled either. Stop payment-service, let
-  a Hold lapse, and start it again: it settles the old `ReservationCreated`, and
-  `GET /api/v1/payments/{id}` reads `SUCCEEDED` while the Reservation reads
-  `EXPIRED` with its Seats back on sale. In a system with a real charge that is a
-  customer paying for nothing; the guard makes the reservation side safe, and a
-  refund (a compensating `Refund` on payment-service for an outcome the guard
-  ignored) is the missing other half.
+- Only `EXPIRED` reports a late success for refund. A `CONFIRMED` reservation
+  that sees another `PaymentSucceeded` keeps its money (the Customer has the
+  Seats), and `CANCELLED` is reached only by a `PaymentFailed`, so a success
+  after it is a producer bug, not money that came too late. Before #52 the late
+  success was dropped outright, leaving `GET /api/v1/payments/{id}` at
+  `SUCCEEDED` beside an `EXPIRED` Reservation; it now reads `REFUNDED`.
 - The Hold is the only clock. A slow or down payment-service turns every
   Reservation placed meanwhile into an expiry, which is also the only way to
   watch one happen by hand: `docker compose stop payment-service`.

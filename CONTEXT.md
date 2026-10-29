@@ -31,11 +31,21 @@ _Avoid_: order, booking
 **Cancelled vs Expired**:
 Both release the Seats; they differ in what happened to the payment.
 `CANCELLED` means the payment was declined. `EXPIRED` means the Hold lapsed
-with no payment outcome at all (released by the sweep).
+before a payment outcome was applied (released by the sweep). An outcome
+that lands afterwards changes nothing about the Reservation; a late success
+is refunded (see **Refund**).
 
 **Payment**:
 The money movement for a Reservation — one per Reservation. States:
-`PENDING`, `SUCCEEDED`, `FAILED`.
+`PENDING`, `SUCCEEDED`, `FAILED`, `REFUNDED` (see **Refund**).
+
+**Refund**:
+The compensating step that returns a late-settled Payment's money: a
+Payment that succeeded after its Reservation had already `EXPIRED` moves
+from `SUCCEEDED` to the terminal `REFUNDED`. A state of the one Payment,
+not a record of its own. Triggered by reservation-service's
+`LatePaymentRejected`, never by a late `PaymentFailed` (nothing was
+charged).
 
 **Customer**:
 The person a Reservation belongs to; referenced by identifier only, no
@@ -54,10 +64,12 @@ other — two callers sharing one would be one identity wearing two logins.
 
 **Notification**:
 The message a Customer is told about a Reservation reaching a terminal
-state. One per Reservation per terminal state, so a Reservation that is
-cancelled and later expires would owe two. Types: `RESERVATION_CONFIRMED`,
-`RESERVATION_CANCELLED`, `RESERVATION_EXPIRED` — mirroring the
-Reservation's own states, minus the non-terminal `PENDING_PAYMENT`.
+state, or about a Refund of its Payment. One per Reservation per type, so
+a Reservation that is cancelled and later expires would owe two. Types:
+`RESERVATION_CONFIRMED`, `RESERVATION_CANCELLED`, `RESERVATION_EXPIRED` —
+mirroring the Reservation's own states, minus the non-terminal
+`PENDING_PAYMENT` — and `PAYMENT_REFUNDED`, which follows a
+`RESERVATION_EXPIRED` to explain the charge.
 A Notification's `message` is the text it was sent with, not the
 Notification's name for itself.
 _Avoid_: email, receipt, ticket
@@ -65,5 +77,6 @@ _Avoid_: email, receipt, ticket
 **Terminal reservation event**:
 The `reservation.events.v1` event that ends a Reservation's life —
 `ReservationConfirmed`, `ReservationCancelled`, `ReservationExpired` — and
-the only trigger for a Notification. Sending is simulated by a log line;
+one of the two triggers for a Notification; the other is
+`payment.events.v1`'s `PaymentRefunded`. Sending is simulated by a log line;
 no channel is wired up yet.

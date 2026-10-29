@@ -23,6 +23,10 @@ import org.springframework.stereotype.Component;
  * the topic — {@code ReservationCreated} above all — belongs to payment-service
  * and is ignored there rather than here, by the same consumer group separation
  * that lets each service read only what it owns.
+ *
+ * <p>It subscribes to {@code payment.events.v1} the same way, for the one payment
+ * fact a Customer is told about: {@code PaymentRefunded} (#52). Both topics carry the
+ * same envelope and go to the same recording service, which picks out what it notifies.
  */
 @Component
 public class ReservationTerminalConsumer {
@@ -35,7 +39,7 @@ public class ReservationTerminalConsumer {
         this.objectMapper = objectMapper;
     }
 
-    @KafkaListener(topics = "${app.kafka.topics.reservation-events}")
+    @KafkaListener(topics = {"${app.kafka.topics.reservation-events}", "${app.kafka.topics.payment-events}"})
     public void onMessage(ConsumerRecord<String, String> record) {
         EventEnvelope<JsonNode> envelope;
         try {

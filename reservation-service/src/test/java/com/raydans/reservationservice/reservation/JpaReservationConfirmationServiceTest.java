@@ -89,7 +89,7 @@ class JpaReservationConfirmationServiceTest {
     }
 
     @Test
-    void outcomeForNonPendingReservationIsANoOpButStillRecordedProcessed() {
+    void outcomeForExpiredReservationChangesNothingButReportsTheLatePaymentForRefund() {
         UUID eventId = UUID.randomUUID();
         ReservationEntity reservation = pendingReservation(43L, List.of(seat(12L, 1000)));
         reservation.markExpired();
@@ -103,6 +103,63 @@ class JpaReservationConfirmationServiceTest {
         assertThat(reservation.getSeats()).allMatch(s -> s.getStatus() == SeatStatus.HELD);
         verify(reservations, never()).save(any());
         verify(seats, never()).saveAll(any());
+
+        ArgumentCaptor<OutboxEventEntity> outboxCaptor = ArgumentCaptor.forClass(OutboxEventEntity.class);
+        verify(outbox).save(outboxCaptor.capture());
+        OutboxEventEntity rejected = outboxCaptor.getValue();
+        assertThat(rejected.getEventType()).isEqualTo("reservation.LatePaymentRejected");
+        assertThat(rejected.getAggregateType()).isEqualTo("Reservation");
+        assertThat(rejected.getAggregateId()).isEqualTo(43L);
+        assertThat(rejected.getCorrelationId()).isEqualTo(CORRELATION_ID);
+        assertThat(rejected.getPayload())
+                .contains("\"reservationId\":43")
+                .contains("\"paymentId\":");
+    }
+
+    @Test
+    void anotherSuccessForAConfirmedReservationIsANoOpAndIsNotRefunded() {
+        // The Customer holds the Seats this money paid for: refunding it would be the bug.
+        UUID eventId = UUID.randomUUID();
+        ReservationEntity reservation = pendingReservation(44L, List.of(seat(13L, 1000)));
+        reservation.confirm();
+        when(processedEvents.tryClaim(eventId)).thenReturn(1);
+        when(reservations.findById(44L)).thenReturn(Optional.of(reservation));
+
+        service.process(succeededEnvelope(eventId, 44L), CORRELATION_ID);
+
+        verify(processedEvents).tryClaim(eventId);
+        assertThat(reservation.getStatus()).isEqualTo(ReservationStatus.CONFIRMED);
+        verify(outbox, never()).save(any(OutboxEventEntity.class));
+    }
+
+    @Test
+    void aSuccessForACancelledReservationIsANoOpAndIsNotRefunded() {
+        // CANCELLED is reached only by a PaymentFailed, so a success after it contradicts the
+        // one Payment per Reservation: a producer bug, not money that came too late.
+        UUID eventId = UUID.randomUUID();
+        ReservationEntity reservation = pendingReservation(45L, List.of(seat(14L, 1000)));
+        reservation.cancel();
+        when(processedEvents.tryClaim(eventId)).thenReturn(1);
+        when(reservations.findById(45L)).thenReturn(Optional.of(reservation));
+
+        service.process(succeededEnvelope(eventId, 45L), CORRELATION_ID);
+
+        verify(processedEvents).tryClaim(eventId);
+        assertThat(reservation.getStatus()).isEqualTo(ReservationStatus.CANCELLED);
+        verify(outbox, never()).save(any(OutboxEventEntity.class));
+    }
+
+    @Test
+    void aPaymentRefundedOnTheTopicIsIgnoredUnclaimed() {
+        // payment-service's refund fact shares payment.events.v1; it is notification-service's
+        // business, so it passes by here rather than being dead-lettered as unsupported.
+        UUID eventId = UUID.randomUUID();
+
+        service.process(new EventEnvelope<>(
+                eventId, "payment.PaymentRefunded", Instant.now(), CORRELATION_ID, new UUID(0L, 46L),
+                objectMapper.valueToTree(Map.of("reservationId", 46L, "status", "REFUNDED"))), CORRELATION_ID);
+
+        verify(processedEvents, never()).tryClaim(any());
         verify(outbox, never()).save(any(OutboxEventEntity.class));
     }
 

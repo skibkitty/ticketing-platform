@@ -145,8 +145,24 @@ class LateSettlementGuardBootTests {
                 .as("a PaymentSucceeded landing after the sweep must not confirm the expired reservation")
                 .isEqualTo("EXPIRED");
         assertThat(outboxCount(lateReservationId, "reservation.ReservationConfirmed"))
-                .as("the guarded outcome must publish nothing")
+                .as("the guarded outcome must not confirm anything")
                 .isZero();
+
+        // #52: the money that came too late is reported back, in the same transaction that
+        // claimed the outcome, so payment-service can refund it.
+        assertThat(outboxCount(lateReservationId, "reservation.LatePaymentRejected"))
+                .as("the ignored success is reported back exactly once")
+                .isEqualTo(1);
+        Map<String, Object> rejected = jdbc.queryForMap(
+                "SELECT payload::text AS payload, correlation_id FROM reservation.outbox_events "
+                        + "WHERE aggregate_id = ? AND event_type = 'reservation.LatePaymentRejected'",
+                lateReservationId);
+        Map<?, ?> payload = objectMapper.readValue((String) rejected.get("payload"), Map.class);
+        assertThat(((Number) payload.get("reservationId")).longValue()).isEqualTo(lateReservationId);
+        assertThat(((Number) payload.get("paymentId")).longValue())
+                .as("names the Payment whose outcome was rejected")
+                .isEqualTo(1L);
+        assertThat(rejected.get("correlation_id")).isEqualTo("corr-late-succeeded-" + lateReservationId);
 
         // The seat now belongs to the new holder, so an unguarded confirm would call markSold() on
         // it — silently taking a live hold and selling it to the wrong customer.
@@ -206,8 +222,11 @@ class LateSettlementGuardBootTests {
                 .as("neither the original delivery nor its redelivery may touch the released seat")
                 .isEqualTo("AVAILABLE");
         assertThat(outboxCount(lateReservationId, "reservation.ReservationConfirmed"))
-                .as("a guarded redelivered outcome publishes nothing either time")
+                .as("a guarded redelivered outcome confirms nothing either time")
                 .isZero();
+        assertThat(outboxCount(lateReservationId, "reservation.LatePaymentRejected"))
+                .as("one rejection per distinct outcome (the original and the sentinel); the redelivery adds none")
+                .isEqualTo(2);
         assertThat(awaitOnTopic(PAYMENT_EVENTS_DLT, record -> record.value().contains(outcomeEventId.toString())))
                 .as("a late settlement is a well-formed outcome that is handled, never a poison record")
                 .isNull();
@@ -241,6 +260,9 @@ class LateSettlementGuardBootTests {
                 .as("a PaymentFailed after expiry leaves the reservation EXPIRED, not CANCELLED")
                 .isEqualTo("EXPIRED");
         assertThat(outboxCount(lateReservationId, "reservation.ReservationCancelled")).isZero();
+        assertThat(outboxCount(lateReservationId, "reservation.LatePaymentRejected"))
+                .as("nothing was charged, so a late failure has nothing to refund and publishes nothing")
+                .isZero();
         assertThat(seatStatus(seatId))
                 .as("a late compensation must not hand another holder's seat back to the pool")
                 .isEqualTo("HELD");
@@ -250,6 +272,32 @@ class LateSettlementGuardBootTests {
         assertThat(reservationStatus(newHolderId, 94L))
                 .as("the new holder's own reservation is unaffected")
                 .isEqualTo("PENDING_PAYMENT");
+    }
+
+    @Test
+    void aPaymentRefundedOnThePaymentTopicIsIgnoredNotDeadLettered() throws Exception {
+        // payment-service publishes PaymentRefunded to the topic this service consumes, but the
+        // refund is notification-service's business. It must pass by, not be dead-lettered as
+        // an unsupported outcome the way an unknown type is.
+        CreatedEvent created = postEvent(List.of(
+                Map.of("section", "Box", "row", "A", "seatNumber", 1, "priceCents", 3000)));
+        long reservationId = postReservation(created.eventId(), created.seatIds(), 95L);
+
+        UUID refundedEventId = UUID.randomUUID();
+        produceOutcome(refundedEventId, reservationId, "payment.PaymentRefunded", "REFUNDED", 4L,
+                "corr-refunded-" + reservationId);
+        // Ordered after it on the same partition, so once the sentinel is claimed the refund
+        // has provably been consumed.
+        UUID sentinelEventId = UUID.randomUUID();
+        producePaymentSucceeded(sentinelEventId, reservationId, "corr-refunded-sentinel-" + reservationId);
+        awaitProcessed(sentinelEventId);
+
+        assertThat(processedCount(refundedEventId))
+                .as("an event this service does not act on is not claimed either")
+                .isZero();
+        assertThat(awaitOnTopic(PAYMENT_EVENTS_DLT, record -> record.value().contains(refundedEventId.toString())))
+                .as("PaymentRefunded is a normal part of the topic, never a poison record")
+                .isNull();
     }
 
     private void lapseHold(long reservationId, List<Long> seatIds) {

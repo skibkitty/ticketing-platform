@@ -35,6 +35,20 @@ public interface PaymentRepository extends JpaRepository<PaymentEntity, Long> {
             @Param("status") String status,
             @Param("settledAt") Instant settledAt);
 
+    /**
+     * Atomically moves a reservation's Payment from {@code SUCCEEDED} to {@code REFUNDED}
+     * inside the caller's transaction. The status guard is in the statement, so the
+     * transition happens at most once however many deliveries race for it: the first
+     * returns 1, and every later one (or one for a Payment that never succeeded) returns 0.
+     */
+    @Modifying
+    @Query(
+            value =
+                    "UPDATE payment.payments SET status = 'REFUNDED', refunded_at = :refundedAt "
+                            + "WHERE reservation_id = :reservationId AND status = 'SUCCEEDED'",
+            nativeQuery = true)
+    int tryRefund(@Param("reservationId") long reservationId, @Param("refundedAt") Instant refundedAt);
+
     Optional<PaymentEntity> findByReservationId(@Param("reservationId") long reservationId);
 
     /**

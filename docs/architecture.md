@@ -17,7 +17,7 @@ rollback that spans two services, not one database transaction).
 - **Reservation** — a customer's attempt to buy a specific set of seats.
   `status` (`PENDING_PAYMENT`, `CONFIRMED`, `CANCELLED`, `EXPIRED`).
 - **Payment** — one per reservation. `status` (`PENDING`, `SUCCEEDED`,
-  `FAILED`).
+  `FAILED`, `REFUNDED`), `settledAt`, `refundedAt`.
 
 `reservation-service` owns Event, Seat, and Reservation together —
 deliberately not split into a separate "catalog service," see below.
@@ -59,6 +59,16 @@ expiry is never lost just because no sweep ran first. Every expiry path runs
 in one transaction and publishes exactly one ReservationExpired —
 seatIds/amountCents describe the seats actually released by that transition
 (possibly none, when a hold was re-extended before the expiry saw it).
+
+A PaymentSucceeded that arrives after the expiry is refunded (ADR 017):
+
+  -> reservation-service ignores it (ADR 007) and, in the same transaction,
+     writes LatePaymentRejected to reservation.events.v1
+  -> payment-service: Payment SUCCEEDED -> REFUNDED, publish PaymentRefunded
+     to payment.events.v1
+  -> notification-service records a PAYMENT_REFUNDED Notification
+
+A late PaymentFailed changes nothing and publishes nothing.
 ```
 
 This is a **choreographed saga**, not an orchestrated one: there's no
@@ -281,8 +291,9 @@ which is scoped to a route this one is not.
 
 Two Kafka topics carry the saga, both JSON `EventEnvelope`s:
 `reservation.events.v1` (reservation-service's `ReservationCreated`,
-`ReservationConfirmed`, `ReservationCancelled`, `ReservationExpired`) and
-`payment.events.v1` (payment-service's `PaymentSucceeded`, `PaymentFailed`).
+`ReservationConfirmed`, `ReservationCancelled`, `ReservationExpired`,
+`LatePaymentRejected`) and `payment.events.v1` (payment-service's
+`PaymentSucceeded`, `PaymentFailed`, `PaymentRefunded`).
 
 ## Why JWT validation and CORS live only at the gateway
 

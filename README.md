@@ -50,7 +50,8 @@ Postgres instance.
   | never arrives | `EXPIRED` by the sweep | released |
 
   It also shows a late payment after expiry being ignored safely
-  ([ADR 007](docs/adr/007-payment-outcome-guard.md)), and one request followed
+  ([ADR 007](docs/adr/007-payment-outcome-guard.md)) and then refunded
+  ([ADR 017](docs/adr/017-refund-late-settled-payment.md)), and one request followed
   across all four services by its correlation id.
 - **At-least-once delivery made safe.** Transactional outboxes on the
   producing services, idempotent consumers keyed on event id, and, in the two
@@ -354,18 +355,25 @@ curl -s localhost:8080/api/v1/notifications -H "Authorization: Bearer $CUS"
 
 Bring payment-service back and it settles the abandoned Reservation late. The
 outcome is ignored ([ADR 007](docs/adr/007-payment-outcome-guard.md)): the
-Reservation stays `EXPIRED`, its Seat stays on sale, and no second notification
-is sent, even though the payment itself reads `SUCCEEDED`.
+Reservation stays `EXPIRED` and its Seat stays on sale. The money is not kept,
+though. reservation-service reports the late success, payment-service refunds
+it, and the Customer is told
+([ADR 017](docs/adr/017-refund-late-settled-payment.md)).
 
 ```bash
 docker compose start payment-service
 
 # Once it has caught up (around half a minute while it starts):
 curl -s localhost:8080/api/v1/payments/3 -H "Authorization: Bearer $CUS"
-# 200 {"reservationId":3,"amountCents":5000,"status":"SUCCEEDED", …}
+# 200 {"reservationId":3,"amountCents":5000,"status":"REFUNDED","settledAt":"…","refundedAt":"…", …}
 
 curl -s localhost:8080/api/v1/reservations/3 -H "Authorization: Bearer $CUS"
 # 200 {"id":3,"status":"EXPIRED", …}
+
+curl -s localhost:8080/api/v1/notifications -H "Authorization: Bearer $CUS"
+# newest two items: "type":"PAYMENT_REFUNDED",
+#   "message":"Your payment for reservation 3 was refunded because it arrived after the reservation expired."
+# then the "RESERVATION_EXPIRED" from before
 ```
 
 #### Following one request through the logs
@@ -399,6 +407,11 @@ confirmed`, and notification-service's `Simulated send: RESERVATION_CONFIRMED`.
   `-Pload-test`: 200 concurrent buyers race for 5 Seats through the gateway,
   and no Seat is ever sold twice. Results, hardware and the rerun command are
   in [`docs/load-test.md`](docs/load-test.md).
+- The late-settlement refund stack test, also in `platform-tests`, run only
+  under `-Pstack-test`, against a stack with a short Hold. It makes a payment
+  late by stopping payment-service, checks the one refund and one notice end
+  to end across the real topics, then replays every consumer group from offset
+  zero and checks again. See [`docs/stack-test.md`](docs/stack-test.md).
 
 Run everything: `mvn verify` from the repo root. It needs Docker for the
 Testcontainers suites, and it starts its own Postgres and Kafka, so stop the
@@ -407,13 +420,6 @@ VM, and Docker stops answering rather than failing cleanly.
 
 ## Known gaps
 
-- **A payment that settles after its Hold expired is not refunded.** The
-  Reservation side is safe ([ADR 007](docs/adr/007-payment-outcome-guard.md)):
-  the late outcome is ignored and the Seats stay on sale. But the Payment stays
-  `SUCCEEDED`, so with a real charge the customer would pay and get no ticket.
-  The walkthrough's flow 3 shows it. The fix is a compensating refund on the
-  payment side, tracked in
-  [#52](https://github.com/skibkitty/ticketing-platform/issues/52).
 - **Payments are simulated.** payment-service declines by a price threshold
   instead of calling a provider. The saga's mechanics are the point, not a
   PCI-scope integration.

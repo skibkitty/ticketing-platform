@@ -653,6 +653,86 @@ class JpaNotificationServiceTest {
         return row;
     }
 
+    @Test
+    void aPaymentRefundedRecordsOneRefundNoticeForThePaymentsOwner() {
+        UUID eventId = UUID.randomUUID();
+        when(processedEvents.tryClaim(eventId)).thenReturn(1);
+        when(notifications.tryClaim(anyLong(), anyLong(), anyString(), anyString())).thenReturn(1);
+
+        service.record(refundEnvelope(eventId, 810L, 980L));
+
+        ArgumentCaptor<String> payload = ArgumentCaptor.forClass(String.class);
+        verify(notifications).tryClaim(eq(980L), eq(810L), eq("PAYMENT_REFUNDED"), payload.capture());
+        assertThat(payload.getValue())
+                .contains("Your payment for reservation 810 was refunded because it arrived after the reservation expired.");
+        assertThat(simulatedSends()).hasSize(1);
+    }
+
+    @Test
+    void aRefundWithNoRecordedOwnerIsSkippedRatherThanDeadLettered() {
+        UUID eventId = UUID.randomUUID();
+
+        service.record(refundEnvelope(eventId, 813L, null));
+
+        verify(notifications, never()).tryClaim(anyLong(), anyLong(), anyString(), anyString());
+        assertThat(simulatedSends()).isEmpty();
+    }
+
+    @Test
+    void aRefundMissingItsReservationIsRejectedSoItIsDeadLetteredNotLost() {
+        EventEnvelope<JsonNode> envelope = refundEnvelope(UUID.randomUUID(), 0L, 980L);
+        ((com.fasterxml.jackson.databind.node.ObjectNode) envelope.payload()).remove("reservationId");
+
+        assertThatThrownBy(() -> service.record(envelope))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("reservationId");
+        verify(processedEvents, never()).tryClaim(any());
+    }
+
+    @Test
+    void aRefundNamingANonPositiveOwnerIsAProducerBugAndIsRejected() {
+        // Absent is a pre-V4 Payment and is skipped; present but impossible is a bug, and
+        // skipping it would hide one.
+        assertThatThrownBy(() -> service.record(refundEnvelope(UUID.randomUUID(), 816L, 0L)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("customerId");
+        verify(processedEvents, never()).tryClaim(any());
+    }
+
+    @Test
+    void anUnreadableRefundPayloadIsRejected() {
+        EventEnvelope<JsonNode> envelope = refundEnvelope(UUID.randomUUID(), 817L, 980L);
+        ((com.fasterxml.jackson.databind.node.ObjectNode) envelope.payload()).put("reservationId", "not-a-number");
+
+        assertThatThrownBy(() -> service.record(envelope)).isInstanceOf(IllegalStateException.class);
+        verify(processedEvents, never()).tryClaim(any());
+    }
+
+    @Test
+    void aRefundWithNoPayloadIsRejected() {
+        EventEnvelope<JsonNode> refund = refundEnvelope(UUID.randomUUID(), 818L, 980L);
+        EventEnvelope<JsonNode> envelope = new EventEnvelope<>(
+                refund.eventId(), refund.eventType(), refund.occurredAt(), refund.correlationId(),
+                refund.aggregateId(), null);
+
+        assertThatThrownBy(() -> service.record(envelope))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("payload");
+    }
+
+    private EventEnvelope<JsonNode> refundEnvelope(UUID eventId, long reservationId, Long customerId) {
+        Map<String, Object> fields = new LinkedHashMap<>();
+        fields.put("paymentId", 7L);
+        fields.put("reservationId", reservationId);
+        fields.put("customerId", customerId);
+        fields.put("amountCents", 44000);
+        fields.put("status", "REFUNDED");
+        fields.put("refundedAt", "2026-10-29T10:00:00Z");
+        return new EventEnvelope<>(
+                eventId, "payment.PaymentRefunded", Instant.now(), "cid", new UUID(0L, reservationId),
+                objectMapper.valueToTree(fields));
+    }
+
     private EventEnvelope<JsonNode> envelope(
             UUID eventId, String eventType, long reservationId, long customerId, List<Long> seatIds, int amountCents) {
         return envelope(eventId, eventType, reservationId, customerId, seatIds, amountCents, null);

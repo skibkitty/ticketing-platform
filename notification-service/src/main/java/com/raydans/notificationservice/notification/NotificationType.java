@@ -3,7 +3,8 @@ package com.raydans.notificationservice.notification;
 import java.util.List;
 
 /**
- * What a Notification says, one value per terminal Reservation state.
+ * What a Notification says, one value per terminal Reservation state, plus the
+ * Refund of a Payment that settled after its Reservation expired (#52).
  *
  * <p>The vocabulary is the Reservation's own (CONTEXT.md): a Reservation reaches
  * exactly one of {@code CONFIRMED}, {@code CANCELLED} or {@code EXPIRED} and
@@ -15,7 +16,8 @@ import java.util.List;
 public enum NotificationType {
     RESERVATION_CONFIRMED("reservation.ReservationConfirmed"),
     RESERVATION_CANCELLED("reservation.ReservationCancelled"),
-    RESERVATION_EXPIRED("reservation.ReservationExpired");
+    RESERVATION_EXPIRED("reservation.ReservationExpired"),
+    PAYMENT_REFUNDED("payment.PaymentRefunded");
 
     private final String eventType;
 
@@ -23,16 +25,16 @@ public enum NotificationType {
         this.eventType = eventType;
     }
 
-    /** The {@code reservation.events.v1} event type this Notification is recorded for. */
+    /** The event type this Notification is recorded for, on whichever topic carries it. */
     public String eventType() {
         return eventType;
     }
 
     /**
-     * The Notification type for a terminal reservation event, or {@code null} for
-     * anything else on the topic. Returning null rather than throwing is
-     * deliberate: {@code reservation.events.v1} is shared, so the uninteresting
-     * types on it ({@code reservation.ReservationCreated}) are a normal part of
+     * The Notification type for an event, or {@code null} for anything else on
+     * the topics. Returning null rather than throwing is deliberate: both topics
+     * are shared, so the uninteresting types on them ({@code
+     * reservation.ReservationCreated}, the payment outcomes) are a normal part of
      * the stream and must be ignored, not treated as malformed.
      */
     public static NotificationType fromEventType(String eventType) {
@@ -61,6 +63,8 @@ public enum NotificationType {
             case RESERVATION_CONFIRMED -> headline + " " + seats + (single ? " is yours." : " are yours.");
             case RESERVATION_CANCELLED, RESERVATION_EXPIRED ->
                     headline + " " + seats + (single ? " has been released." : " have been released.");
+            // A refund names no Seats: they went with the expiry it follows.
+            case PAYMENT_REFUNDED -> headline;
         };
     }
 
@@ -76,6 +80,9 @@ public enum NotificationType {
                     "Your reservation " + reservationId + " was cancelled because the payment was declined.";
             case RESERVATION_EXPIRED ->
                     "Your reservation " + reservationId + " expired before payment completed.";
+            case PAYMENT_REFUNDED ->
+                    "Your payment for reservation " + reservationId
+                            + " was refunded because it arrived after the reservation expired.";
         };
     }
 }

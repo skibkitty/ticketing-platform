@@ -14,7 +14,8 @@ public record PaymentResponse(
         int amountCents,
         PaymentStatus status,
         Instant createdAt,
-        Instant settledAt) {
+        Instant settledAt,
+        Instant refundedAt) {
 
     public static PaymentResponse from(PaymentEntity row) {
         return new PaymentResponse(
@@ -23,6 +24,7 @@ public record PaymentResponse(
                 row.getAmountCents(),
                 row.getStatus(),
                 row.getCreatedAt(),
-                row.getSettledAt());
+                row.getSettledAt(),
+                row.getRefundedAt());
     }
 }
